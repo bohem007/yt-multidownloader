@@ -10,3 +10,8 @@ dependencies = [
     "streamlit>=1.63.0",
     "yt-dlp>=2026.8.19",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
