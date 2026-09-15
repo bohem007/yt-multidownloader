@@ -86,12 +86,32 @@ def _playlist_profile(output_format: str) -> DownloadProfile:
     )
 
 
-def get_profile(mode: str, output_format: str) -> DownloadProfile:
+def _audio_mp3_profile(bitrate_kbps: int | None) -> DownloadProfile:
+    if bitrate_kbps is None:
+        return AUDIO_MP3
+
+    # preferredquality jako liczbowy string = CBR w kbps (yt-dlp/ffmpeg),
+    # w przeciwieństwie do "0"..."9" (VBR) użytego w profilu domyślnym.
+    postprocessors = [
+        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": str(bitrate_kbps)},
+    ]
+    return DownloadProfile(
+        selector=AUDIO_MP3.selector,
+        postprocessors=postprocessors,
+        extra_opts=AUDIO_MP3.extra_opts,
+    )
+
+
+def get_profile(
+    mode: str, output_format: str, *, audio_bitrate_kbps: int | None = None
+) -> DownloadProfile:
     if mode == "video":
         return VIDEO
 
     if mode == "audio":
-        return AUDIO_FLAC if output_format == "flac" else AUDIO_MP3
+        if output_format == "flac":
+            return AUDIO_FLAC
+        return _audio_mp3_profile(audio_bitrate_kbps)
 
     if mode == "subtitle":
         return _subtitle_profile(output_format)

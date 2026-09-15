@@ -28,6 +28,7 @@ class DownloadJob:
     session_id: str
     job_id: str
     cookiefile: str | None = None
+    audio_bitrate_kbps: int | None = None
 
 
 class EngineError(Exception):
@@ -58,7 +59,7 @@ class DownloadEngine:
 
             job_dir = storage.create(job.session_id, job.job_id)
 
-            profile = get_profile(job.mode, job.output_format)
+            profile = get_profile(job.mode, job.output_format, audio_bitrate_kbps=job.audio_bitrate_kbps)
             ydl_opts = self._build_ydl_opts(job, profile, job_dir, on_event)
 
             with YoutubeDL(ydl_opts) as ydl:

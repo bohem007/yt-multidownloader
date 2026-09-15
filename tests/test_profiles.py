@@ -47,6 +47,19 @@ def test_get_profile_playlist_inherits_video_profile_for_mp4():
     assert profile.extra_opts["ignoreerrors"] is True
 
 
+def test_get_profile_audio_mp3_with_custom_bitrate_overrides_preferredquality():
+    profile = get_profile("audio", "mp3", audio_bitrate_kbps=192)
+    assert profile.selector == AUDIO_MP3.selector
+    assert profile.postprocessors[0]["preferredcodec"] == "mp3"
+    assert profile.postprocessors[0]["preferredquality"] == "192"
+
+
+def test_get_profile_audio_mp3_without_bitrate_keeps_default_vbr():
+    profile = get_profile("audio", "mp3", audio_bitrate_kbps=None)
+    assert profile is AUDIO_MP3
+    assert profile.postprocessors[0]["preferredquality"] == "0"
+
+
 def test_get_profile_transcript_not_implemented_yet():
     with pytest.raises(NotImplementedError):
         get_profile("transcript", "txt")
