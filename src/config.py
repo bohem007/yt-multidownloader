@@ -8,7 +8,8 @@ os.getenv/os.environ bezpośrednio. Patrz CLAUDE.md, sekcja
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from typing import Mapping
 from urllib.parse import quote
 
@@ -69,6 +70,7 @@ class Settings:
     rate_limit_per_ip: int = 10
     rate_limiting_enabled: bool = True
     ip_hash_secret: str = ""
+    storage_base_dir: str = field(default_factory=tempfile.gettempdir)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Settings":
@@ -78,13 +80,17 @@ class Settings:
         bez monkeypatchowania procesu.
         """
         defaults = cls()
+        environment = env.get("ENVIRONMENT", defaults.environment)
         database_url = (
             env.get("DATABASE_URL")
             or _build_database_url_from_pg_vars(env)
             or defaults.database_url
         )
+        storage_base_dir = env.get("STORAGE_BASE_DIR") or (
+            tempfile.gettempdir() if environment == "local" else "/tmp"
+        )
         return cls(
-            environment=env.get("ENVIRONMENT", defaults.environment),
+            environment=environment,
             database_url=database_url,
             db_schema=env.get("DB_SCHEMA", defaults.db_schema),
             max_file_size_mb=int(env.get("MAX_FILE_SIZE_MB", defaults.max_file_size_mb)),
@@ -95,6 +101,7 @@ class Settings:
                 env.get("RATE_LIMITING_ENABLED"), defaults.rate_limiting_enabled
             ),
             ip_hash_secret=env.get("IP_HASH_SECRET", defaults.ip_hash_secret),
+            storage_base_dir=storage_base_dir,
         )
 
 
