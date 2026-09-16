@@ -61,6 +61,60 @@ def test_subtitle_language_selectbox_filters_automatic_captions_to_allowed_set(m
     assert set(lang_select.proto.options) == {"fr", "pl", "de", "en"}
 
 
+def test_transcript_mode_shows_language_selector_without_format_choice(monkeypatch):
+    """Tryb Transkrypt reużywa selektor języka Subtitle (ten sam cache/
+    filtr pl/de/en), ale NIE pyta o format napisów (SRT/VTT) — zawsze
+    czyści VTT do .txt wewnętrznie (patrz profiles.py::_transcript_profile)."""
+    fake_subtitles = {"manual": ["en"], "automatic": []}
+    monkeypatch.setattr(engine_module, "list_available_subtitles", lambda url: fake_subtitles)
+
+    at = _run_app(monkeypatch)
+    # URL inny niż w pozostałych testach — _cached_list_available_subtitles
+    # (st.cache_data) jest cache'owany po URL na poziomie procesu testowego,
+    # nie per-AppTest-instancja, więc wspólny URL złapałby zapamiętany
+    # wynik z innego testu niezależnie od monkeypatcha na tej funkcji.
+    at.text_input(key="url_input").input("https://www.youtube.com/watch?v=transcripttest1").run()
+    at.selectbox(key="mode_select").select("Transkrypt (TXT)").run()
+
+    assert not at.exception
+    selectbox_keys = [sb.key for sb in at.selectbox]
+    assert "subtitle_lang_select" in selectbox_keys
+    assert "subtitle_format_select" not in selectbox_keys
+    assert list(at.selectbox(key="subtitle_lang_select").proto.options) == ["en"]
+    assert at.button(key="download_button").proto.disabled is False
+
+
+def test_completed_transcript_job_shows_txt_download_button(monkeypatch, tmp_path):
+    """Wynik trybu Transkrypt (.txt) przechodzi przez ten sam potok
+    zakończenia joba co Video/Audio/Subtitle — bez żadnych zmian w
+    _render_progress/_render_result specyficznych dla tego trybu."""
+    at = _run_app(monkeypatch)
+
+    result_file = tmp_path / "Uploader-Title.en.txt"
+    result_file.write_bytes("Czysty tekst transkryptu.".encode("utf-8"))
+
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=result_file,
+            result_uploader="Test Uploader",
+            result_title="Test Title",
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    assert at.session_state["result_file_name"] == "Uploader-Title.en.txt"
+    assert at.session_state["result_data"] == "Czysty tekst transkryptu.".encode("utf-8")
+    assert len(at.download_button) >= 1
+
+
 def test_selecting_playlist_shows_in_progress_message_instead_of_running_job(monkeypatch):
     at = _run_app(monkeypatch)
 

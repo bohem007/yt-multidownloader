@@ -37,7 +37,7 @@ MODE_LABELS = {
     "transcript": "Transkrypt (TXT)",
 }
 MODE_KEYS_BY_LABEL = {label: key for key, label in MODE_LABELS.items()}
-READY_MODES = {"video", "audio", "subtitle"}
+READY_MODES = {"video", "audio", "subtitle", "transcript"}
 # YouTube automatic_captions zawiera pełną listę celów auto-tłumaczenia
 # (potrafi być >150 kodów) — dla auto-napisów pokazujemy tylko te języki,
 # niezależnie od tego, czy dla danego filmu istnieją też manualne napisy.
@@ -256,9 +256,17 @@ with tab_download:
                 "to nie jest realny wzrost jakości."
             )
 
-    elif mode == "subtitle":
-        subtitle_format_label = st.selectbox("Format napisów", ["SRT", "VTT"], key="subtitle_format_select")
-        output_format = subtitle_format_label.lower()
+    elif mode in ("subtitle", "transcript"):
+        if mode == "subtitle":
+            subtitle_format_label = st.selectbox(
+                "Format napisów", ["SRT", "VTT"], key="subtitle_format_select"
+            )
+            output_format = subtitle_format_label.lower()
+        else:
+            # Transkrypt zawsze czyści VTT do czystego tekstu wewnętrznie
+            # (patrz profiles.py::_transcript_profile) — nie pytamy o
+            # format napisów, użytkownik i tak dostaje tylko .txt.
+            output_format = "txt"
 
         if url:
             try:
@@ -289,9 +297,6 @@ with tab_download:
         st.caption(f"Limit playlisty: maksymalnie {settings.max_playlist_items} pozycji.")
         st.info("Tryb Playlist jest w przygotowaniu — wkrótce dostępny.")
 
-    elif mode == "transcript":
-        st.info("Tryb Transkrypt jest w przygotowaniu — wkrótce dostępny.")
-
     # Zmiana trybu/formatu przy URL wciąż wypełnionym chowa wynik/błąd
     # POPRZEDNIEGO zadania (i "Zapisz plik") — ale nie dotyka pola URL.
     # Tylko jeśli jest faktycznie coś do wyczyszczenia (is_terminal()) —
@@ -313,7 +318,7 @@ with tab_download:
         Path(cookiefile_path).write_bytes(cookie_upload.getvalue())
 
     job_in_progress = state.status == "running"
-    subtitle_blocked = mode == "subtitle" and subtitle_lang_missing
+    subtitle_blocked = mode in ("subtitle", "transcript") and subtitle_lang_missing
     download_disabled = mode not in READY_MODES or not url or job_in_progress or subtitle_blocked
     # "Nowy URL" nie może przerwać aktywnego pobierania — zerwałoby to
     # wątek w tle i zostawiłoby niezwolniony permit semafora współbieżności.
