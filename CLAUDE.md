@@ -164,3 +164,19 @@ test(rate-limit)
 - Nie hardkoduj limitów (rozmiaru, playlisty, współbieżności) w kodzie logiki.
 - Nie przechowuj plików multimedialnych w bazie ani trwale na dysku.
 - Nie loguj surowego adresu IP — tylko hash.
+
+## Znane problemy z testów manualnych (2026-09-16)
+
+Sesja A (błędy silnika — w trakcie naprawy):
+2. Audio MP3: plik wynikowy ma rozszerzenie .webm zamiast .mp3.
+3. Brak wsparcia dla wyboru języka napisów/transkryptu — dla filmu z polskim 
+   audio tryb Napisy/Transkrypt nie generuje żadnego pliku.
+5. Komunikat dla trybu Transkrypt ujawnia wewnętrzną nazwę pliku 
+   (transcript_cleaner.py) — nieprofesjonalne dla użytkownika końcowego.
+
+Sesja B (rozbudowa UX — zaplanowana, jeszcze nie zaczęta):
+1. Blokada pola URL po wprowadzeniu + przycisk "Nowy URL" resetujący cały stan.
+4. Konwencja nazw pobieranych plików: Autor-Tytuł_wideo.jezyk.rozszerzenie 
+   (separator: łącznik).
+6. Zmiana trybu/formatu przy już pobranym pliku ma czyścić komunikaty 
+   i ukrywać "Zapisz plik".
