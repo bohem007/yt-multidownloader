@@ -53,22 +53,24 @@ def test_engine_submit_downloads_audio_and_respects_size_limit():
         job_id="test-job",
     )
 
-    result_path = None
+    result = None
     try:
-        result_path = engine.submit(job, on_event=events.append)
+        result = engine.submit(job, on_event=events.append)
 
-        assert result_path.exists()
-        assert result_path.is_file()
-        assert result_path.stat().st_size > 0
+        assert result.path.exists()
+        assert result.path.is_file()
+        assert result.path.stat().st_size > 0
+        assert result.uploader
+        assert result.title
 
         # enforce_size_limit już przeszedł wewnątrz submit() bez wyjątku —
         # tu tylko potwierdzamy, że wynik faktycznie jest pod limitem.
-        storage.enforce_size_limit(result_path)
+        storage.enforce_size_limit(result.path)
 
         assert any(event.event_type == "on_finished" for event in events)
     finally:
-        if result_path is not None:
-            storage.cleanup(result_path.parent)
+        if result is not None:
+            storage.cleanup(result.path.parent)
 
 
 @pytest.mark.slow
@@ -86,13 +88,13 @@ def test_engine_submit_audio_mp3_returns_path_with_mp3_extension():
         job_id="test-job-mp3-extension",
     )
 
-    result_path = None
+    result = None
     try:
-        result_path = engine.submit(job)
-        assert result_path.suffix == ".mp3"
+        result = engine.submit(job)
+        assert result.path.suffix == ".mp3"
     finally:
-        if result_path is not None:
-            storage.cleanup(result_path.parent)
+        if result is not None:
+            storage.cleanup(result.path.parent)
 
 
 @pytest.mark.slow
@@ -123,11 +125,44 @@ def test_engine_submit_subtitle_downloads_detected_language():
         subtitle_lang=lang,
     )
 
-    result_path = None
+    result = None
     try:
-        result_path = engine.submit(job)
-        assert result_path.exists()
-        assert result_path.stat().st_size > 0
+        result = engine.submit(job)
+        assert result.path.exists()
+        assert result.path.stat().st_size > 0
     finally:
-        if result_path is not None:
-            storage.cleanup(result_path.parent)
+        if result is not None:
+            storage.cleanup(result.path.parent)
+
+
+@pytest.mark.slow
+def test_engine_submit_subtitle_downloads_manual_caption_not_phantom_media_file():
+    """Regresja: dla MANUALNYCH napisów (nie tylko automatycznych, patrz
+    test wyżej) yt-dlp też wypełnia requested_downloads fantomowym wpisem
+    wskazującym na plik medialny, który nigdy nie zostaje zapisany
+    (skip_download=True) — _resolve_result musi poprawnie sięgnąć po
+    requested_subtitles, weryfikując .exists() na każdym kandydacie."""
+    available = list_available_subtitles(TEST_VIDEO_URL)
+    assert available["manual"], "oczekiwano realnych manualnych napisów dla tego filmu"
+
+    lang = available["manual"][0]
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=TEST_VIDEO_URL,
+        mode="subtitle",
+        output_format="srt",
+        session_id="test-session",
+        job_id="test-job-subtitle-manual",
+        subtitle_lang=lang,
+    )
+
+    result = None
+    try:
+        result = engine.submit(job)
+        assert result.path.exists()
+        assert result.path.suffix == ".srt"
+        assert result.path.stat().st_size > 0
+    finally:
+        if result is not None:
+            storage.cleanup(result.path.parent)

@@ -20,5 +20,11 @@ class ProgressEvent:
     message: str
     # Ustawiane tylko na finalnym "on_finished" (patrz job_runner.py) —
     # rzeczywista ścieżka pliku wynikowego PO postprocessingu, zwrócona
-    # przez yt_dlp (nigdy zgadywana z zawartości katalogu).
+    # przez yt_dlp (nigdy zgadywana z zawartości katalogu), plus metadane
+    # materiału do budowy nazwy pliku widocznej dla użytkownika
+    # (src/naming.py). Płaskie pola (nie DownloadResult z engine.py) —
+    # engine.py importuje z progress.py, więc odwrotna zależność
+    # utworzyłaby cykl importów.
     result_path: Path | None = None
+    result_uploader: str | None = None
+    result_title: str | None = None

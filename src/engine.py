@@ -2,8 +2,9 @@
 
 DownloadEngine.submit() jest wywoływalny synchronicznie — integracja
 z threading.Thread/Semaphore(MAX_CONCURRENT_JOBS) wchodzi w sesji z app.py.
-Zwraca ścieżkę do KONKRETNEGO pliku wynikowego (nie katalogu zadania) —
-patrz _resolve_result_path.
+Zwraca DownloadResult ze ścieżką do KONKRETNEGO pliku wynikowego (nie
+katalogu zadania) plus metadane (uploader/title) do budowy nazwy pliku
+widocznej dla użytkownika — patrz _resolve_result.
 """
 
 from __future__ import annotations
@@ -32,6 +33,17 @@ class DownloadJob:
     cookiefile: str | None = None
     audio_bitrate_kbps: int | None = None
     subtitle_lang: str | None = None
+
+
+@dataclass
+class DownloadResult:
+    """Wynik DownloadEngine.submit() — plik PO postprocessingu plus
+    metadane materiału, do budowy nazwy pliku widocznej dla użytkownika
+    (patrz src/naming.py) bez ponownego odpytywania yt-dlp."""
+
+    path: Path
+    uploader: str | None = None
+    title: str | None = None
 
 
 class EngineError(Exception):
@@ -70,7 +82,7 @@ def list_available_subtitles(url: str) -> dict[str, list[str]]:
 
 
 class DownloadEngine:
-    def submit(self, job: DownloadJob, on_event: OnEventCallback | None = None) -> Path:
+    def submit(self, job: DownloadJob, on_event: OnEventCallback | None = None) -> DownloadResult:
         job_dir: Path | None = None
         try:
             if not validate_url(job.url):
@@ -98,16 +110,16 @@ class DownloadEngine:
                 # (np. .webm zamiast finalnego .mp3) — dokładnie ten bug.
                 info = ydl.extract_info(job.url, download=True)
 
-            result_path = self._resolve_result_path(info)
-            if result_path is None:
+            result = self._resolve_result(info)
+            if result is None:
                 raise RuntimeError("Nie udało się ustalić ścieżki pliku wynikowego po pobraniu.")
 
             # yt-dlp nie zawsze zna finalny rozmiar pliku z góry (np. po
             # transkodowaniu FFmpeg do mp3/flac) — limit sprawdzamy
             # post-factum, na podstawie tego, co faktycznie wylądowało na dysku.
-            storage.enforce_size_limit(result_path)
+            storage.enforce_size_limit(result.path)
 
-            return result_path
+            return result
 
         except Exception as exc:
             message = map_download_error(exc)
@@ -117,28 +129,43 @@ class DownloadEngine:
             raise EngineError(message, original_exception=exc) from exc
 
     @staticmethod
-    def _resolve_result_path(info: dict | None) -> Path | None:
+    def _resolve_result(info: dict | None) -> DownloadResult | None:
         """Wyciąga rzeczywistą ścieżkę pliku wynikowego z info_dict PO
         wszystkich postprocessorach — nigdy nie zgaduje na podstawie
-        outtmpl czy zawartości katalogu."""
+        outtmpl czy zawartości katalogu — plus uploader/title do nazwy
+        pliku widocznej dla użytkownika (src/naming.py).
+
+        Sprawdzamy .exists() dla każdego kandydata: przy skip_download=True
+        (tryb Subtitle) yt-dlp i tak wypełnia `requested_downloads` wpisem
+        z hipotetyczną ścieżką pliku medialnego, który NIGDY nie został
+        zapisany (download jest pominięty) — bez tej weryfikacji
+        _resolve_result zwracał tę fantomową ścieżkę zamiast prawdziwego
+        pliku napisów z `requested_subtitles`."""
         if not info:
             return None
+
+        path: Path | None = None
 
         requested_downloads = info.get("requested_downloads") or []
         if requested_downloads:
             filepath = requested_downloads[0].get("filepath")
-            if filepath:
-                return Path(filepath)
+            if filepath and Path(filepath).exists():
+                path = Path(filepath)
 
-        # Tryb Subtitle (skip_download=True) nie populuje requested_downloads
-        # — ścieżka zapisanego pliku napisów jest w requested_subtitles.
-        requested_subtitles = info.get("requested_subtitles") or {}
-        for subtitle_info in requested_subtitles.values():
-            filepath = subtitle_info.get("filepath")
-            if filepath:
-                return Path(filepath)
+        if path is None:
+            # Tryb Subtitle (skip_download=True) — ścieżka zapisanego
+            # pliku napisów jest w requested_subtitles.
+            requested_subtitles = info.get("requested_subtitles") or {}
+            for subtitle_info in requested_subtitles.values():
+                filepath = subtitle_info.get("filepath")
+                if filepath and Path(filepath).exists():
+                    path = Path(filepath)
+                    break
 
-        return None
+        if path is None:
+            return None
+
+        return DownloadResult(path=path, uploader=info.get("uploader"), title=info.get("title"))
 
     def _check_playlist_limit(self, url: str) -> None:
         # extract_flat=True: enumeruje pozycje playlisty bez rozwiązywania
