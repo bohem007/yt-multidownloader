@@ -167,12 +167,16 @@ test(rate-limit)
 
 ## Znane problemy z testów manualnych (2026-09-16)
 
-Sesja A (błędy silnika — w trakcie naprawy):
-2. Audio MP3: plik wynikowy ma rozszerzenie .webm zamiast .mp3.
+Sesja A (błędy silnika — ROZWIĄZANE):
+2. Audio MP3: plik wynikowy ma rozszerzenie .webm zamiast .mp3. ROZWIĄZANE —
+   _resolve_result w engine.py wyciąga rzeczywistą ścieżkę PO postprocessingu.
 3. Brak wsparcia dla wyboru języka napisów/transkryptu — dla filmu z polskim 
-   audio tryb Napisy/Transkrypt nie generuje żadnego pliku.
+   audio tryb Napisy/Transkrypt nie generuje żadnego pliku. ROZWIĄZANE —
+   subtitleslangs jawnie ustawiane z wybranego języka (profiles.py).
 5. Komunikat dla trybu Transkrypt ujawnia wewnętrzną nazwę pliku 
    (transcript_cleaner.py) — nieprofesjonalne dla użytkownika końcowego.
+   ROZWIĄZANE — placeholder usunięty, tryb faktycznie działa (patrz sekcja
+   "Tryb Transkrypt — zaimplementowany" niżej).
 
 Sesja B (rozbudowa UX — zaplanowana, jeszcze nie zaczęta):
 1. Blokada pola URL po wprowadzeniu + przycisk "Nowy URL" resetujący cały stan.
@@ -246,3 +250,35 @@ symulujący dokładnie sporny scenariusz (dwa on_finished w jednej kolejce): prz
 bez zmian w kodzie. _render_progress poprawnie drenuje całą kolejkę w pętli
 while/get_nowait/except Empty i poprawnie rozróżnia premature/terminal po result_path.
 Brak dalszego działania. Nie badać tego ponownie.
+
+## Tryb Transkrypt — zaimplementowany (2026-09-16)
+
+Reużywa całą infrastrukturę Subtitle (DownloadResult, _resolve_result,
+list_available_subtitles, naming.build_display_filename, JobRunner, kolejkę
+postępu w app.py). profiles.py::_transcript_profile wymusza subtitlesformat="vtt"
+niezależnie od output_format joba — transcript_cleaner.py czyści wyłącznie VTT.
+
+Pipeline w engine.py::_finalize_transcript (wołany z submit() po
+_resolve_result, tylko dla mode="transcript"):
+1. clean_vtt_to_text — usuwa nagłówek/tagi/znaczniki czasu, dedup LOKALNY
+   (tylko sąsiadujące linie — rolling captions YouTube) żeby nie usuwać
+   legalnych odległych powtórzeń tego samego zdania.
+2. format_paragraphs — dzieli oczyszczony tekst na akapity po 4 zdania
+   (podział po . ! ? z lookaheadem na wielką literę/cyfrę, żeby odróżnić
+   koniec zdania od skrótu typu "np."). Działa WYŁĄCZNIE na już
+   zdeduplikowanym tekście, nigdy na surowym VTT/znacznikach czasu.
+3. Zapis .txt, usunięcie oryginalnego .vtt — użytkownik dostaje tylko
+   czysty tekst, nigdy surowych napisów.
+
+Znany edge case (udokumentowany testem, nie wymaga fixu): filmy z bardzo
+krótkimi/nieformalnymi napisami manualnymi (np. "Me at the zoo", 19s) mogą
+mieć ZERO interpunkcji kończącej zdanie — cały transkrypt wychodzi jako
+jeden akapit. To jest poprawne zachowanie (nie ma zdań do podziału), nie bug.
+Test end-to-end z podziałem na akapity (test_engine_submit_transcript_downloads_and_cleans_manual_caption_to_txt)
+używa więc LONG_TEST_VIDEO_URL (TED talk, ~20 min, manualne napisy EN z
+realną interpunkcją) — TEST_VIDEO_URL do tego nie wystarcza strukturalnie.
+
+Drugi udokumentowany edge case (w kodzie transcript_cleaner.py, niekrytyczny):
+skrót przed WIELKĄ literą ("godz. Warszawa nie śpi") wygląda identycznie jak
+koniec zdania i zostanie rozdzielony — rzadkie w praktyce (YouTube
+auto-punktuacja jest uboga), nierozwiązywane bez słownika skrótów.
