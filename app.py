@@ -21,7 +21,7 @@ import streamlit as st
 from src import storage
 from src.config import settings
 from src.db import Database
-from src.engine import DownloadJob
+from src.engine import DownloadJob, list_available_subtitles
 from src.errors import InvalidUrlError, map_download_error
 from src.job_runner import JobRunner
 from src.progress import ProgressEvent
@@ -45,15 +45,11 @@ def get_database() -> Database:
     return Database()
 
 
-def _find_result_file(job_dir: Path) -> Path | None:
-    """Zwraca największy plik w katalogu zadania (nasze profile produkują
-    dokładnie jeden plik wynikowy dla video/audio/subtitle)."""
-    if not job_dir.is_dir():
-        return None
-    files = [entry for entry in job_dir.iterdir() if entry.is_file()]
-    if not files:
-        return None
-    return max(files, key=lambda entry: entry.stat().st_size)
+@st.cache_data(ttl=300, show_spinner="Sprawdzanie dostępnych napisów...")
+def _cached_list_available_subtitles(url: str) -> dict[str, list[str]]:
+    """Cache po URL — bez tego zapytanie do YouTube powtarzałoby się przy
+    każdym rerunie skryptu (Streamlit reruje cały plik na każdą interakcję)."""
+    return list_available_subtitles(url)
 
 
 def _guess_mime(file_name: str | None) -> str:
@@ -114,12 +110,15 @@ def _render_progress(state: SessionState) -> None:
         duration_ms = int((time.monotonic() - (state.started_at or time.monotonic())) * 1000)
 
         if terminal_event.event_type == "on_finished":
-            job_dir = Path(settings.storage_base_dir) / state.session_id / (state.job_id or "")
-            result_file = _find_result_file(job_dir)
+            # Prawdziwa ścieżka pliku PO postprocessingu, zwrócona przez
+            # yt_dlp (engine.py) — nigdy zgadywana z zawartości katalogu
+            # (to była przyczyna bugu: .webm serwowane zamiast .mp3).
+            result_file = terminal_event.result_path
 
-            if result_file is None:
+            if result_file is None or not result_file.exists():
                 state.set_error("Zadanie zakończone, ale nie znaleziono pliku wynikowego.")
-                storage.cleanup(job_dir)
+                if result_file is not None:
+                    storage.cleanup(result_file.parent)
                 _log_job_finish(
                     state, status="error", duration_ms=duration_ms, error_message=state.error_message
                 )
@@ -127,8 +126,8 @@ def _render_progress(state: SessionState) -> None:
                 data = result_file.read_bytes()
                 # Wczytane do RAM — katalog tymczasowy natychmiast usuwamy,
                 # zgodnie z Warstwą 10 (brak trwałych plików na serwerze).
-                storage.cleanup(job_dir)
-                state.set_done(job_dir, data=data, file_name=result_file.name)
+                storage.cleanup(result_file.parent)
+                state.set_done(result_file, data=data, file_name=result_file.name)
                 _log_job_finish(state, status="done", duration_ms=duration_ms, file_size_bytes=len(data))
         else:
             state.set_error(terminal_event.message)
@@ -187,6 +186,8 @@ with tab_download:
 
     output_format = "mp4"
     audio_bitrate_kbps: int | None = None
+    subtitle_lang: str | None = None
+    subtitle_lang_missing = False
 
     if mode == "audio":
         audio_format_label = st.selectbox("Format audio", ["MP3", "FLAC"], key="audio_format_select")
@@ -211,12 +212,29 @@ with tab_download:
         subtitle_format_label = st.selectbox("Format napisów", ["SRT", "VTT"], key="subtitle_format_select")
         output_format = subtitle_format_label.lower()
 
+        if url:
+            try:
+                available = _cached_list_available_subtitles(url)
+            except Exception:
+                st.warning("Nie udało się sprawdzić dostępnych napisów dla tego adresu.")
+                subtitle_lang_missing = True
+            else:
+                # Manualne napisy przed automatycznymi, bez duplikatów.
+                lang_options = list(dict.fromkeys(available["manual"] + available["automatic"]))
+                if not lang_options:
+                    st.warning("Nie znaleziono żadnych napisów dla tego materiału.")
+                    subtitle_lang_missing = True
+                else:
+                    subtitle_lang = st.selectbox("Język napisów", lang_options, key="subtitle_lang_select")
+        else:
+            subtitle_lang_missing = True
+
     elif mode == "playlist":
         st.caption(f"Limit playlisty: maksymalnie {settings.max_playlist_items} pozycji.")
-        st.info("Tryb w przygotowaniu — wymaga jeszcze pakowania ZIP w pamięci.")
+        st.info("Tryb Playlist jest w przygotowaniu — wkrótce dostępny.")
 
     elif mode == "transcript":
-        st.info("Tryb w przygotowaniu — wymaga jeszcze czyszczenia napisów (transcript_cleaner.py).")
+        st.info("Tryb Transkrypt jest w przygotowaniu — wkrótce dostępny.")
 
     cookie_upload = st.file_uploader(
         "cookies.txt (opcjonalnie — pomaga ominąć bot-check YouTube)",
@@ -229,7 +247,8 @@ with tab_download:
         Path(cookiefile_path).write_bytes(cookie_upload.getvalue())
 
     job_in_progress = state.status == "running"
-    download_disabled = mode not in READY_MODES or not url or job_in_progress
+    subtitle_blocked = mode == "subtitle" and subtitle_lang_missing
+    download_disabled = mode not in READY_MODES or not url or job_in_progress or subtitle_blocked
 
     if st.button("Pobierz", key="download_button", disabled=download_disabled):
         if not validate_url(url):
@@ -267,6 +286,7 @@ with tab_download:
                 job_id=job_id,
                 cookiefile=cookiefile_path,
                 audio_bitrate_kbps=audio_bitrate_kbps,
+                subtitle_lang=subtitle_lang,
             )
 
             def on_state(event: ProgressEvent, _queue: "queue_module.Queue" = job_queue) -> None:
@@ -298,4 +318,4 @@ with tab_history:
         if not history:
             st.caption("Brak zapisanych zadań.")
         else:
-            st.dataframe(history, use_container_width=True)
+            st.dataframe(history)
