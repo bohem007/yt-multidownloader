@@ -51,19 +51,24 @@ AUDIO_FLAC = DownloadProfile(
 )
 
 
-def _subtitle_profile(output_format: str) -> DownloadProfile:
+def _subtitle_profile(output_format: str, lang: str | None = None) -> DownloadProfile:
     subtitle_format = output_format if output_format in ("srt", "vtt") else "srt"
-    return DownloadProfile(
-        selector=None,
-        postprocessors=[],
-        extra_opts={
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitlesformat": subtitle_format,
-            "outtmpl_template": DEFAULT_OUTTMPL,
-        },
-    )
+    extra_opts = {
+        "skip_download": True,
+        # writesubtitles (napisy ręczne) ORAZ writeautomaticsub (auto-napisy)
+        # razem — wiele filmów (zwłaszcza nieanglojęzycznych) ma WYŁĄCZNIE
+        # auto-napisy, yt-dlp sam wybierze, który typ faktycznie istnieje.
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitlesformat": subtitle_format,
+        "outtmpl_template": DEFAULT_OUTTMPL,
+    }
+    if lang:
+        # Bez tego yt-dlp domyślnie szuka subtitleslangs=["en"] — dla
+        # filmu bez angielskich napisów/auto-napisów nic się nie zapisze,
+        # nawet jeśli inne języki są dostępne.
+        extra_opts["subtitleslangs"] = [lang]
+    return DownloadProfile(selector=None, postprocessors=[], extra_opts=extra_opts)
 
 
 def _playlist_profile(output_format: str) -> DownloadProfile:
@@ -103,7 +108,11 @@ def _audio_mp3_profile(bitrate_kbps: int | None) -> DownloadProfile:
 
 
 def get_profile(
-    mode: str, output_format: str, *, audio_bitrate_kbps: int | None = None
+    mode: str,
+    output_format: str,
+    *,
+    audio_bitrate_kbps: int | None = None,
+    subtitle_lang: str | None = None,
 ) -> DownloadProfile:
     if mode == "video":
         return VIDEO
@@ -114,7 +123,7 @@ def get_profile(
         return _audio_mp3_profile(audio_bitrate_kbps)
 
     if mode == "subtitle":
-        return _subtitle_profile(output_format)
+        return _subtitle_profile(output_format, lang=subtitle_lang)
 
     if mode == "playlist":
         return _playlist_profile(output_format)
