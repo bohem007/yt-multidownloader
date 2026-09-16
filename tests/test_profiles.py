@@ -60,9 +60,17 @@ def test_get_profile_audio_mp3_without_bitrate_keeps_default_vbr():
     assert profile.postprocessors[0]["preferredquality"] == "0"
 
 
-def test_get_profile_transcript_not_implemented_yet():
-    with pytest.raises(NotImplementedError):
-        get_profile("transcript", "txt")
+def test_get_profile_transcript_forces_vtt_regardless_of_output_format():
+    profile = get_profile("transcript", "txt")
+    assert profile.extra_opts["skip_download"] is True
+    assert profile.extra_opts["writesubtitles"] is True
+    assert profile.extra_opts["writeautomaticsub"] is True
+    assert profile.extra_opts["subtitlesformat"] == "vtt"
+
+
+def test_get_profile_transcript_sets_subtitleslangs_when_lang_given():
+    profile = get_profile("transcript", "txt", subtitle_lang="pl")
+    assert profile.extra_opts["subtitleslangs"] == ["pl"]
 
 
 def test_get_profile_unknown_mode_raises_value_error():

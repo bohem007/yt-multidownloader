@@ -71,6 +71,22 @@ def _subtitle_profile(output_format: str, lang: str | None = None) -> DownloadPr
     return DownloadProfile(selector=None, postprocessors=[], extra_opts=extra_opts)
 
 
+def _transcript_profile(lang: str | None = None) -> DownloadProfile:
+    # subtitlesformat wymuszony na "vtt" niezależnie od output_format joba —
+    # transcript_cleaner.py czyści wyłącznie VTT (znaczniki czasu/karaoke
+    # mają tu inny, dużo prostszy format niż w SRT).
+    extra_opts = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitlesformat": "vtt",
+        "outtmpl_template": DEFAULT_OUTTMPL,
+    }
+    if lang:
+        extra_opts["subtitleslangs"] = [lang]
+    return DownloadProfile(selector=None, postprocessors=[], extra_opts=extra_opts)
+
+
 def _playlist_profile(output_format: str) -> DownloadProfile:
     if output_format == "mp4":
         base = VIDEO
@@ -129,11 +145,6 @@ def get_profile(
         return _playlist_profile(output_format)
 
     if mode == "transcript":
-        # TODO(następna sesja): profil transcript wymaga skip_download=True
-        # + VTT i post-processingu tekstowego przez transcript_cleaner.py
-        # (Warstwa 7 specyfikacji) — nie implementowany w tej sesji.
-        raise NotImplementedError(
-            "Profil transcript wchodzi w kolejnej sesji wraz z transcript_cleaner.py."
-        )
+        return _transcript_profile(lang=subtitle_lang)
 
     raise ValueError(f"Nieznany tryb pobierania: {mode!r}")
