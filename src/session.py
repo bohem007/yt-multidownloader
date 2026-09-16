@@ -25,25 +25,43 @@ _MESSAGE = "message"
 _RESULT_PATH = "result_path"
 _RESULT_DATA = "result_data"
 _RESULT_FILE_NAME = "result_file_name"
+_RESULT_UPLOADER = "result_uploader"
+_RESULT_TITLE = "result_title"
 _ERROR_MESSAGE = "error_message"
 _JOB_ID = "job_id"
 _DB_JOB_ID = "db_job_id"
 _STARTED_AT = "started_at"
 _QUEUE = "queue"
 _SESSION_ID = "session_id"
+_URL_LOCKED = "url_locked"
+_LAST_MODE_FORMAT = "last_mode_format"
+_SUBTITLE_LANG = "subtitle_lang"
+
+# Pola "wyniku" zadania — czyszczone razem przy starcie nowego zadania
+# (set_running) i przy zmianie trybu/formatu z URL wciąż wypełnionym
+# (clear_result). NIE obejmuje url_locked/last_mode_format/subtitle_lang
+# (Warstwa 2, UX) — te żyją niezależnie od pojedynczego zadania.
+_RESULT_FIELDS: dict = {
+    _RESULT_PATH: None,
+    _RESULT_DATA: None,
+    _RESULT_FILE_NAME: None,
+    _RESULT_UPLOADER: None,
+    _RESULT_TITLE: None,
+    _ERROR_MESSAGE: None,
+}
 
 _DEFAULTS: dict = {
     _STATUS: "idle",
     _PERCENT: 0.0,
     _MESSAGE: "",
-    _RESULT_PATH: None,
-    _RESULT_DATA: None,
-    _RESULT_FILE_NAME: None,
-    _ERROR_MESSAGE: None,
     _JOB_ID: None,
     _DB_JOB_ID: None,
     _STARTED_AT: None,
     _QUEUE: None,
+    _URL_LOCKED: False,
+    _LAST_MODE_FORMAT: None,
+    _SUBTITLE_LANG: None,
+    **_RESULT_FIELDS,
 }
 
 
@@ -78,6 +96,14 @@ class SessionState:
         return self._store[_RESULT_FILE_NAME]
 
     @property
+    def result_uploader(self) -> str | None:
+        return self._store[_RESULT_UPLOADER]
+
+    @property
+    def result_title(self) -> str | None:
+        return self._store[_RESULT_TITLE]
+
+    @property
     def error_message(self) -> str | None:
         return self._store[_ERROR_MESSAGE]
 
@@ -106,6 +132,25 @@ class SessionState:
             self._store[_SESSION_ID] = str(uuid.uuid4())
         return self._store[_SESSION_ID]
 
+    @property
+    def url_locked(self) -> bool:
+        """True, gdy pole URL ma być zablokowane do edycji (URL już wpisany)."""
+        return self._store[_URL_LOCKED]
+
+    @property
+    def last_mode_format(self) -> tuple[str, str] | None:
+        """(mode, output_format) zapamiętane z poprzedniego przebiegu —
+        do wykrywania zmiany trybu/formatu (Warstwa 2, UX)."""
+        return self._store[_LAST_MODE_FORMAT]
+
+    @property
+    def subtitle_lang(self) -> str | None:
+        """Język napisów użyty w OSTATNIM zleconym zadaniu — potrzebny
+        przy budowie nazwy pliku (src/naming.py) już po zakończeniu, gdy
+        widżet wyboru języka z chwili kliknięcia "Pobierz" dawno przestał
+        istnieć w bieżącym przebiegu skryptu."""
+        return self._store[_SUBTITLE_LANG]
+
     def reset(self) -> None:
         self._store.update(_DEFAULTS)
 
@@ -113,12 +158,20 @@ class SessionState:
         self._store[_STATUS] = "running"
         self._store[_PERCENT] = 0.0
         self._store[_MESSAGE] = ""
-        self._store[_RESULT_PATH] = None
-        self._store[_RESULT_DATA] = None
-        self._store[_RESULT_FILE_NAME] = None
-        self._store[_ERROR_MESSAGE] = None
+        self._store.update(_RESULT_FIELDS)
 
-    def begin_job(self, job_id: str) -> "queue_module.Queue":
+    def clear_result(self) -> None:
+        """Czyści wynik/komunikaty poprzedniego zadania (status->idle),
+        ale NIE dotyka url_locked, session_id ani last_mode_format —
+        używane przy zmianie trybu/formatu z URL wciąż wypełnionym.
+        Odpowiednik set_running(), tylko status wraca do "idle", nie
+        "running" (żadne zadanie faktycznie nie startuje)."""
+        self._store[_STATUS] = "idle"
+        self._store[_PERCENT] = 0.0
+        self._store[_MESSAGE] = ""
+        self._store.update(_RESULT_FIELDS)
+
+    def begin_job(self, job_id: str, subtitle_lang: str | None = None) -> "queue_module.Queue":
         """Startuje nowe zadanie: status->running, nowe job_id, świeża
         kolejka na zdarzenia postępu (most z wątku w tle) i znacznik czasu
         startu. Zwraca kolejkę, którą wołający ma podłączyć do callbacku
@@ -126,12 +179,19 @@ class SessionState:
         self.set_running()
         self._store[_JOB_ID] = job_id
         self._store[_STARTED_AT] = time.monotonic()
+        self._store[_SUBTITLE_LANG] = subtitle_lang
         q: queue_module.Queue = queue_module.Queue()
         self._store[_QUEUE] = q
         return q
 
     def set_db_job_id(self, db_job_id: int) -> None:
         self._store[_DB_JOB_ID] = db_job_id
+
+    def set_url_locked(self, locked: bool) -> None:
+        self._store[_URL_LOCKED] = locked
+
+    def set_last_mode_format(self, mode_format: tuple[str, str]) -> None:
+        self._store[_LAST_MODE_FORMAT] = mode_format
 
     def set_progress(self, percent: float, message: str) -> None:
         self._store[_STATUS] = "running"
@@ -144,12 +204,16 @@ class SessionState:
         *,
         data: bytes | None = None,
         file_name: str | None = None,
+        uploader: str | None = None,
+        title: str | None = None,
     ) -> None:
         self._store[_STATUS] = "done"
         self._store[_PERCENT] = 100.0
         self._store[_RESULT_PATH] = result_path
         self._store[_RESULT_DATA] = data
         self._store[_RESULT_FILE_NAME] = file_name
+        self._store[_RESULT_UPLOADER] = uploader
+        self._store[_RESULT_TITLE] = title
 
     def set_error(self, message: str) -> None:
         self._store[_STATUS] = "error"
