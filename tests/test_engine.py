@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+import src.engine as engine_module
 from src import storage
 from src.engine import DownloadEngine, DownloadJob, EngineError, list_available_subtitles
 from src.errors import InvalidUrlError
@@ -20,6 +21,14 @@ TEST_VIDEO_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 # Film z polskim audio/napisami, na którym wykryto błąd "brak napisów" —
 # domyślne subtitleslangs=["en"] w yt-dlp nic nie znajdowało.
 POLISH_TEST_VIDEO_URL = "https://www.youtube.com/watch?v=6eBSHbLKuN0"
+
+# TED talk (Ken Robinson, "Do schools kill creativity?") — manualne napisy
+# EN z prawdziwą interpunkcją, ~20 minut. TEST_VIDEO_URL ("Me at the zoo",
+# 19s) ma manualne napisy BEZ ŻADNEJ kończącej interpunkcji (potwierdzone
+# manualnie: cały transkrypt to jedno "zdanie") — strukturalnie nie może
+# wygenerować >1 akapitu, więc test podziału na akapity potrzebuje dłuższego
+# materiału z realną interpunkcją.
+LONG_TEST_VIDEO_URL = "https://www.youtube.com/watch?v=iG9CE55wbtY"
 
 
 def test_submit_invalid_url_raises_engine_error_with_original_exception():
@@ -163,6 +172,111 @@ def test_engine_submit_subtitle_downloads_manual_caption_not_phantom_media_file(
         assert result.path.exists()
         assert result.path.suffix == ".srt"
         assert result.path.stat().st_size > 0
+    finally:
+        if result is not None:
+            storage.cleanup(result.path.parent)
+
+
+class _FakeYDL:
+    """Podstawia yt_dlp.YoutubeDL — extract_info() zwraca info_dict przekazany
+    z zewnątrz, bez żadnego realnego zapytania do sieci. Wystarczy do
+    przetestowania _finalize_transcript bez czekania na prawdziwe pobranie
+    (patrz test_engine_submit_transcript_downloads_and_cleans_manual_caption_to_txt
+    dla wersji integracyjnej z realnym VTT z YouTube)."""
+
+    def __init__(self, opts: dict, info: dict) -> None:
+        self._opts = opts
+        self._info = info
+
+    def __enter__(self) -> "_FakeYDL":
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+    def extract_info(self, url: str, download: bool = True) -> dict:
+        return self._info
+
+
+def test_engine_submit_transcript_mode_converts_vtt_to_txt(monkeypatch, tmp_path):
+    """Regresja: submit() w trybie transcript musi zwrócić .txt oczyszczony
+    przez transcript_cleaner, a NIE surowy .vtt zwracany przez _resolve_result
+    (dokładnie ta sama ścieżka rozwiązywania co Subtitle) — i musi usunąć
+    oryginalny plik .vtt (użytkownik dostaje tylko czysty tekst)."""
+    vtt_path = tmp_path / "Video.en.vtt"
+    vtt_path.write_text(
+        "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello world.\n", encoding="utf-8"
+    )
+
+    fake_info = {
+        "requested_subtitles": {"en": {"filepath": str(vtt_path)}},
+        # Fantomowy wpis medialny (skip_download=True) — nigdy nie istnieje
+        # na dysku, _resolve_result musi go zignorować (patrz .exists() guard).
+        "requested_downloads": [{"filepath": str(tmp_path / "Video.en.mp4")}],
+        "uploader": "Channel",
+        "title": "Video",
+    }
+
+    monkeypatch.setattr(
+        engine_module, "YoutubeDL", lambda opts: _FakeYDL(opts, fake_info)
+    )
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url="https://www.youtube.com/watch?v=jNQXAC9IVRw",
+        mode="transcript",
+        output_format="txt",
+        session_id="test-session",
+        job_id="test-job-transcript-mock",
+        subtitle_lang="en",
+    )
+
+    result = engine.submit(job)
+
+    assert result.path.suffix == ".txt"
+    assert result.path.read_text(encoding="utf-8") == "Hello world."
+    assert not vtt_path.exists()
+    assert result.uploader == "Channel"
+    assert result.title == "Video"
+
+
+@pytest.mark.slow
+def test_engine_submit_transcript_downloads_and_cleans_manual_caption_to_txt():
+    """Regresja end-to-end: tryb Transkrypt reużywa dokładnie tę samą ścieżkę
+    resolvowania co Subtitle (patrz test wyżej dla manualnych napisów), ale
+    dodatkowo przepuszcza wynik przez transcript_cleaner (dedup + podział na
+    akapity) — wynikowy plik musi być .txt, bez timestampów/tagów VTT, bez
+    oczywistych zduplikowanych zdań pod rząd (rolling captions), i z
+    faktycznym podziałem na akapity (materiał jest długi — patrz komentarz
+    przy LONG_TEST_VIDEO_URL o tym, czemu TEST_VIDEO_URL do tego nie wystarcza)."""
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=LONG_TEST_VIDEO_URL,
+        mode="transcript",
+        output_format="txt",
+        session_id="test-session",
+        job_id="test-job-transcript",
+        subtitle_lang="en",
+    )
+
+    result = None
+    try:
+        result = engine.submit(job)
+        assert result.path.exists()
+        assert result.path.suffix == ".txt"
+
+        text = result.path.read_text(encoding="utf-8")
+        assert text.strip()
+        assert "-->" not in text
+        assert "WEBVTT" not in text
+        assert "<c>" not in text and "<i>" not in text
+
+        sentences = [s.strip() for s in text.split(".") if s.strip()]
+        for previous, current in zip(sentences, sentences[1:]):
+            assert previous != current, "wykryto zduplikowane zdanie pod rząd"
+
+        assert text.count("\n\n") >= 2, "oczekiwano co najmniej 3 akapitów dla tak długiego materiału"
     finally:
         if result is not None:
             storage.cleanup(result.path.parent)

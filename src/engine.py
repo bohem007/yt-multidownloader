@@ -20,6 +20,7 @@ from src.config import settings
 from src.errors import InvalidUrlError, PlaylistTooLargeError, map_download_error
 from src.profiles import DownloadProfile, get_profile
 from src.progress import ProgressEvent
+from src.transcript_cleaner import clean_vtt_to_text, format_paragraphs
 from src.validators import validate_url
 
 
@@ -114,6 +115,13 @@ class DownloadEngine:
             if result is None:
                 raise RuntimeError("Nie udało się ustalić ścieżki pliku wynikowego po pobraniu.")
 
+            if job.mode == "transcript":
+                # Ta sama ścieżka resolvowania co Subtitle (profil transcript
+                # zawsze wymusza VTT — patrz profiles.py) — różnica jest w
+                # tym, co użytkownik dostaje: surowe napisy nigdy nie
+                # docierają na wierzch, tylko oczyszczony tekst.
+                result = self._finalize_transcript(result)
+
             # yt-dlp nie zawsze zna finalny rozmiar pliku z góry (np. po
             # transkodowaniu FFmpeg do mp3/flac) — limit sprawdzamy
             # post-factum, na podstawie tego, co faktycznie wylądowało na dysku.
@@ -166,6 +174,24 @@ class DownloadEngine:
             return None
 
         return DownloadResult(path=path, uploader=info.get("uploader"), title=info.get("title"))
+
+    @staticmethod
+    def _finalize_transcript(result: DownloadResult) -> DownloadResult:
+        """Zamienia surowy plik VTT (rozwiązany przez _resolve_result tą samą
+        ścieżką co Subtitle) na czysty tekst — użytkownik trybu Transkrypt
+        dostaje WYŁĄCZNIE .txt, nigdy surowych napisów z timestampami."""
+        vtt_content = result.path.read_text(encoding="utf-8")
+        text = clean_vtt_to_text(vtt_content)
+        # Podział na akapity działa na JUŻ OCZYSZCZONYM tekście (po
+        # deduplikacji) — nigdy na surowym VTT, żadnego zgadywania granic
+        # po znacznikach czasu (patrz transcript_cleaner.format_paragraphs).
+        text = format_paragraphs(text)
+
+        txt_path = result.path.with_suffix(".txt")
+        txt_path.write_text(text, encoding="utf-8")
+        result.path.unlink(missing_ok=True)
+
+        return DownloadResult(path=txt_path, uploader=result.uploader, title=result.title)
 
     def _check_playlist_limit(self, url: str) -> None:
         # extract_flat=True: enumeruje pozycje playlisty bez rozwiązywania

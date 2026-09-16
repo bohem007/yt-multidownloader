@@ -46,3 +46,10 @@ def test_very_long_title_with_lang_keeps_lang_intact():
 def test_empty_uploader_and_title_fall_back_to_placeholders():
     name = build_display_filename("", "", "mp4")
     assert name == "Unknown-download.mp4"
+
+
+def test_transcript_filename_with_txt_extension_and_lang():
+    """Tryb Transkrypt reużywa tę samą funkcję co Subtitle — .txt z lang
+    musi działać bez żadnych zmian w naming.py (generyczny parametr ext)."""
+    name = build_display_filename("Some Channel", "Cool Video Title", "txt", lang="en")
+    assert name == "Some Channel-Cool Video Title.en.txt"
