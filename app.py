@@ -24,6 +24,7 @@ from src.db import Database
 from src.engine import DownloadJob, list_available_subtitles
 from src.errors import InvalidUrlError, map_download_error
 from src.job_runner import JobRunner
+from src.naming import build_display_filename
 from src.progress import ProgressEvent
 from src.session import SessionState
 from src.validators import validate_url
@@ -37,6 +38,10 @@ MODE_LABELS = {
 }
 MODE_KEYS_BY_LABEL = {label: key for key, label in MODE_LABELS.items()}
 READY_MODES = {"video", "audio", "subtitle"}
+# YouTube automatic_captions zawiera pełną listę celów auto-tłumaczenia
+# (potrafi być >150 kodów) — dla auto-napisów pokazujemy tylko te języki,
+# niezależnie od tego, czy dla danego filmu istnieją też manualne napisy.
+AUTOMATIC_SUBTITLE_LANGS = ("pl", "de", "en")
 
 
 @st.cache_resource
@@ -98,12 +103,22 @@ def _render_progress(state: SessionState) -> None:
             except queue_module.Empty:
                 break
 
-            if event.event_type in ("on_start", "on_progress"):
+            if event.event_type == "on_finished" and event.result_path is None:
+                # Wczesny "on_finished" z progress_hooks w engine.py — sam
+                # DOWNLOAD się skończył, ale postprocessing (ffmpeg/zapis
+                # napisów) jeszcze trwa, więc job_runner.py NIE dołączył
+                # jeszcze prawdziwego result_path (patrz jego komentarz).
+                # To NIE jest terminal — inaczej UI kończyłoby z "nie
+                # znaleziono pliku wynikowego" niemal przy każdym pobraniu,
+                # bo ten event prawie zawsze trafia do kolejki, zanim
+                # postprocessing zdąży się zakończyć.
+                state.set_progress(event.percent, event.message)
+            elif event.event_type in ("on_start", "on_progress"):
                 state.set_progress(event.percent, event.message)
             elif event.event_type in ("on_finished", "on_error"):
-                # Ostatni terminal event w kolejce wygrywa — patrz komentarz
-                # w job_runner.py o dwóch "on_finished" (koniec pobierania
-                # vs. koniec całego submit(), łącznie z postprocessingiem).
+                # Ostatni terminal event w kolejce wygrywa — dociera tu
+                # tylko prawdziwie terminalny "on_finished" (result_path
+                # ustawiony przez job_runner.py) albo "on_error".
                 terminal_event = event
 
     if terminal_event is not None:
@@ -127,7 +142,13 @@ def _render_progress(state: SessionState) -> None:
                 # Wczytane do RAM — katalog tymczasowy natychmiast usuwamy,
                 # zgodnie z Warstwą 10 (brak trwałych plików na serwerze).
                 storage.cleanup(result_file.parent)
-                state.set_done(result_file, data=data, file_name=result_file.name)
+                state.set_done(
+                    result_file,
+                    data=data,
+                    file_name=result_file.name,
+                    uploader=terminal_event.result_uploader,
+                    title=terminal_event.result_title,
+                )
                 _log_job_finish(state, status="done", duration_ms=duration_ms, file_size_bytes=len(data))
         else:
             state.set_error(terminal_event.message)
@@ -151,11 +172,24 @@ def _render_result(state: SessionState) -> None:
         st.error("Brak danych wynikowych.")
         return
 
+    # Nazwa widoczna dla użytkownika ({Uploader}-{Tytuł}[.{jezyk}].{ext})
+    # jest NIEZALEŻNA od wewnętrznej nazwy pliku na dysku serwera (patrz
+    # src/naming.py) — ta ostatnia i tak już nie istnieje (usunięta zaraz
+    # po wczytaniu do RAM), result_file_name służy tu tylko do ustalenia
+    # prawdziwego rozszerzenia i do zgadywania MIME.
+    ext = Path(state.result_file_name or "").suffix.lstrip(".") or "bin"
+    display_name = build_display_filename(
+        state.result_uploader or "",
+        state.result_title or (state.result_file_name or "download"),
+        ext,
+        lang=state.subtitle_lang,
+    )
+
     st.success("Pobieranie zakończone.")
     st.download_button(
         "Zapisz plik",
         data=state.result_data,
-        file_name=state.result_file_name or "output",
+        file_name=display_name,
         mime=_guess_mime(state.result_file_name),
         key="download_result_button",
     )
@@ -177,9 +211,23 @@ if settings.environment == "production":
 tab_download, tab_history = st.tabs(["Pobieranie", "Historia"])
 
 with tab_download:
+    # disabled=state.url_locked celowo czyta wartość USTAWIONĄ NA KOŃCU
+    # POPRZEDNIEGO przebiegu, nie przeliczoną tutaj na nowo: Streamlit nie
+    # przyjmuje nowej wartości widgetu, jeśli w TYM SAMYM przebiegu jest on
+    # renderowany jako disabled=True (przetestowane empirycznie przez
+    # AppTest — próba przeliczenia "na żywo" powodowała, że wpisany URL
+    # nigdy nie był przyjmowany). Blokada włącza się więc z jednorenderowym
+    # opóźnieniem: widoczna dopiero przy NASTĘPNEJ interakcji po wpisaniu
+    # URL — to jest poprawne zachowanie Streamlit, nie błąd.
     url = st.text_input(
-        "URL", placeholder="https://www.youtube.com/watch?v=...", key="url_input"
+        "URL",
+        placeholder="https://www.youtube.com/watch?v=...",
+        key="url_input",
+        disabled=state.url_locked,
     )
+    # Blokada włącza się, gdy URL jest wypełniony — jedyny sposób jego
+    # odblokowania to przycisk "Nowy URL" niżej (pełny reset).
+    state.set_url_locked(bool(url))
 
     mode_label = st.selectbox("Tryb", list(MODE_LABELS.values()), key="mode_select")
     mode = MODE_KEYS_BY_LABEL[mode_label]
@@ -219,8 +267,16 @@ with tab_download:
                 st.warning("Nie udało się sprawdzić dostępnych napisów dla tego adresu.")
                 subtitle_lang_missing = True
             else:
-                # Manualne napisy przed automatycznymi, bez duplikatów.
-                lang_options = list(dict.fromkeys(available["manual"] + available["automatic"]))
+                # automatic_captions z YouTube zawiera pełną listę CELÓW
+                # auto-tłumaczenia (potrafi być >150 kodów), nie tylko
+                # natywny język auto-napisów — bez ograniczenia do
+                # wybranych języków selectbox pokazywałby praktycznie
+                # każdy język świata. Manualne napisy pokazujemy zawsze
+                # w całości, bez duplikatów.
+                allowed_automatic = [
+                    lang for lang in AUTOMATIC_SUBTITLE_LANGS if lang in available["automatic"]
+                ]
+                lang_options = list(dict.fromkeys(available["manual"] + allowed_automatic))
                 if not lang_options:
                     st.warning("Nie znaleziono żadnych napisów dla tego materiału.")
                     subtitle_lang_missing = True
@@ -236,6 +292,16 @@ with tab_download:
     elif mode == "transcript":
         st.info("Tryb Transkrypt jest w przygotowaniu — wkrótce dostępny.")
 
+    # Zmiana trybu/formatu przy URL wciąż wypełnionym chowa wynik/błąd
+    # POPRZEDNIEGO zadania (i "Zapisz plik") — ale nie dotyka pola URL.
+    # Tylko jeśli jest faktycznie coś do wyczyszczenia (is_terminal()) —
+    # w trakcie pobierania (status "running") zmiana widgetów nie ma tu
+    # znaczenia, bo są zablokowane niżej przez download_disabled/inne joby.
+    current_mode_format = (mode, output_format)
+    if state.is_terminal() and state.last_mode_format not in (None, current_mode_format):
+        state.clear_result()
+    state.set_last_mode_format(current_mode_format)
+
     cookie_upload = st.file_uploader(
         "cookies.txt (opcjonalnie — pomaga ominąć bot-check YouTube)",
         type=["txt"],
@@ -249,8 +315,35 @@ with tab_download:
     job_in_progress = state.status == "running"
     subtitle_blocked = mode == "subtitle" and subtitle_lang_missing
     download_disabled = mode not in READY_MODES or not url or job_in_progress or subtitle_blocked
+    # "Nowy URL" nie może przerwać aktywnego pobierania — zerwałoby to
+    # wątek w tle i zostawiłoby niezwolniony permit semafora współbieżności.
+    new_url_disabled = not url or job_in_progress
 
-    if st.button("Pobierz", key="download_button", disabled=download_disabled):
+    def _start_new_url() -> None:
+        # on_click (nie st.rerun() po zwykłym if-bloku): callback wykonuje
+        # się PRZED narysowaniem widgetów w tym samym przebiegu, więc
+        # czyszczenie st.session_state["url_input"] tutaj jest bezpieczne —
+        # zrobione PO tym, jak text_input() już narysuje pole w tym
+        # przebiegu, Streamlit rzuciłby wyjątkiem ("cannot be modified
+        # after widget ... is instantiated").
+        state.reset()
+        st.session_state["url_input"] = ""
+
+    col_download, col_new_url = st.columns(2)
+    with col_download:
+        download_clicked = st.button(
+            "Pobierz", key="download_button", disabled=download_disabled, width="stretch"
+        )
+    with col_new_url:
+        st.button(
+            "Nowy URL",
+            key="new_url_button",
+            disabled=new_url_disabled,
+            on_click=_start_new_url,
+            width="stretch",
+        )
+
+    if download_clicked:
         if not validate_url(url):
             st.error(map_download_error(InvalidUrlError(url)))
         elif not runner.is_slot_available():
@@ -274,7 +367,7 @@ with tab_download:
             except Exception:
                 db_job_id = None
 
-            job_queue = state.begin_job(job_id)
+            job_queue = state.begin_job(job_id, subtitle_lang=subtitle_lang)
             if db_job_id is not None:
                 state.set_db_job_id(db_job_id)
 
