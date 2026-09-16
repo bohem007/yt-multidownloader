@@ -26,6 +26,20 @@ class FileTooLargeError(Exception):
 
 
 _BOT_CHECK_MARKERS = ("confirm you're not a bot", "sign in to confirm", "not a bot")
+# Osobny, jednoznaczny przypadek od _BOT_CHECK_MARKERS: "Sign in to confirm
+# your age" (brak/nieważne cookies — problem DO ROZWIĄZANIA przez wgranie
+# cookies.txt) zawsze zawiera "sign in to confirm", więc trafia w gałąź
+# bot-check WCZEŚNIEJ (sprawdzaną pierwszą) i nigdy nie dociera tutaj.
+# "Sorry, this content is age-restricted" pojawia się natomiast NAWET z
+# prawidłowymi, świeżymi cookies — NIE jest to problem konta Google
+# użytkownika (potwierdzone: to samo konto ogląda tę treść normalnie w
+# przeglądarce). To udokumentowane, aktualne ograniczenie yt-dlp
+# (github.com/yt-dlp/yt-dlp/issues/17619): dla zalogowanych sesji YouTube
+# coraz częściej wymaga środowiska JS (Deno/Node) do rozwiązania wyzwań
+# szyfrujących, którego świadomie nie dodajemy (zbyt duży wzrost zakresu) —
+# stąd komunikat opisuje to jako ograniczenie narzędzia, nie instrukcję do
+# naprawienia przez użytkownika.
+_AGE_RESTRICTED_MARKERS = ("content is age-restricted",)
 _SUBTITLE_MARKERS = ("subtitle", "subtitles")
 
 
@@ -58,6 +72,15 @@ def map_download_error(exc: Exception) -> str:
                 "YouTube wymaga potwierdzenia, że nie jesteś botem. Wgraj plik "
                 "cookies.txt (wyeksportowany z zalogowanej sesji przeglądarki) "
                 "i spróbuj ponownie."
+            )
+
+        if any(marker in message for marker in _AGE_RESTRICTED_MARKERS):
+            return (
+                "YouTube blokuje pobranie tego materiału pomimo prawidłowych "
+                "cookies — to znane, aktualne ograniczenie techniczne yt-dlp "
+                "dla części treści z ograniczeniem wiekowym, niezwiązane "
+                "z ustawieniami Twojego konta Google. Aplikacja obecnie nie "
+                "obsługuje obejścia tego ograniczenia."
             )
 
         if any(marker in message for marker in _SUBTITLE_MARKERS):
