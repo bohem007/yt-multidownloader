@@ -6,6 +6,8 @@ Wymaga dostępu do internetu i ffmpeg na PATH.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 import src.engine as engine_module
@@ -239,6 +241,101 @@ def test_engine_submit_transcript_mode_converts_vtt_to_txt(monkeypatch, tmp_path
     assert not vtt_path.exists()
     assert result.uploader == "Channel"
     assert result.title == "Video"
+
+
+def test_engine_submit_passes_cookiefile_to_every_ydl_instance(monkeypatch, tmp_path):
+    """Regresja: cookies.txt wgrany przez użytkownika (app.py przekazuje
+    surowe bajty jako job.cookie_data, NIE ścieżkę) musi trafić do yt_dlp
+    jako 'cookiefile' wskazujący na ISTNIEJĄCY plik na dysku z tą samą
+    zawartością — w KAŻDYM wywołaniu YoutubeDL, w tym w sondzie
+    _check_playlist_limit (bez cookiefile tam materiał z ograniczeniem
+    wiekowym nigdy nie dociera do głównego pobrania, które cookies miało).
+    Sprawdzamy realne opcje przekazane do YoutubeDL, nie tylko brak wyjątku."""
+    media_path = tmp_path / "Video.mp4"
+    media_path.write_bytes(b"fake mp4 bytes")
+
+    fake_info = {
+        "requested_downloads": [{"filepath": str(media_path)}],
+        "uploader": "Channel",
+        "title": "Video",
+    }
+
+    captured_opts: list[dict] = []
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        captured_opts.append(opts)
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    cookie_bytes = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tfoo\tbar\n"
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url="https://www.youtube.com/watch?v=jNQXAC9IVRw",
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-cookies",
+        cookie_data=cookie_bytes,
+    )
+
+    result = engine.submit(job)
+
+    assert result.path == media_path
+    # Dwa wywołania YoutubeDL: sonda _check_playlist_limit + główne pobranie —
+    # OBA muszą dostać cookiefile, nie tylko drugie.
+    assert len(captured_opts) == 2
+    for opts in captured_opts:
+        assert "cookiefile" in opts
+        cookiefile_path = Path(opts["cookiefile"])
+        assert cookiefile_path.exists()
+        assert cookiefile_path.read_bytes() == cookie_bytes
+        # Plik cookie żyje w job_dir (tmp_path), nie w systemowym katalogu temp.
+        assert cookiefile_path.parent == tmp_path
+
+
+def test_list_available_subtitles_passes_cookiefile_pointing_to_real_file_with_content(monkeypatch):
+    """Regresja: list_available_subtitles() ma tę samą sondę YoutubeDL co
+    _check_playlist_limit miał przed naprawą — bez cookiefile materiał z
+    ograniczeniem wiekowym nigdy nie zwróci listy języków, niezależnie od
+    tego, czy użytkownik wgrał cookies.txt (UI pokazywałby "nie znaleziono
+    napisów" mimo poprawnych cookies do właściwego pobrania). Sprawdzamy
+    realne opcje przekazane do YoutubeDL, nie tylko brak wyjątku — i że
+    tymczasowy plik cookie jest usuwany zaraz po sondzie (nie żyje w job_dir,
+    bo ta funkcja jest wołana PRZED istnieniem joba)."""
+    fake_info = {"subtitles": {"en": {}}, "automatic_captions": {}}
+
+    captured_opts: list[dict] = []
+    captured_cookiefile_content: list[bytes] = []
+    captured_cookiefile_path: list[Path] = []
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        captured_opts.append(opts)
+        if "cookiefile" in opts:
+            path = Path(opts["cookiefile"])
+            # Musi istnieć TERAZ, w trakcie sondy — funkcja usuwa go
+            # dopiero po zamknięciu YoutubeDL, więc czytamy zawartość tutaj.
+            assert path.exists()
+            captured_cookiefile_content.append(path.read_bytes())
+            captured_cookiefile_path.append(path)
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+
+    cookie_bytes = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tfoo\tbar\n"
+    result = engine_module.list_available_subtitles(
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw", cookie_data=cookie_bytes
+    )
+
+    assert result == {"manual": ["en"], "automatic": []}
+    assert len(captured_opts) == 1
+    assert "cookiefile" in captured_opts[0]
+    assert captured_cookiefile_content == [cookie_bytes]
+    # Sprzątnięty natychmiast po sondzie — ta funkcja nie ma job_dir do
+    # późniejszego storage.cleanup(), więc musi posprzątać sama.
+    assert not captured_cookiefile_path[0].exists()
 
 
 @pytest.mark.slow

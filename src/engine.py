@@ -9,6 +9,7 @@ widocznej dla użytkownika — patrz _resolve_result.
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -31,7 +32,14 @@ class DownloadJob:
     output_format: str
     session_id: str
     job_id: str
-    cookiefile: str | None = None
+    # Surowa zawartość wgranego cookies.txt (nie ścieżka!) — yt_dlp wymaga
+    # ŚCIEŻKI DO PLIKU na dysku w opcji cookiefile, więc submit() zapisuje
+    # te bajty do pliku w katalogu roboczym TEGO joba (patrz _write_cookiefile)
+    # i przekazuje wynikową ścieżkę dalej. Trzymanie tu tylko bytes (nie
+    # ścieżki wyznaczonej wcześniej przez app.py) gwarantuje, że plik cookie
+    # żyje wyłącznie w job_dir i jest sprzątany razem z resztą (storage.cleanup),
+    # zamiast osierocanego pliku w systemowym katalogu temp.
+    cookie_data: bytes | None = None
     audio_bitrate_kbps: int | None = None
     subtitle_lang: str | None = None
 
@@ -64,15 +72,57 @@ class EngineError(Exception):
 OnEventCallback = Callable[[ProgressEvent], None]
 
 
-def list_available_subtitles(url: str) -> dict[str, list[str]]:
+def _base_ydl_opts(cookiefile: str | None = None) -> dict:
+    """Opcje wspólne dla KAŻDEJ instancji YoutubeDL w tym module — sond
+    (list_available_subtitles, _check_playlist_limit) i głównego pobrania
+    (_build_ydl_opts). cookiefile musi trafiać do WSZYSTKICH, w jednym
+    miejscu, bez duplikowania logiki — inaczej materiał z ograniczeniem
+    wiekowym pada już na sondzie, która go nie miała (dokładnie to był bug
+    w _check_playlist_limit przed naprawą).
+
+    Próba obejścia github.com/yt-dlp/yt-dlp/issues/17619 przez wymuszenie
+    extractor_args player_client=["mweb"] tutaj została WYCOFANA — łamała
+    ekstrakcję formatów dla zwykłych żądań bez ograniczenia wiekowego
+    (potwierdzone: "No video formats found!" na standardowym wideo
+    testowym). Dla treści z ograniczeniem wiekowym, którego cookies nie
+    ominą, patrz komunikat _AGE_RESTRICTED_MARKERS w errors.py."""
+    opts: dict = {"quiet": True, "no_warnings": True}
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+    return opts
+
+
+def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict[str, list[str]]:
     """Dostępne języki napisów dla materiału — osobno manualne
     (info_dict['subtitles']) i automatyczne (info_dict['automatic_captions']).
 
     Bez tego wiele filmów (zwłaszcza nieanglojęzycznych) nie ma ŻADNYCH
-    napisów w domyślnym języku yt-dlp (subtitleslangs=["en"])."""
-    probe_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    with YoutubeDL(probe_opts) as probe:
-        info = probe.extract_info(url, download=False)
+    napisów w domyślnym języku yt-dlp (subtitleslangs=["en"]).
+
+    Ta sonda ma ten sam problem, jaki miał _check_playlist_limit przed
+    naprawą: dla materiału z ograniczeniem wiekowym YouTube wymaga cookies
+    już na etapie SAMEJ próby odczytu metadanych (nie tylko pobrania) — bez
+    cookiefile tutaj UI nigdy nie pokaże listy języków, niezależnie od tego,
+    czy użytkownik wgrał cookies.txt do właściwego pobrania. Wywoływana poza
+    kontekstem joba (przed jego utworzeniem, więc bez job_dir), stąd własny,
+    tymczasowy plik zamiast _write_cookiefile z DownloadEngine — usuwany
+    natychmiast po sondzie, nie przeżywa jej."""
+    cookiefile_path: Path | None = None
+    if cookie_data:
+        fd, raw_path = tempfile.mkstemp(suffix=".txt", prefix="cookies-probe-")
+        cookiefile_path = Path(raw_path)
+        with open(fd, "wb") as f:
+            f.write(cookie_data)
+
+    probe_opts = _base_ydl_opts(str(cookiefile_path) if cookiefile_path else None)
+    probe_opts["skip_download"] = True
+
+    try:
+        with YoutubeDL(probe_opts) as probe:
+            info = probe.extract_info(url, download=False)
+    finally:
+        if cookiefile_path is not None:
+            cookiefile_path.unlink(missing_ok=True)
 
     if not info:
         return {"manual": [], "automatic": []}
@@ -89,9 +139,16 @@ class DownloadEngine:
             if not validate_url(job.url):
                 raise InvalidUrlError(job.url)
 
-            self._check_playlist_limit(job.url)
-
             job_dir = storage.create(job.session_id, job.job_id)
+            cookiefile_path = self._write_cookiefile(job.cookie_data, job_dir)
+
+            # Sonda limitu playlisty MUSI dostać te same cookies co główne
+            # pobranie — dla materiału z ograniczeniem wiekowym błąd "Sign in
+            # to confirm your age" pojawia się już na etapie tej sondy
+            # (extract_flat=True nie omija weryfikacji wieku dla pojedynczego
+            # wideo), więc bez cookiefile TUTAJ żądanie nigdy nie dociera do
+            # dalszej części submit(), która cookies faktycznie miała.
+            self._check_playlist_limit(job.url, cookiefile_path)
 
             profile = get_profile(
                 job.mode,
@@ -99,7 +156,7 @@ class DownloadEngine:
                 audio_bitrate_kbps=job.audio_bitrate_kbps,
                 subtitle_lang=job.subtitle_lang,
             )
-            ydl_opts = self._build_ydl_opts(job, profile, job_dir, on_event)
+            ydl_opts = self._build_ydl_opts(job, profile, job_dir, on_event, cookiefile_path)
 
             with YoutubeDL(ydl_opts) as ydl:
                 # extract_info(download=True) (a nie ydl.download()) — tylko
@@ -193,15 +250,26 @@ class DownloadEngine:
 
         return DownloadResult(path=txt_path, uploader=result.uploader, title=result.title)
 
-    def _check_playlist_limit(self, url: str) -> None:
+    @staticmethod
+    def _write_cookiefile(cookie_data: bytes | None, job_dir: Path) -> str | None:
+        """yt_dlp wymaga ŚCIEŻKI DO PLIKU na dysku w opcji cookiefile — nie
+        przyjmuje bajtów/UploadedFile bezpośrednio. Zapisuje do job_dir (nie
+        systemowego katalogu temp), żeby plik zniknął wraz z resztą przy
+        storage.cleanup(job_dir) — zarówno po sukcesie, jak i po błędzie
+        (patrz except w submit()) — cookies sesji nie mają powodu przeżyć
+        joba, który je zużył."""
+        if not cookie_data:
+            return None
+        cookiefile_path = job_dir / "cookies.txt"
+        cookiefile_path.write_bytes(cookie_data)
+        return str(cookiefile_path)
+
+    def _check_playlist_limit(self, url: str, cookiefile: str | None = None) -> None:
         # extract_flat=True: enumeruje pozycje playlisty bez rozwiązywania
         # pełnych metadanych każdego wideo — szybka walidacja PRZED pobraniem.
-        probe_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "extract_flat": True,
-        }
+        probe_opts = _base_ydl_opts(cookiefile)
+        probe_opts["skip_download"] = True
+        probe_opts["extract_flat"] = True
         with YoutubeDL(probe_opts) as probe:
             info = probe.extract_info(url, download=False)
 
@@ -221,18 +289,21 @@ class DownloadEngine:
         profile: DownloadProfile,
         job_dir: Path,
         on_event: OnEventCallback | None,
+        cookiefile_path: str | None = None,
     ) -> dict:
         outtmpl_template = profile.extra_opts.get("outtmpl_template", "%(title)s.%(ext)s")
         outtmpl = str(job_dir / outtmpl_template)
 
-        ydl_opts: dict = {
-            "outtmpl": outtmpl,
-            "retries": 3,
-            "fragment_retries": 3,
-            "progress_hooks": [self._make_progress_hook(on_event)],
-            "quiet": True,
-            "noprogress": True,
-        }
+        ydl_opts = _base_ydl_opts(cookiefile_path)
+        ydl_opts.update(
+            {
+                "outtmpl": outtmpl,
+                "retries": 3,
+                "fragment_retries": 3,
+                "progress_hooks": [self._make_progress_hook(on_event)],
+                "noprogress": True,
+            }
+        )
 
         if profile.selector:
             ydl_opts["format"] = profile.selector
@@ -244,9 +315,6 @@ class DownloadEngine:
             key: value for key, value in profile.extra_opts.items() if key != "outtmpl_template"
         }
         ydl_opts.update(extra_opts)
-
-        if job.cookiefile:
-            ydl_opts["cookiefile"] = job.cookiefile
 
         return ydl_opts
 
