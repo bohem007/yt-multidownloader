@@ -2,6 +2,8 @@
 
 DownloadEngine.submit() jest wywoływalny synchronicznie — integracja
 z threading.Thread/Semaphore(MAX_CONCURRENT_JOBS) wchodzi w sesji z app.py.
+Zwraca ścieżkę do KONKRETNEGO pliku wynikowego (nie katalogu zadania) —
+patrz _resolve_result_path.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ class DownloadJob:
     job_id: str
     cookiefile: str | None = None
     audio_bitrate_kbps: int | None = None
+    subtitle_lang: str | None = None
 
 
 class EngineError(Exception):
@@ -48,6 +51,24 @@ class EngineError(Exception):
 OnEventCallback = Callable[[ProgressEvent], None]
 
 
+def list_available_subtitles(url: str) -> dict[str, list[str]]:
+    """Dostępne języki napisów dla materiału — osobno manualne
+    (info_dict['subtitles']) i automatyczne (info_dict['automatic_captions']).
+
+    Bez tego wiele filmów (zwłaszcza nieanglojęzycznych) nie ma ŻADNYCH
+    napisów w domyślnym języku yt-dlp (subtitleslangs=["en"])."""
+    probe_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    with YoutubeDL(probe_opts) as probe:
+        info = probe.extract_info(url, download=False)
+
+    if not info:
+        return {"manual": [], "automatic": []}
+
+    manual = sorted((info.get("subtitles") or {}).keys())
+    automatic = sorted((info.get("automatic_captions") or {}).keys())
+    return {"manual": manual, "automatic": automatic}
+
+
 class DownloadEngine:
     def submit(self, job: DownloadJob, on_event: OnEventCallback | None = None) -> Path:
         job_dir: Path | None = None
@@ -59,18 +80,34 @@ class DownloadEngine:
 
             job_dir = storage.create(job.session_id, job.job_id)
 
-            profile = get_profile(job.mode, job.output_format, audio_bitrate_kbps=job.audio_bitrate_kbps)
+            profile = get_profile(
+                job.mode,
+                job.output_format,
+                audio_bitrate_kbps=job.audio_bitrate_kbps,
+                subtitle_lang=job.subtitle_lang,
+            )
             ydl_opts = self._build_ydl_opts(job, profile, job_dir, on_event)
 
             with YoutubeDL(ydl_opts) as ydl:
-                ydl.download([job.url])
+                # extract_info(download=True) (a nie ydl.download()) — tylko
+                # ten wariant zwraca info_dict, z którego wyciągamy
+                # RZECZYWISTĄ ścieżkę pliku PO postprocessingu (patrz
+                # _resolve_result_path). ydl.download() zwraca wyłącznie
+                # kod wyjścia, więc bez tego app.py musiałoby zgadywać
+                # nazwę pliku na podstawie outtmpl sprzed konwersji ffmpeg
+                # (np. .webm zamiast finalnego .mp3) — dokładnie ten bug.
+                info = ydl.extract_info(job.url, download=True)
+
+            result_path = self._resolve_result_path(info)
+            if result_path is None:
+                raise RuntimeError("Nie udało się ustalić ścieżki pliku wynikowego po pobraniu.")
 
             # yt-dlp nie zawsze zna finalny rozmiar pliku z góry (np. po
             # transkodowaniu FFmpeg do mp3/flac) — limit sprawdzamy
             # post-factum, na podstawie tego, co faktycznie wylądowało na dysku.
-            storage.enforce_size_limit(job_dir)
+            storage.enforce_size_limit(result_path)
 
-            return job_dir
+            return result_path
 
         except Exception as exc:
             message = map_download_error(exc)
@@ -78,6 +115,30 @@ class DownloadEngine:
             if job_dir is not None:
                 storage.cleanup(job_dir)
             raise EngineError(message, original_exception=exc) from exc
+
+    @staticmethod
+    def _resolve_result_path(info: dict | None) -> Path | None:
+        """Wyciąga rzeczywistą ścieżkę pliku wynikowego z info_dict PO
+        wszystkich postprocessorach — nigdy nie zgaduje na podstawie
+        outtmpl czy zawartości katalogu."""
+        if not info:
+            return None
+
+        requested_downloads = info.get("requested_downloads") or []
+        if requested_downloads:
+            filepath = requested_downloads[0].get("filepath")
+            if filepath:
+                return Path(filepath)
+
+        # Tryb Subtitle (skip_download=True) nie populuje requested_downloads
+        # — ścieżka zapisanego pliku napisów jest w requested_subtitles.
+        requested_subtitles = info.get("requested_subtitles") or {}
+        for subtitle_info in requested_subtitles.values():
+            filepath = subtitle_info.get("filepath")
+            if filepath:
+                return Path(filepath)
+
+        return None
 
     def _check_playlist_limit(self, url: str) -> None:
         # extract_flat=True: enumeruje pozycje playlisty bez rozwiązywania
