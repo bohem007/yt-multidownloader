@@ -24,7 +24,7 @@ import pytest
 from src import job_runner as job_runner_module
 from src import storage
 from src.config import Settings
-from src.engine import DownloadJob
+from src.engine import DownloadJob, DownloadResult
 from src.job_runner import JobRunner
 from src.progress import ProgressEvent
 
@@ -49,12 +49,12 @@ class _BlockingFakeEngine:
         self.started = threading.Event()
         self.release_gate = threading.Event()
 
-    def submit(self, job: DownloadJob, on_event=None) -> Path:
+    def submit(self, job: DownloadJob, on_event=None) -> DownloadResult:
         self.started.set()
         self.release_gate.wait(timeout=10.0)
         if on_event is not None:
             on_event(ProgressEvent(event_type="on_finished", percent=100.0, message="fake done"))
-        return Path("/fake/path")
+        return DownloadResult(path=Path("/fake/path"), uploader="Fake Uploader", title="Fake Title")
 
 
 @pytest.mark.slow
@@ -118,6 +118,8 @@ def test_final_on_finished_event_carries_result_path_from_engine():
     )
     final_events = [e for e in events if e.event_type == "on_finished"]
     assert final_events[-1].result_path == Path("/fake/path")
+    assert final_events[-1].result_uploader == "Fake Uploader"
+    assert final_events[-1].result_title == "Fake Title"
 
 
 def test_concurrency_limit_makes_second_job_queue(monkeypatch):

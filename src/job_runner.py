@@ -106,21 +106,24 @@ class JobRunner:
 
     def _run(self, job: DownloadJob, on_state: OnStateCallback, semaphore: threading.Semaphore) -> None:
         try:
-            result_path = self._engine.submit(job, on_event=on_state)
+            result = self._engine.submit(job, on_event=on_state)
             # engine.py emituje "on_finished" już z progress_hooks, czyli
             # gdy sam DOWNLOAD się skończy — postprocessing (ffmpeg: mp3/
             # flac/remux) dzieje się PO tym, wciąż wewnątrz submit(). Ten
             # drugi "on_finished", wysyłany dopiero gdy submit() faktycznie
             # wróci, jest jedynym jednoznacznym sygnałem "naprawdę gotowe,
             # bezpiecznie czytać plik z dysku" dla odbiorcy (app.py) —
-            # niesie od razu prawdziwą ścieżkę pliku (result_path) zwróconą
-            # przez yt_dlp, żeby odbiorca nie musiał zgadywać jej sam.
+            # niesie od razu prawdziwy DownloadResult (ścieżka + uploader/
+            # title) zwrócony przez yt_dlp, żeby odbiorca nie musiał
+            # zgadywać/doodpytywać go sam.
             on_state(
                 ProgressEvent(
                     event_type="on_finished",
                     percent=100.0,
                     message="Zakończono",
-                    result_path=result_path,
+                    result_path=result.path,
+                    result_uploader=result.uploader,
+                    result_title=result.title,
                 )
             )
         except EngineError:
