@@ -282,3 +282,26 @@ Drugi udokumentowany edge case (w kodzie transcript_cleaner.py, niekrytyczny):
 skrót przed WIELKĄ literą ("godz. Warszawa nie śpi") wygląda identycznie jak
 koniec zdania i zostanie rozdzielony — rzadkie w praktyce (YouTube
 auto-punktuacja jest uboga), nierozwiązywane bez słownika skrótów.
+
+## Znane ograniczenie: filmy z ograniczeniem wiekowym dla zalogowanych sesji (2026-09-16)
+
+Pobieranie filmów z ograniczeniem wiekowym z prawidłowymi, świeżymi cookies
+kończy się błędem yt-dlp "Sorry, this content is age-restricted" — NIE jest
+to problem z weryfikacją wieku konta Google (potwierdzone: konto użytkownika
+jest w pełni zweryfikowane i może oglądać tę treść normalnie w przeglądarce).
+
+To udokumentowane, aktualne ograniczenie yt-dlp dla zalogowanych sesji
+(https://github.com/yt-dlp/yt-dlp/issues/17619) — wymaga środowiska
+JavaScript (Deno/Node) do rozwiązania wyzwań szyfrujących YouTube, którego
+świadomie nie dodajemy jako zależności projektu (zbyt duży wzrost zakresu:
+nowa zależność binarna + PO tokens wymagające odnawiania).
+
+Wypróbowane i ODRZUCONE obejście: wymuszenie extractor_args
+player_client=["mweb"] we wszystkich opcjach yt_dlp — powoduje regresję
+("No video formats found!") dla zwykłych, nieograniczonych wideo. Nie
+próbować ponownie bez realnych, zalogowanych cookies do weryfikacji korzyści
+przeciw temu kosztowi.
+
+Komunikat błędu w UI (errors.py) uczciwie informuje użytkownika, że to znane
+ograniczenie narzędzia, z linkiem do zgłoszenia — nie sugeruje problemu
+po stronie konta użytkownika.
