@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import mimetypes
 import queue as queue_module
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -51,10 +50,14 @@ def get_database() -> Database:
 
 
 @st.cache_data(ttl=300, show_spinner="Sprawdzanie dostępnych napisów...")
-def _cached_list_available_subtitles(url: str) -> dict[str, list[str]]:
-    """Cache po URL — bez tego zapytanie do YouTube powtarzałoby się przy
-    każdym rerunie skryptu (Streamlit reruje cały plik na każdą interakcję)."""
-    return list_available_subtitles(url)
+def _cached_list_available_subtitles(
+    url: str, cookie_data: bytes | None
+) -> dict[str, list[str]]:
+    """Cache po (URL, cookie_data) — bez tego zapytanie do YouTube powtarzałoby
+    się przy każdym rerunie skryptu (Streamlit reruje cały plik na każdą
+    interakcję). cookie_data w kluczu cache: dla materiału z ograniczeniem
+    wiekowym lista języków zależy od tego, czy sonda miała cookies."""
+    return list_available_subtitles(url, cookie_data=cookie_data)
 
 
 def _guess_mime(file_name: str | None) -> str:
@@ -229,6 +232,21 @@ with tab_download:
     # odblokowania to przycisk "Nowy URL" niżej (pełny reset).
     state.set_url_locked(bool(url))
 
+    cookie_upload = st.file_uploader(
+        "cookies.txt (opcjonalnie — dla filmów 18+ lub blokady bot-check)",
+        type=["txt"],
+        key="cookies_uploader",
+    )
+    # Tylko surowe bajty — NIE zapisujemy tu pliku na dysk. yt_dlp wymaga
+    # ścieżki do pliku w opcji cookiefile, ale ten plik musi żyć w katalogu
+    # roboczym KONKRETNEGO joba (engine.py::_write_cookiefile), żeby zniknął
+    # razem z resztą przy storage.cleanup() — plik w systemowym katalogu
+    # temp (poprzednia implementacja) nigdy nie był sprzątany. Zdefiniowane
+    # PRZED blokiem wyboru trybu, bo lista języków napisów (poniżej, dla
+    # Subtitle/Transcript) też potrzebuje cookies dla materiału z
+    # ograniczeniem wiekowym — patrz list_available_subtitles w engine.py.
+    cookie_data: bytes | None = cookie_upload.getvalue() if cookie_upload is not None else None
+
     mode_label = st.selectbox("Tryb", list(MODE_LABELS.values()), key="mode_select")
     mode = MODE_KEYS_BY_LABEL[mode_label]
 
@@ -270,7 +288,7 @@ with tab_download:
 
         if url:
             try:
-                available = _cached_list_available_subtitles(url)
+                available = _cached_list_available_subtitles(url, cookie_data)
             except Exception:
                 st.warning("Nie udało się sprawdzić dostępnych napisów dla tego adresu.")
                 subtitle_lang_missing = True
@@ -306,16 +324,6 @@ with tab_download:
     if state.is_terminal() and state.last_mode_format not in (None, current_mode_format):
         state.clear_result()
     state.set_last_mode_format(current_mode_format)
-
-    cookie_upload = st.file_uploader(
-        "cookies.txt (opcjonalnie — pomaga ominąć bot-check YouTube)",
-        type=["txt"],
-        key="cookies_uploader",
-    )
-    cookiefile_path: str | None = None
-    if cookie_upload is not None:
-        cookiefile_path = str(Path(tempfile.gettempdir()) / f"cookies-{state.session_id}.txt")
-        Path(cookiefile_path).write_bytes(cookie_upload.getvalue())
 
     job_in_progress = state.status == "running"
     subtitle_blocked = mode in ("subtitle", "transcript") and subtitle_lang_missing
@@ -382,7 +390,7 @@ with tab_download:
                 output_format=output_format,
                 session_id=state.session_id,
                 job_id=job_id,
-                cookiefile=cookiefile_path,
+                cookie_data=cookie_data,
                 audio_bitrate_kbps=audio_bitrate_kbps,
                 subtitle_lang=subtitle_lang,
             )

@@ -50,7 +50,7 @@ def test_subtitle_language_selectbox_filters_automatic_captions_to_allowed_set(m
         "manual": ["fr"],
         "automatic": ["pl", "de", "en", "es", "it", "ja"],
     }
-    monkeypatch.setattr(engine_module, "list_available_subtitles", lambda url: fake_subtitles)
+    monkeypatch.setattr(engine_module, "list_available_subtitles", lambda url, cookie_data=None: fake_subtitles)
 
     at = _run_app(monkeypatch)
     at.text_input(key="url_input").input("https://www.youtube.com/watch?v=jNQXAC9IVRw").run()
@@ -66,7 +66,7 @@ def test_transcript_mode_shows_language_selector_without_format_choice(monkeypat
     filtr pl/de/en), ale NIE pyta o format napisów (SRT/VTT) — zawsze
     czyści VTT do .txt wewnętrznie (patrz profiles.py::_transcript_profile)."""
     fake_subtitles = {"manual": ["en"], "automatic": []}
-    monkeypatch.setattr(engine_module, "list_available_subtitles", lambda url: fake_subtitles)
+    monkeypatch.setattr(engine_module, "list_available_subtitles", lambda url, cookie_data=None: fake_subtitles)
 
     at = _run_app(monkeypatch)
     # URL inny niż w pozostałych testach — _cached_list_available_subtitles
