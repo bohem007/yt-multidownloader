@@ -92,6 +92,34 @@ def test_start_does_not_block_and_reports_finished_eventually():
         storage.cleanup(storage.create(job.session_id, job.job_id))
 
 
+def test_final_on_finished_event_carries_result_path_from_engine():
+    """job_runner._run() musi doczepić do finalnego on_finished ścieżkę
+    wyniku zwróconą przez engine.submit() — app.py opiera na niej
+    wczytanie pliku do RAM, bez zgadywania po katalogu."""
+    fake_engine = _BlockingFakeEngine()
+    runner = JobRunner(engine=fake_engine)
+    events: list[ProgressEvent] = []
+
+    job = DownloadJob(
+        url=TEST_VIDEO_URL,
+        mode="audio",
+        output_format="mp3",
+        session_id="test-session",
+        job_id="job-result-path",
+    )
+
+    assert runner.start(job, on_state=events.append) == "started"
+    assert fake_engine.started.wait(timeout=5.0)
+    fake_engine.release_gate.set()
+
+    assert _wait_until(
+        lambda: any(e.event_type == "on_finished" and e.result_path is not None for e in events),
+        timeout=5.0,
+    )
+    final_events = [e for e in events if e.event_type == "on_finished"]
+    assert final_events[-1].result_path == Path("/fake/path")
+
+
 def test_concurrency_limit_makes_second_job_queue(monkeypatch):
     monkeypatch.setattr(
         job_runner_module, "settings", Settings.from_env({"MAX_CONCURRENT_JOBS": "1"})
