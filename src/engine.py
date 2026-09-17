@@ -148,6 +148,30 @@ def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict
     return {"manual": manual, "automatic": automatic}
 
 
+def count_playlist_items(url: str, cookie_data: bytes | None = None) -> int | None:
+    """Liczy pozycje playlisty przez extract_flat=True (bez rozwiązywania
+    pełnych metadanych każdego wideo) — używane przez UI (app.py) do
+    pokazania realnej liczby pozycji w radiu wyboru zakresu ORAZ do
+    prewencyjnego zablokowania przycisku "Pobierz" PRZED kliknięciem, zamiast
+    czekać, aż _check_playlist_limit zrobi to samo dopiero w submit().
+
+    Zwraca None, jeśli URL w ogóle nie jest playlistą (yt-dlp nie zwróciło
+    `entries`) — wołający (app.py) pokazuje w takim wypadku nieznaną liczbę,
+    nie zero."""
+    with _temp_cookiefile(cookie_data) as cookiefile_path:
+        probe_opts = _base_ydl_opts(cookiefile_path)
+        probe_opts["skip_download"] = True
+        probe_opts["extract_flat"] = True
+
+        with YoutubeDL(probe_opts) as probe:
+            info = probe.extract_info(url, download=False)
+
+    entries = info.get("entries") if info else None
+    if entries is None:
+        return None
+    return sum(1 for entry in entries if entry is not None)
+
+
 class DownloadEngine:
     def submit(self, job: DownloadJob, on_event: OnEventCallback | None = None) -> DownloadResult:
         job_dir: Path | None = None
@@ -164,7 +188,14 @@ class DownloadEngine:
             # (extract_flat=True nie omija weryfikacji wieku dla pojedynczego
             # wideo), więc bez cookiefile TUTAJ żądanie nigdy nie dociera do
             # dalszej części submit(), która cookies faktycznie miała.
-            self._check_playlist_limit(job.url, cookiefile_path)
+            #
+            # Wołana TYLKO gdy playlist_scope=="all" i mode w (video, audio):
+            # dla "single" noplaylist=True i tak ściągnie jedno wideo
+            # niezależnie od tego, ile pozycji ma playlista w URL-u (sonda
+            # byłaby zbędnym zapytaniem do YouTube) — a limit liczby pozycji
+            # w ogóle nie dotyczy Subtitle/Transcript (patrz app.py).
+            if job.playlist_scope == "all" and job.mode in ("video", "audio"):
+                self._check_playlist_limit(job.url, cookiefile_path)
 
             profile = get_profile(
                 job.mode,

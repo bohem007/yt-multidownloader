@@ -151,3 +151,21 @@ def test_set_done_stores_uploader_and_title():
 
     assert state.result_uploader == "Channel"
     assert state.result_title == "Title"
+
+
+def test_playlist_scope_defaults_to_single_and_is_settable():
+    state = SessionState({})
+
+    assert state.playlist_scope == "single"
+
+    state.set_playlist_scope("all")
+    assert state.playlist_scope == "all"
+
+
+def test_reset_returns_playlist_scope_to_single():
+    state = SessionState({})
+    state.set_playlist_scope("all")
+
+    state.reset()
+
+    assert state.playlist_scope == "single"

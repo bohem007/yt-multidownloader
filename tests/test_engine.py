@@ -24,6 +24,12 @@ TEST_VIDEO_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 # domyślne subtitleslangs=["en"] w yt-dlp nic nie znajdowało.
 POLISH_TEST_VIDEO_URL = "https://www.youtube.com/watch?v=6eBSHbLKuN0"
 
+# URL z briefu "Poprawna obsługa URL-i z playlisty" — v= i list= razem
+# (typowy link "autoplay z listy"). Bez noplaylist=True yt-dlp domyślnie
+# rozwiązuje ten URL jako CAŁĄ playlistę (potwierdzone manualnie: 'entries'
+# w info_dict, brak 'duration' pojedynczego wideo) — dokładnie zgłoszony bug.
+MIXED_PLAYLIST_URL = "https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
+
 # TED talk (Ken Robinson, "Do schools kill creativity?") — manualne napisy
 # EN z prawdziwą interpunkcją, ~20 minut. TEST_VIDEO_URL ("Me at the zoo",
 # 19s) ma manualne napisy BEZ ŻADNEJ kończącej interpunkcji (potwierdzone
@@ -79,6 +85,33 @@ def test_engine_submit_downloads_audio_and_respects_size_limit():
         storage.enforce_size_limit(result.path)
 
         assert any(event.event_type == "on_finished" for event in events)
+    finally:
+        if result is not None:
+            storage.cleanup(result.path.parent)
+
+
+@pytest.mark.slow
+def test_engine_submit_mixed_playlist_url_with_single_scope_downloads_only_that_video():
+    """Kryterium akceptacji z briefu: URL z v= i list=, playlist_scope="single"
+    (domyślny) + Tryb Audio → pobiera WYŁĄCZNIE wskazane wideo, bez błędu
+    "Nie udało się ustalić ścieżki pliku wynikowego" (który wystąpiłby, gdyby
+    yt-dlp po cichu ściągnęło wiele plików całej playlisty — _resolve_result
+    zakłada jeden plik wynikowy)."""
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=MIXED_PLAYLIST_URL,
+        mode="audio",
+        output_format="mp3",
+        session_id="test-session",
+        job_id="test-job-mixed-playlist-single",
+        playlist_scope="single",
+    )
+
+    result = None
+    try:
+        result = engine.submit(job)
+        assert result.path.exists()
+        assert result.path.suffix == ".mp3"
     finally:
         if result is not None:
             storage.cleanup(result.path.parent)
@@ -279,6 +312,10 @@ def test_engine_submit_passes_cookiefile_to_every_ydl_instance(monkeypatch, tmp_
         session_id="test-session",
         job_id="test-job-cookies",
         cookie_data=cookie_bytes,
+        # playlist_scope="all" wymusza wywołanie _check_playlist_limit (patrz
+        # test_engine_submit_skips_playlist_limit_probe_when_scope_is_single)
+        # — bez tego byłoby tylko jedno wywołanie YoutubeDL, nie dwa.
+        playlist_scope="all",
     )
 
     result = engine.submit(job)
@@ -331,6 +368,98 @@ def test_engine_submit_sets_noplaylist_true_for_single_scope(monkeypatch, tmp_pa
     # od tego, czy poprzedziła je sonda _check_playlist_limit) — sprawdzamy
     # właśnie to wywołanie.
     assert captured_opts[-1]["noplaylist"] is True
+
+
+def test_engine_submit_skips_playlist_limit_probe_when_scope_is_single(monkeypatch, tmp_path):
+    """Sonda _check_playlist_limit jest zbędnym zapytaniem do YouTube, gdy
+    playlist_scope=="single" — noplaylist=True i tak ściągnie jedno wideo
+    niezależnie od liczby pozycji w URL-u."""
+    media_path = tmp_path / "Video.mp4"
+    media_path.write_bytes(b"fake mp4 bytes")
+    fake_info = {"requested_downloads": [{"filepath": str(media_path)}]}
+
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        nonlocal call_count
+        call_count += 1
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url="https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq",
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-skip-probe",
+        playlist_scope="single",
+    )
+
+    engine.submit(job)
+
+    assert call_count == 1  # tylko główne pobranie, żadnej sondy
+
+
+def test_engine_submit_skips_playlist_limit_probe_for_subtitle_mode_even_with_all_scope(
+    monkeypatch, tmp_path
+):
+    """Limit liczby pozycji nie dotyczy Subtitle/Transcript (app.py) — sonda
+    _check_playlist_limit musi być pominięta nawet gdy playlist_scope=="all",
+    jeśli mode nie jest video/audio."""
+    vtt_path = tmp_path / "Video.en.vtt"
+    vtt_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHi.\n", encoding="utf-8")
+    fake_info = {"requested_subtitles": {"en": {"filepath": str(vtt_path)}}}
+
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        nonlocal call_count
+        call_count += 1
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url="https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq",
+        mode="subtitle",
+        output_format="srt",
+        session_id="test-session",
+        job_id="test-job-subtitle-all-scope",
+        subtitle_lang="en",
+        playlist_scope="all",
+    )
+
+    engine.submit(job)
+
+    assert call_count == 1  # tylko główne pobranie, żadnej sondy limitu
+
+
+def test_count_playlist_items_returns_entry_count_for_real_playlist(monkeypatch):
+    fake_info = {"entries": [{"id": "a"}, {"id": "b"}, None, {"id": "c"}]}
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+
+    # None (fałszywy wpis) nie liczy się jako pozycja — 3 realne z 4 entries.
+    assert engine_module.count_playlist_items("https://www.youtube.com/playlist?list=PLxxx") == 3
+
+
+def test_count_playlist_items_returns_none_when_not_a_playlist(monkeypatch):
+    fake_info = {"id": "single-video"}  # brak "entries" — to nie playlista
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+
+    assert engine_module.count_playlist_items("https://www.youtube.com/watch?v=xxx") is None
 
 
 def test_list_available_subtitles_passes_cookiefile_pointing_to_real_file_with_content(monkeypatch):

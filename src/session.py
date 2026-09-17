@@ -36,6 +36,7 @@ _SESSION_ID = "session_id"
 _URL_LOCKED = "url_locked"
 _LAST_MODE_FORMAT = "last_mode_format"
 _SUBTITLE_LANG = "subtitle_lang"
+_PLAYLIST_SCOPE = "playlist_scope"
 
 # Pola "wyniku" zadania — czyszczone razem przy starcie nowego zadania
 # (set_running) i przy zmianie trybu/formatu z URL wciąż wypełnionym
@@ -61,6 +62,7 @@ _DEFAULTS: dict = {
     _URL_LOCKED: False,
     _LAST_MODE_FORMAT: None,
     _SUBTITLE_LANG: None,
+    _PLAYLIST_SCOPE: "single",
     **_RESULT_FIELDS,
 }
 
@@ -151,6 +153,14 @@ class SessionState:
         istnieć w bieżącym przebiegu skryptu."""
         return self._store[_SUBTITLE_LANG]
 
+    @property
+    def playlist_scope(self) -> str:
+        """"single" (domyślnie) albo "all" — wybór z radia widocznego dla
+        URL-i z parametrem `list` (validators.classify_url), przeliczany
+        na nowo w KAŻDYM przebiegu skryptu (jak url_locked/last_mode_format),
+        nie tylko przy starcie joba."""
+        return self._store[_PLAYLIST_SCOPE]
+
     def reset(self) -> None:
         self._store.update(_DEFAULTS)
 
@@ -192,6 +202,9 @@ class SessionState:
 
     def set_last_mode_format(self, mode_format: tuple[str, str]) -> None:
         self._store[_LAST_MODE_FORMAT] = mode_format
+
+    def set_playlist_scope(self, scope: str) -> None:
+        self._store[_PLAYLIST_SCOPE] = scope
 
     def set_progress(self, percent: float, message: str) -> None:
         self._store[_STATUS] = "running"
