@@ -10,9 +10,10 @@ widocznej dla użytkownika — patrz _resolve_result.
 from __future__ import annotations
 
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from yt_dlp import YoutubeDL
 
@@ -92,6 +93,28 @@ def _base_ydl_opts(cookiefile: str | None = None) -> dict:
     return opts
 
 
+@contextmanager
+def _temp_cookiefile(cookie_data: bytes | None) -> Iterator[str | None]:
+    """Zapisuje cookie_data do tymczasowego pliku na czas sond wykonywanych
+    POZA kontekstem joba (przed jego utworzeniem — list_available_subtitles
+    — więc bez job_dir do zapisania przez DownloadEngine._write_cookiefile).
+    Plik usuwany natychmiast po wyjściu z bloku `with`, nie przeżywa sondy —
+    w przeciwieństwie do cookiefile właściwego joba, który żyje w job_dir
+    do storage.cleanup()."""
+    if not cookie_data:
+        yield None
+        return
+
+    fd, raw_path = tempfile.mkstemp(suffix=".txt", prefix="cookies-probe-")
+    path = Path(raw_path)
+    try:
+        with open(fd, "wb") as f:
+            f.write(cookie_data)
+        yield str(path)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict[str, list[str]]:
     """Dostępne języki napisów dla materiału — osobno manualne
     (info_dict['subtitles']) i automatyczne (info_dict['automatic_captions']).
@@ -103,26 +126,13 @@ def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict
     naprawą: dla materiału z ograniczeniem wiekowym YouTube wymaga cookies
     już na etapie SAMEJ próby odczytu metadanych (nie tylko pobrania) — bez
     cookiefile tutaj UI nigdy nie pokaże listy języków, niezależnie od tego,
-    czy użytkownik wgrał cookies.txt do właściwego pobrania. Wywoływana poza
-    kontekstem joba (przed jego utworzeniem, więc bez job_dir), stąd własny,
-    tymczasowy plik zamiast _write_cookiefile z DownloadEngine — usuwany
-    natychmiast po sondzie, nie przeżywa jej."""
-    cookiefile_path: Path | None = None
-    if cookie_data:
-        fd, raw_path = tempfile.mkstemp(suffix=".txt", prefix="cookies-probe-")
-        cookiefile_path = Path(raw_path)
-        with open(fd, "wb") as f:
-            f.write(cookie_data)
+    czy użytkownik wgrał cookies.txt do właściwego pobrania."""
+    with _temp_cookiefile(cookie_data) as cookiefile_path:
+        probe_opts = _base_ydl_opts(cookiefile_path)
+        probe_opts["skip_download"] = True
 
-    probe_opts = _base_ydl_opts(str(cookiefile_path) if cookiefile_path else None)
-    probe_opts["skip_download"] = True
-
-    try:
         with YoutubeDL(probe_opts) as probe:
             info = probe.extract_info(url, download=False)
-    finally:
-        if cookiefile_path is not None:
-            cookiefile_path.unlink(missing_ok=True)
 
     if not info:
         return {"manual": [], "automatic": []}
