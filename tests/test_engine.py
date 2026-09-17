@@ -12,8 +12,9 @@ import pytest
 
 import src.engine as engine_module
 from src import storage
+from src.config import settings
 from src.engine import DownloadEngine, DownloadJob, EngineError, list_available_subtitles
-from src.errors import InvalidUrlError
+from src.errors import InvalidUrlError, PlaylistTooLargeError
 from src.progress import ProgressEvent
 
 # "Me at the zoo" — pierwsze wideo wgrane na YouTube, ~19s, publiczne,
@@ -365,8 +366,8 @@ def test_engine_submit_sets_noplaylist_true_for_single_scope(monkeypatch, tmp_pa
     engine.submit(job)
 
     # Główne pobranie jest zawsze OSTATNIM wywołaniem YoutubeDL (niezależnie
-    # od tego, czy poprzedziła je sonda _check_playlist_limit) — sprawdzamy
-    # właśnie to wywołanie.
+    # od tego, czy poprzedziła je sonda _check_playlist_limit — to osobna
+    # sprawa, pokryta testem niżej) — sprawdzamy właśnie to wywołanie.
     assert captured_opts[-1]["noplaylist"] is True
 
 
@@ -439,16 +440,67 @@ def test_engine_submit_skips_playlist_limit_probe_for_subtitle_mode_even_with_al
     assert call_count == 1  # tylko główne pobranie, żadnej sondy limitu
 
 
-def test_count_playlist_items_returns_entry_count_for_real_playlist(monkeypatch):
-    fake_info = {"entries": [{"id": "a"}, {"id": "b"}, None, {"id": "c"}]}
+def test_check_playlist_limit_uses_in_playlist_flat_mode_not_bool(monkeypatch):
+    """Regresja: extract_flat=True (bool) dla URL-i "mixed" cicho WYŁĄCZAŁ
+    ochronę limitu (info bez 'entries' => _check_playlist_limit po prostu
+    wracał, nigdy nie podnosząc PlaylistTooLargeError, bez żadnego błędu).
+    Weryfikujemy realną opcję przekazaną do YoutubeDL."""
+    fake_info = {"entries": [{"id": "a"}, {"id": "b"}]}
+    captured_opts: list[dict] = []
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        captured_opts.append(opts)
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+
+    DownloadEngine()._check_playlist_limit(
+        "https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
+    )
+
+    assert captured_opts[0]["extract_flat"] == "in_playlist"
+
+
+def test_check_playlist_limit_raises_for_mixed_url_shaped_response_over_limit(monkeypatch):
+    """End-to-end regresja dla drugiej konsekwencji tego samego buga: dla
+    URL-a "mixed" z liczbą pozycji przekraczającą MAX_PLAYLIST_ITEMS,
+    _check_playlist_limit MUSI faktycznie podnieść PlaylistTooLargeError —
+    z extract_flat=True (bool) tego nigdy nie robił (cicho wracał, myśląc,
+    że to nie playlista)."""
+    fake_info = {
+        "_type": "playlist",
+        "entries": [{"id": f"video{i}"} for i in range(settings.max_playlist_items + 5)],
+    }
 
     def _fake_ydl_factory(opts: dict) -> _FakeYDL:
         return _FakeYDL(opts, fake_info)
 
     monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
 
+    with pytest.raises(PlaylistTooLargeError):
+        DownloadEngine()._check_playlist_limit(
+            "https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
+        )
+
+
+def test_count_playlist_items_returns_entry_count_for_real_playlist(monkeypatch):
+    fake_info = {"entries": [{"id": "a"}, {"id": "b"}, None, {"id": "c"}]}
+    captured_opts: list[dict] = []
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        captured_opts.append(opts)
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+
     # None (fałszywy wpis) nie liczy się jako pozycja — 3 realne z 4 entries.
     assert engine_module.count_playlist_items("https://www.youtube.com/playlist?list=PLxxx") == 3
+    # Regresja: NIE extract_flat=True (bool) — dla URL-i "mixed" zwraca stub
+    # bez 'entries' (potwierdzone w REPL-u), patrz komentarz przy
+    # _PLAYLIST_FLAT_MODE. Weryfikujemy realną opcję przekazaną do YoutubeDL,
+    # nie tylko że test przechodzi przez inną, przypadkową ścieżkę.
+    assert captured_opts[0]["extract_flat"] == engine_module._PLAYLIST_FLAT_MODE
+    assert captured_opts[0]["extract_flat"] == "in_playlist"
 
 
 def test_count_playlist_items_returns_none_when_not_a_playlist(monkeypatch):
@@ -460,6 +512,27 @@ def test_count_playlist_items_returns_none_when_not_a_playlist(monkeypatch):
     monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
 
     assert engine_module.count_playlist_items("https://www.youtube.com/watch?v=xxx") is None
+
+
+def test_count_playlist_items_resolves_entries_for_mixed_url_shaped_response(monkeypatch):
+    """Regresja dokładnie dla zgłoszonego buga: symuluje kształt odpowiedzi,
+    jaki extract_flat="in_playlist" faktycznie zwraca dla URL-i "mixed"
+    (potwierdzone w REPL-u: _type=playlist, entries obecne) — w
+    przeciwieństwie do stub-obiektu (_type=url, brak entries), jaki
+    zwracałoby extract_flat=True (bool) dla tego samego URL-a."""
+    fake_info = {
+        "_type": "playlist",
+        "id": "PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq",
+        "entries": [{"id": f"video{i}"} for i in range(12)],
+    }
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+
+    mixed_url = "https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
+    assert engine_module.count_playlist_items(mixed_url) == 12
 
 
 def test_list_available_subtitles_passes_cookiefile_pointing_to_real_file_with_content(monkeypatch):

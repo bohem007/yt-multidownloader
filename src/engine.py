@@ -78,6 +78,16 @@ class EngineError(Exception):
 
 OnEventCallback = Callable[[ProgressEvent], None]
 
+# NIE używać extract_flat=True (bool) — dla URL-i "mixed" (jednocześnie v=
+# i list=) zwraca płytki stub-obiekt (_type: "url") BEZ klucza 'entries',
+# mimo że URL jednoznacznie wskazuje na playlistę (potwierdzone w REPL-u:
+# dla /playlist?list=... to samo True działa poprawnie — niekonsekwencja
+# w samym yt-dlp między kształtami URL-i, nie w naszym kodzie). "in_playlist"
+# to wartość, której yt-dlp używa wewnętrznie pod --flat-playlist — poprawnie
+# rozwiązuje entries dla OBU kształtów URL-a. Jedna stała, używana przez
+# count_playlist_items i _check_playlist_limit — bez duplikowania.
+_PLAYLIST_FLAT_MODE = "in_playlist"
+
 
 def _base_ydl_opts(cookiefile: str | None = None) -> dict:
     """Opcje wspólne dla KAŻDEJ instancji YoutubeDL w tym module — sond
@@ -102,11 +112,11 @@ def _base_ydl_opts(cookiefile: str | None = None) -> dict:
 @contextmanager
 def _temp_cookiefile(cookie_data: bytes | None) -> Iterator[str | None]:
     """Zapisuje cookie_data do tymczasowego pliku na czas sond wykonywanych
-    POZA kontekstem joba (przed jego utworzeniem — list_available_subtitles
-    — więc bez job_dir do zapisania przez DownloadEngine._write_cookiefile).
-    Plik usuwany natychmiast po wyjściu z bloku `with`, nie przeżywa sondy —
-    w przeciwieństwie do cookiefile właściwego joba, który żyje w job_dir
-    do storage.cleanup()."""
+    POZA kontekstem joba (przed jego utworzeniem — list_available_subtitles,
+    count_playlist_items — więc bez job_dir do zapisania przez
+    DownloadEngine._write_cookiefile). Plik usuwany natychmiast po wyjściu
+    z bloku `with`, nie przeżywa sondy — w przeciwieństwie do cookiefile
+    właściwego joba, który żyje w job_dir do storage.cleanup()."""
     if not cookie_data:
         yield None
         return
@@ -149,11 +159,11 @@ def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict
 
 
 def count_playlist_items(url: str, cookie_data: bytes | None = None) -> int | None:
-    """Liczy pozycje playlisty przez extract_flat=True (bez rozwiązywania
-    pełnych metadanych każdego wideo) — używane przez UI (app.py) do
-    pokazania realnej liczby pozycji w radiu wyboru zakresu ORAZ do
-    prewencyjnego zablokowania przycisku "Pobierz" PRZED kliknięciem, zamiast
-    czekać, aż _check_playlist_limit zrobi to samo dopiero w submit().
+    """Liczy pozycje playlisty przez extract_flat=_PLAYLIST_FLAT_MODE (bez
+    rozwiązywania pełnych metadanych każdego wideo) — używane przez UI
+    (app.py) do pokazania realnej liczby pozycji w radiu wyboru zakresu
+    ORAZ do prewencyjnego zablokowania przycisku "Pobierz" PRZED kliknięciem,
+    zamiast czekać, aż _check_playlist_limit zrobi to samo dopiero w submit().
 
     Zwraca None, jeśli URL w ogóle nie jest playlistą (yt-dlp nie zwróciło
     `entries`) — wołający (app.py) pokazuje w takim wypadku nieznaną liczbę,
@@ -161,7 +171,7 @@ def count_playlist_items(url: str, cookie_data: bytes | None = None) -> int | No
     with _temp_cookiefile(cookie_data) as cookiefile_path:
         probe_opts = _base_ydl_opts(cookiefile_path)
         probe_opts["skip_download"] = True
-        probe_opts["extract_flat"] = True
+        probe_opts["extract_flat"] = _PLAYLIST_FLAT_MODE
 
         with YoutubeDL(probe_opts) as probe:
             info = probe.extract_info(url, download=False)
@@ -312,11 +322,14 @@ class DownloadEngine:
         return str(cookiefile_path)
 
     def _check_playlist_limit(self, url: str, cookiefile: str | None = None) -> None:
-        # extract_flat=True: enumeruje pozycje playlisty bez rozwiązywania
-        # pełnych metadanych każdego wideo — szybka walidacja PRZED pobraniem.
+        # extract_flat=_PLAYLIST_FLAT_MODE: enumeruje pozycje playlisty bez
+        # rozwiązywania pełnych metadanych każdego wideo — szybka walidacja
+        # PRZED pobraniem. NIE extract_flat=True (bool) — patrz komentarz
+        # przy _PLAYLIST_FLAT_MODE: dla URL-i "mixed" bool zwraca stub bez
+        # 'entries', co cicho WYŁĄCZAŁO tę ochronę limitu bez żadnego błędu.
         probe_opts = _base_ydl_opts(cookiefile)
         probe_opts["skip_download"] = True
-        probe_opts["extract_flat"] = True
+        probe_opts["extract_flat"] = _PLAYLIST_FLAT_MODE
         with YoutubeDL(probe_opts) as probe:
             info = probe.extract_info(url, download=False)
 
