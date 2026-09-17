@@ -53,3 +53,25 @@ def test_transcript_filename_with_txt_extension_and_lang():
     musi działać bez żadnych zmian w naming.py (generyczny parametr ext)."""
     name = build_display_filename("Some Channel", "Cool Video Title", "txt", lang="en")
     assert name == "Some Channel-Cool Video Title.en.txt"
+
+
+def test_index_none_does_not_change_existing_behavior():
+    """Domyślne index=None — wywołania dla pojedynczych plików (przed Fazą
+    2a) muszą dawać identyczny wynik co dotychczas."""
+    name = build_display_filename("Some Channel", "Cool Video Title", "mp4", index=None)
+    assert name == "Some Channel-Cool Video Title.mp4"
+
+
+def test_index_adds_zero_padded_prefix():
+    name = build_display_filename("Some Channel", "Cool Video Title", "mp4", index=1)
+    assert name == "01 - Some Channel-Cool Video Title.mp4"
+
+
+def test_index_prefix_combines_with_lang():
+    name = build_display_filename("Some Channel", "Cool Video Title", "srt", lang="pl", index=3)
+    assert name == "03 - Some Channel-Cool Video Title.pl.srt"
+
+
+def test_index_larger_than_99_is_not_truncated():
+    name = build_display_filename("Channel", "Title", "mp4", index=123)
+    assert name == "123 - Channel-Title.mp4"

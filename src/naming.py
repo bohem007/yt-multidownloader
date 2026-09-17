@@ -21,7 +21,17 @@ def _sanitize(value: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def build_display_filename(uploader: str, title: str, ext: str, lang: str | None = None) -> str:
+def build_display_filename(
+    uploader: str,
+    title: str,
+    ext: str,
+    lang: str | None = None,
+    index: int | None = None,
+) -> str:
+    """`index` (Faza 2a, playlisty) dopisuje prefiks numeru pozycji
+    ("01 - ..."), żeby pliki wielu pozycji w jednym ZIP-ie miały unikalne,
+    uporządkowane nazwy — patrz engine.py::DownloadEngine.submit_playlist.
+    Domyślne `index=None` nie zmienia zachowania dla pojedynczych plików."""
     uploader = _sanitize(uploader) or "Unknown"
     title = _sanitize(title) or "download"
     ext = ext.lstrip(".")
@@ -33,4 +43,6 @@ def build_display_filename(uploader: str, title: str, ext: str, lang: str | None
         base = base[:_MAX_BASE_LENGTH].rstrip()
 
     stem = f"{base}.{lang}" if lang else base
+    if index is not None:
+        stem = f"{index:02d} - {stem}"
     return f"{stem}.{ext}"
