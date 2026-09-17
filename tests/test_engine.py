@@ -296,6 +296,43 @@ def test_engine_submit_passes_cookiefile_to_every_ydl_instance(monkeypatch, tmp_
         assert cookiefile_path.parent == tmp_path
 
 
+def test_engine_submit_sets_noplaylist_true_for_single_scope(monkeypatch, tmp_path):
+    """Regresja centralna tego briefu: URL zawierający jednocześnie v= i
+    list= musi ściągnąć WYŁĄCZNIE wideo wskazane przez v=, nie całą
+    playlistę (yt-dlp domyślnie: noplaylist=False) — inaczej
+    _resolve_result (zakłada jeden plik wynikowy) dostaje wiele ściągniętych
+    plików i cicho zwraca None → "Nie udało się ustalić ścieżki..."."""
+    media_path = tmp_path / "Video.mp4"
+    media_path.write_bytes(b"fake mp4 bytes")
+    fake_info = {"requested_downloads": [{"filepath": str(media_path)}]}
+
+    captured_opts: list[dict] = []
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        captured_opts.append(opts)
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url="https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq",
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-noplaylist",
+        playlist_scope="single",
+    )
+
+    engine.submit(job)
+
+    # Główne pobranie jest zawsze OSTATNIM wywołaniem YoutubeDL (niezależnie
+    # od tego, czy poprzedziła je sonda _check_playlist_limit) — sprawdzamy
+    # właśnie to wywołanie.
+    assert captured_opts[-1]["noplaylist"] is True
+
+
 def test_list_available_subtitles_passes_cookiefile_pointing_to_real_file_with_content(monkeypatch):
     """Regresja: list_available_subtitles() ma tę samą sondę YoutubeDL co
     _check_playlist_limit miał przed naprawą — bez cookiefile materiał z

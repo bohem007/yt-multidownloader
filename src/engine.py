@@ -43,6 +43,12 @@ class DownloadJob:
     cookie_data: bytes | None = None
     audio_bitrate_kbps: int | None = None
     subtitle_lang: str | None = None
+    # "single" (domyślnie) — noplaylist=True, ściągane jest WYŁĄCZNIE wideo
+    # wskazane przez `v=`, nawet jeśli URL zawiera też `list=` (patrz
+    # validators.classify_url). "all" — Faza 2 (jeszcze niezaimplementowana
+    # w engine.py): app.py na razie pokazuje dla tego placeholder, nigdy nie
+    # tworzy z tym joba, który faktycznie dotarłby do submit().
+    playlist_scope: str = "single"
 
 
 @dataclass
@@ -312,6 +318,14 @@ class DownloadEngine:
                 "fragment_retries": 3,
                 "progress_hooks": [self._make_progress_hook(on_event)],
                 "noprogress": True,
+                # Bez tego URL zawierający jednocześnie v= i list= (typowy
+                # link "autoplay z listy") ściągnąłby domyślnie (yt-dlp:
+                # noplaylist=False) CAŁĄ playlistę, mimo że użytkownik chciał
+                # jedno wideo — _resolve_result zakłada jeden plik wynikowy
+                # (requested_downloads[0]), więc przy wielu ściągniętych
+                # plikach cicho zwracał None → "Nie udało się ustalić
+                # ścieżki..." (dokładnie ten bug).
+                "noplaylist": job.playlist_scope == "single",
             }
         )
 
