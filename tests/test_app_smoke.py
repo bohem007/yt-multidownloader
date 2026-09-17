@@ -115,14 +115,101 @@ def test_completed_transcript_job_shows_txt_download_button(monkeypatch, tmp_pat
     assert len(at.download_button) >= 1
 
 
-def test_selecting_playlist_shows_in_progress_message_instead_of_running_job(monkeypatch):
-    at = _run_app(monkeypatch)
+def test_mixed_url_shows_playlist_scope_radio_with_real_item_count(monkeypatch):
+    """URL z v= i list= (typowy link "autoplay z listy") musi pokazać radio
+    z DWIEMA opcjami i realną (sondowaną) liczbą pozycji, nie zaślepką."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 7)
 
-    at.selectbox(key="mode_select").select("Playlist").run()
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest1&list=PLmixedtest1"
+    ).run()
+
+    assert not at.exception
+    radio = at.radio(key="playlist_scope_radio")
+    assert radio.options == ["Tylko to wideo", "Cała playlista (7 pozycji)"]
+    assert radio.value == "Tylko to wideo"  # domyślnie pojedyncze wideo
+
+
+def test_playlist_only_url_shows_radio_with_single_forced_all_scope(monkeypatch):
+    """URL bez v= (np. /playlist?list=...) nie ma wariantu "tylko wideo" —
+    nic takiego nie istnieje do wybrania, więc jedyna opcja to cała lista."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 4)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/playlist?list=PLplaylistonly1"
+    ).run()
+
+    assert not at.exception
+    radio = at.radio(key="playlist_scope_radio")
+    assert radio.options == ["Cała playlista (4 pozycji)"]
+    assert at.session_state["playlist_scope"] == "all"
+
+
+def test_playlist_scope_all_over_limit_blocks_download_for_video_mode(monkeypatch):
+    """N > MAX_PLAYLIST_ITEMS (domyślnie 10) dla Video musi zablokować
+    przycisk "Pobierz" PRZED kliknięciem, z komunikatem podającym realny
+    limit — nie zaszytą liczbę."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 15)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest2&list=PLmixedtest2"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (15 pozycji)").run()
+
+    assert not at.exception
+    # Tryb domyślny (pierwsza opcja selectboxa) to Video — limit obowiązuje.
+    assert at.button(key="download_button").proto.disabled is True
+    warning_messages = [w.value for w in at.warning]
+    assert any("15" in message and "10" in message for message in warning_messages)
+
+
+def test_playlist_scope_all_over_limit_does_not_block_download_for_subtitle_mode(monkeypatch):
+    """Limit liczby pozycji NIE dotyczy Subtitle/Transcript — przycisk
+    "Pobierz" nie może być blokowany przez playlist_limit_exceeded dla
+    tych trybów, niezależnie od N."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 15)
+    monkeypatch.setattr(
+        engine_module,
+        "list_available_subtitles",
+        lambda url, cookie_data=None: {"manual": ["en"], "automatic": []},
+    )
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest3&list=PLmixedtest3"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (15 pozycji)").run()
+    at.selectbox(key="mode_select").select("Napisy (SRT / VTT)").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+
+
+def test_clicking_download_with_playlist_scope_all_shows_placeholder_without_starting_job(monkeypatch):
+    """Faza 2 (realne pobranie wielu pozycji) nie jest zaimplementowana —
+    kliknięcie "Pobierz" z wybraną "Cała playlista" (pod limitem, więc
+    przycisk NIE jest zablokowany) musi pokazać placeholder, a NIE
+    faktycznie wystartować joba (state.status musi zostać "idle")."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 3)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest4&list=PLmixedtest4"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (3 pozycji)").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+
+    at.button(key="download_button").click().run()
 
     assert not at.exception
     info_messages = [info.value for info in at.info]
     assert any("w przygotowaniu" in message for message in info_messages)
+    assert at.session_state["status"] == "idle"
 
 
 def test_invalid_url_shows_error_on_download_click(monkeypatch):

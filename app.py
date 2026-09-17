@@ -9,6 +9,7 @@ klasę, zgodnie z CLAUDE.md.
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 import queue as queue_module
 import time
@@ -17,21 +18,26 @@ from pathlib import Path
 
 import streamlit as st
 
+# Defensywne logowanie nieoczekiwanych błędów sondy — bez tego wyjątki
+# w blokach `except Exception: ... = None` giną bez śladu (sondy sieciowe
+# do YouTube mogą zawodzić z wielu przyczyn: timeout, 429, zmiana API —
+# warto to widzieć w logach, nie tylko przy jednorazowej diagnozie).
+logger = logging.getLogger(__name__)
+
 from src import storage
 from src.config import settings
 from src.db import Database
-from src.engine import DownloadJob, list_available_subtitles
+from src.engine import DownloadJob, count_playlist_items, list_available_subtitles
 from src.errors import InvalidUrlError, map_download_error
 from src.job_runner import JobRunner
 from src.naming import build_display_filename
 from src.progress import ProgressEvent
 from src.session import SessionState
-from src.validators import validate_url
+from src.validators import classify_url, validate_url
 
 MODE_LABELS = {
     "video": "Video (MP4)",
     "audio": "Audio (MP3 / FLAC)",
-    "playlist": "Playlist",
     "subtitle": "Napisy (SRT / VTT)",
     "transcript": "Transkrypt (TXT)",
 }
@@ -41,6 +47,10 @@ READY_MODES = {"video", "audio", "subtitle", "transcript"}
 # (potrafi być >150 kodów) — dla auto-napisów pokazujemy tylko te języki,
 # niezależnie od tego, czy dla danego filmu istnieją też manualne napisy.
 AUTOMATIC_SUBTITLE_LANGS = ("pl", "de", "en")
+# Limit liczby pozycji (MAX_PLAYLIST_ITEMS) dotyczy TYLKO Video/Audio —
+# Subtitle/Transcript ściągają tekst, nie media, więc rozmiar/czas pobrania
+# per pozycja jest znikomy w porównaniu do limitu darmowego tieru.
+PLAYLIST_LIMITED_MODES = {"video", "audio"}
 
 
 @st.cache_resource
@@ -58,6 +68,13 @@ def _cached_list_available_subtitles(
     interakcję). cookie_data w kluczu cache: dla materiału z ograniczeniem
     wiekowym lista języków zależy od tego, czy sonda miała cookies."""
     return list_available_subtitles(url, cookie_data=cookie_data)
+
+
+@st.cache_data(ttl=300, show_spinner="Sprawdzanie liczby pozycji playlisty...")
+def _cached_count_playlist_items(url: str, cookie_data: bytes | None) -> int | None:
+    """Ten sam wzorzec cache co _cached_list_available_subtitles — bez tego
+    sonda extract_flat powtarzałaby się przy każdym rerunie skryptu."""
+    return count_playlist_items(url, cookie_data=cookie_data)
 
 
 def _guess_mime(file_name: str | None) -> str:
@@ -247,6 +264,44 @@ with tab_download:
     # ograniczeniem wiekowym — patrz list_available_subtitles w engine.py.
     cookie_data: bytes | None = cookie_upload.getvalue() if cookie_upload is not None else None
 
+    # URL zawierający `list=` (obok/bez `v=`) domyślnie w yt-dlp ściągnąłby
+    # CAŁĄ playlistę niezależnie od wybranego Trybu (noplaylist=False) —
+    # to jest dokładnie zgłoszony bug. Radio poniżej wymusza świadomy wybór
+    # zamiast polegania na tym domyślnym zachowaniu; renderowany PRZED
+    # selectboxem Tryb, bo dotyczy każdego trybu jednakowo.
+    url_classification = classify_url(url) if url else "single"
+    playlist_item_count: int | None = None
+    playlist_scope = "single"
+
+    if url_classification != "single":
+        try:
+            playlist_item_count = _cached_count_playlist_items(url, cookie_data)
+        except Exception:
+            logger.exception("count_playlist_items failed for url=%s", url)
+            playlist_item_count = None
+        count_label = (
+            f"{playlist_item_count} pozycji" if playlist_item_count is not None else "nieznana liczba pozycji"
+        )
+
+        if url_classification == "mixed":
+            scope_choice = st.radio(
+                "Zakres pobierania",
+                ["Tylko to wideo", f"Cała playlista ({count_label})"],
+                key="playlist_scope_radio",
+            )
+            playlist_scope = "single" if scope_choice == "Tylko to wideo" else "all"
+        else:
+            # "playlist_only" (np. /playlist?list=...) — nie ma pojedynczego
+            # wideo do wybrania, tylko jedna opcja.
+            st.radio(
+                "Zakres pobierania",
+                [f"Cała playlista ({count_label})"],
+                key="playlist_scope_radio",
+            )
+            playlist_scope = "all"
+
+    state.set_playlist_scope(playlist_scope)
+
     mode_label = st.selectbox("Tryb", list(MODE_LABELS.values()), key="mode_select")
     mode = MODE_KEYS_BY_LABEL[mode_label]
 
@@ -311,10 +366,6 @@ with tab_download:
         else:
             subtitle_lang_missing = True
 
-    elif mode == "playlist":
-        st.caption(f"Limit playlisty: maksymalnie {settings.max_playlist_items} pozycji.")
-        st.info("Tryb Playlist jest w przygotowaniu — wkrótce dostępny.")
-
     # Zmiana trybu/formatu przy URL wciąż wypełnionym chowa wynik/błąd
     # POPRZEDNIEGO zadania (i "Zapisz plik") — ale nie dotyka pola URL.
     # Tylko jeśli jest faktycznie coś do wyczyszczenia (is_terminal()) —
@@ -327,7 +378,28 @@ with tab_download:
 
     job_in_progress = state.status == "running"
     subtitle_blocked = mode in ("subtitle", "transcript") and subtitle_lang_missing
-    download_disabled = mode not in READY_MODES or not url or job_in_progress or subtitle_blocked
+    # Limit MAX_PLAYLIST_ITEMS dotyczy tylko Video/Audio (patrz
+    # PLAYLIST_LIMITED_MODES) — blokujemy PRZED kliknięciem "Pobierz", żeby
+    # user nie czekał na to samo odrzucenie dopiero w engine.py::submit().
+    playlist_limit_exceeded = (
+        playlist_scope == "all"
+        and mode in PLAYLIST_LIMITED_MODES
+        and playlist_item_count is not None
+        and playlist_item_count > settings.max_playlist_items
+    )
+    if playlist_limit_exceeded:
+        st.warning(
+            f"Playlista ma {playlist_item_count} pozycji — limit dla trybu "
+            f"{MODE_LABELS[mode]} to {settings.max_playlist_items}. Wybierz "
+            'opcję "Tylko to wideo" albo krótszą playlistę.'
+        )
+    download_disabled = (
+        mode not in READY_MODES
+        or not url
+        or job_in_progress
+        or subtitle_blocked
+        or playlist_limit_exceeded
+    )
     # "Nowy URL" nie może przerwać aktywnego pobierania — zerwałoby to
     # wątek w tle i zostawiłoby niezwolniony permit semafora współbieżności.
     new_url_disabled = not url or job_in_progress
@@ -359,6 +431,15 @@ with tab_download:
     if download_clicked:
         if not validate_url(url):
             st.error(map_download_error(InvalidUrlError(url)))
+        elif playlist_scope == "all":
+            # Faza 2 (pobranie wielu pozycji — ZIP, agregacja postępu) nie
+            # jest jeszcze zaimplementowana w engine.py — nigdy nie tworzymy
+            # tu joba, który by tam dotarł. download_disabled już zablokował
+            # przycisk, jeśli N przekracza limit dla Video/Audio; to gałąź
+            # dla przypadków POD limitem (albo Subtitle/Transcript, dla
+            # których limit nie obowiązuje) — wybranie "Cała playlista" i
+            # kliknięcie "Pobierz" pokazuje ten placeholder niezależnie od Trybu.
+            st.info("Ta funkcja jest w przygotowaniu — wkrótce dostępna.")
         elif not runner.is_slot_available():
             st.warning(
                 f"Wszystkie {settings.max_concurrent_jobs} miejsca pobierania są zajęte "
@@ -393,6 +474,7 @@ with tab_download:
                 cookie_data=cookie_data,
                 audio_bitrate_kbps=audio_bitrate_kbps,
                 subtitle_lang=subtitle_lang,
+                playlist_scope=playlist_scope,
             )
 
             def on_state(event: ProgressEvent, _queue: "queue_module.Queue" = job_queue) -> None:
