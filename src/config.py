@@ -66,6 +66,7 @@ class Settings:
     db_schema: str = "dev"
     max_file_size_mb: int = 500
     max_playlist_items: int = 10
+    max_zip_size_mb: int = 500
     max_concurrent_jobs: int = 2
     rate_limit_per_ip: int = 10
     rate_limiting_enabled: bool = True
@@ -95,6 +96,7 @@ class Settings:
             db_schema=env.get("DB_SCHEMA", defaults.db_schema),
             max_file_size_mb=int(env.get("MAX_FILE_SIZE_MB", defaults.max_file_size_mb)),
             max_playlist_items=int(env.get("MAX_PLAYLIST_ITEMS", defaults.max_playlist_items)),
+            max_zip_size_mb=int(env.get("MAX_ZIP_SIZE_MB", defaults.max_zip_size_mb)),
             max_concurrent_jobs=int(env.get("MAX_CONCURRENT_JOBS", defaults.max_concurrent_jobs)),
             rate_limit_per_ip=int(env.get("RATE_LIMIT_PER_IP", defaults.rate_limit_per_ip)),
             rate_limiting_enabled=_parse_bool(
