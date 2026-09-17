@@ -59,3 +59,20 @@ def test_enforce_size_limit_uses_settings_default_when_max_mb_not_given(tmp_path
 
     with pytest.raises(FileTooLargeError):
         storage.enforce_size_limit(file_path)
+
+
+def test_directory_size_bytes_sums_files_recursively(tmp_path):
+    """Publiczne API (Faza 2a: engine.py::submit_playlist używa tego do
+    sprawdzania skumulowanego rozmiaru ZIP-a w trakcie pobierania) — ta sama
+    logika, którą enforce_size_limit już wykorzystywał wewnętrznie."""
+    (tmp_path / "a.bin").write_bytes(b"0" * 1000)
+    (tmp_path / "b.bin").write_bytes(b"0" * 2000)
+
+    assert storage.directory_size_bytes(tmp_path) == 3000
+
+
+def test_directory_size_bytes_of_single_file(tmp_path):
+    file_path = tmp_path / "solo.bin"
+    file_path.write_bytes(b"0" * 500)
+
+    assert storage.directory_size_bytes(file_path) == 500

@@ -26,7 +26,12 @@ def cleanup(path: str | Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _total_size_bytes(path: Path) -> int:
+def directory_size_bytes(path: str | Path) -> int:
+    """Sumuje rozmiar pliku albo całego katalogu (rekurencyjnie) — jedna
+    droga liczenia rozmiaru, używana przez enforce_size_limit (limit
+    pojedynczego pliku) i engine.py::submit_playlist (limit ZIP-a w trakcie
+    pobierania wielu pozycji), bez duplikowania tej samej logiki rglob."""
+    path = Path(path)
     if path.is_file():
         return path.stat().st_size
     return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file())
@@ -40,7 +45,7 @@ def enforce_size_limit(path: str | Path, max_mb: int | None = None) -> None:
     """
     path = Path(path)
     limit_mb = max_mb if max_mb is not None else settings.max_file_size_mb
-    size_bytes = _total_size_bytes(path)
+    size_bytes = directory_size_bytes(path)
     limit_bytes = limit_mb * 1024 * 1024
 
     if size_bytes > limit_bytes:
