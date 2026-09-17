@@ -10,16 +10,18 @@ widocznej dla użytkownika — patrz _resolve_result.
 from __future__ import annotations
 
 import tempfile
+import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Literal
 
 from yt_dlp import YoutubeDL
 
 from src import storage
 from src.config import settings
 from src.errors import InvalidUrlError, PlaylistTooLargeError, map_download_error
+from src.naming import build_display_filename
 from src.profiles import DownloadProfile, get_profile
 from src.progress import ProgressEvent
 from src.transcript_cleaner import clean_vtt_to_text, format_paragraphs
@@ -45,9 +47,10 @@ class DownloadJob:
     subtitle_lang: str | None = None
     # "single" (domyślnie) — noplaylist=True, ściągane jest WYŁĄCZNIE wideo
     # wskazane przez `v=`, nawet jeśli URL zawiera też `list=` (patrz
-    # validators.classify_url). "all" — Faza 2 (jeszcze niezaimplementowana
-    # w engine.py): app.py na razie pokazuje dla tego placeholder, nigdy nie
-    # tworzy z tym joba, który faktycznie dotarłby do submit().
+    # validators.classify_url), przez submit(). "all" — submit_playlist()
+    # ściąga WSZYSTKIE pozycje do jednego ZIP-a (Faza 2a). app.py (Faza 2b,
+    # jeszcze niezaimplementowana) na razie pokazuje dla "all" placeholder,
+    # nigdy nie tworzy z tym joba, który faktycznie wywołałby submit_playlist().
     playlist_scope: str = "single"
 
 
@@ -60,6 +63,39 @@ class DownloadResult:
     path: Path
     uploader: str | None = None
     title: str | None = None
+
+
+@dataclass
+class PlaylistItemResult:
+    """Wynik pobrania JEDNEJ pozycji playlisty — status="error" NIE przerywa
+    reszty batcha (decyzja produktowa: pomiń, kontynuuj, zbierz raport).
+    `index` jest 1-based (kolejność w playliście, także w nazwie pliku w ZIP-ie).
+
+    status="skipped" oznacza pozycję NIEPRÓBOWANĄ (pętla zatrzymała się
+    wcześniej z powodu MAX_ZIP_SIZE_MB) — odróżnione od status="error",
+    które oznacza realne niepowodzenie pobrania (wyjątek z _download_one)."""
+
+    index: int
+    title: str | None
+    status: Literal["done", "error", "skipped"]
+    error_message: str | None = None
+
+
+@dataclass
+class PlaylistDownloadResult:
+    """Wynik DownloadEngine.submit_playlist() — jeden ZIP + raport per pozycja.
+
+    `stopped_early_reason` jest ustawiony tylko, gdy pętla pobierania
+    zatrzymała się PRZED przetworzeniem wszystkich pozycji z powodu
+    MAX_ZIP_SIZE_MB (twardy stop — patrz submit_playlist) — pozostałe,
+    nieprzetworzone pozycje trafiają do `items` jako status="skipped" z
+    odpowiednim error_message, żeby raport pokrywał WSZYSTKIE pozycje
+    playlisty, nie tylko te faktycznie spróbowane."""
+
+    zip_path: Path
+    items: list[PlaylistItemResult]
+    playlist_title: str | None = None
+    stopped_early_reason: str | None = None
 
 
 class EngineError(Exception):
@@ -158,28 +194,47 @@ def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict
     return {"manual": manual, "automatic": automatic}
 
 
+def _probe_playlist_entries(
+    url: str, cookiefile: str | None = None
+) -> tuple[list[dict] | None, str | None]:
+    """Sonda extract_flat=_PLAYLIST_FLAT_MODE współdzielona przez
+    count_playlist_items, _check_playlist_limit i submit_playlist — JEDNA
+    droga odpytania YouTube o pozycje playlisty, bez duplikowania logiki
+    (patrz komentarz przy _PLAYLIST_FLAT_MODE o tym, czemu nie extract_flat=True).
+
+    Zwraca (lista prawdziwych entries — fałszywe wpisy None odfiltrowane,
+    tytuł playlisty). Pierwszy element to None (nie pusta lista), jeśli URL
+    w ogóle nie jest playlistą (yt-dlp nie zwróciło klucza 'entries') —
+    odróżnia to od realnej, ale pustej playlisty."""
+    probe_opts = _base_ydl_opts(cookiefile)
+    probe_opts["skip_download"] = True
+    probe_opts["extract_flat"] = _PLAYLIST_FLAT_MODE
+
+    with YoutubeDL(probe_opts) as probe:
+        info = probe.extract_info(url, download=False)
+
+    raw_entries = info.get("entries") if info else None
+    playlist_title = info.get("title") if info else None
+    if raw_entries is None:
+        return None, playlist_title
+
+    entries = [entry for entry in raw_entries if entry is not None]
+    return entries, playlist_title
+
+
 def count_playlist_items(url: str, cookie_data: bytes | None = None) -> int | None:
-    """Liczy pozycje playlisty przez extract_flat=_PLAYLIST_FLAT_MODE (bez
-    rozwiązywania pełnych metadanych każdego wideo) — używane przez UI
-    (app.py) do pokazania realnej liczby pozycji w radiu wyboru zakresu
-    ORAZ do prewencyjnego zablokowania przycisku "Pobierz" PRZED kliknięciem,
-    zamiast czekać, aż _check_playlist_limit zrobi to samo dopiero w submit().
+    """Liczy pozycje playlisty (bez rozwiązywania pełnych metadanych każdego
+    wideo) — używane przez UI (app.py) do pokazania realnej liczby pozycji
+    w radiu wyboru zakresu ORAZ do prewencyjnego zablokowania przycisku
+    "Pobierz" PRZED kliknięciem, zamiast czekać, aż _check_playlist_limit
+    zrobi to samo dopiero w submit().
 
-    Zwraca None, jeśli URL w ogóle nie jest playlistą (yt-dlp nie zwróciło
-    `entries`) — wołający (app.py) pokazuje w takim wypadku nieznaną liczbę,
-    nie zero."""
+    Zwraca None, jeśli URL w ogóle nie jest playlistą — wołający (app.py)
+    pokazuje w takim wypadku nieznaną liczbę, nie zero."""
     with _temp_cookiefile(cookie_data) as cookiefile_path:
-        probe_opts = _base_ydl_opts(cookiefile_path)
-        probe_opts["skip_download"] = True
-        probe_opts["extract_flat"] = _PLAYLIST_FLAT_MODE
+        entries, _ = _probe_playlist_entries(url, cookiefile_path)
 
-        with YoutubeDL(probe_opts) as probe:
-            info = probe.extract_info(url, download=False)
-
-    entries = info.get("entries") if info else None
-    if entries is None:
-        return None
-    return sum(1 for entry in entries if entry is not None)
+    return len(entries) if entries is not None else None
 
 
 class DownloadEngine:
@@ -269,6 +324,148 @@ class DownloadEngine:
 
         return result
 
+    def submit_playlist(
+        self, job: DownloadJob, on_event: OnEventCallback | None = None
+    ) -> PlaylistDownloadResult:
+        """Pobiera WSZYSTKIE pozycje playlisty (job.playlist_scope=="all")
+        do jednego ZIP-a. Błąd pojedynczej pozycji NIE przerywa reszty
+        (decyzja produktowa: pomiń, kontynuuj, zbierz raport w items) —
+        tylko błędy na poziomie CAŁEGO joba (walidacja URL, sonda, limit
+        MAX_PLAYLIST_ITEMS) trafiają do zewnętrznego except/EngineError,
+        tak jak w submit()."""
+        job_dir: Path | None = None
+        try:
+            if not validate_url(job.url):
+                raise InvalidUrlError(job.url)
+
+            job_dir = storage.create(job.session_id, job.job_id)
+            cookiefile_path = self._write_cookiefile(job.cookie_data, job_dir)
+
+            entries, playlist_title = _probe_playlist_entries(job.url, cookiefile_path)
+            entries = entries or []
+
+            # Zabezpieczenie na poziomie SILNIKA, nie tylko UI (Faza 2b) —
+            # limit liczby pozycji nie dotyczy Subtitle/Transcript (te same
+            # zasady co _check_playlist_limit w submit()).
+            if job.mode in ("video", "audio") and len(entries) > settings.max_playlist_items:
+                raise PlaylistTooLargeError(
+                    f"playlist ma {len(entries)} pozycji, limit to {settings.max_playlist_items}"
+                )
+
+            items: list[PlaylistItemResult] = []
+            total = len(entries)
+            stopped_early_reason: str | None = None
+            max_zip_size_bytes = settings.max_zip_size_mb * 1024 * 1024
+
+            for position, entry in enumerate(entries, start=1):
+                video_url = entry.get("url") or f"https://www.youtube.com/watch?v={entry.get('id')}"
+                entry_title = entry.get("title")
+                size_limit_exceeded = False
+
+                try:
+                    # on_event=None dla pojedynczej pozycji — progress_hooks
+                    # w bajtach jednego pliku nie ma sensu wymieszany z
+                    # ogólnym postępem "X z N pozycji" emitowanym niżej;
+                    # UI (Faza 2b) dostaje tylko ten drugi, zagregowany sygnał.
+                    result = self._download_one(video_url, job, job_dir, cookiefile_path)
+                except Exception as exc:
+                    items.append(
+                        PlaylistItemResult(
+                            index=position,
+                            title=entry_title,
+                            status="error",
+                            error_message=map_download_error(exc),
+                        )
+                    )
+                else:
+                    self._rename_with_playlist_index(result, position, job, entry_title)
+                    items.append(
+                        PlaylistItemResult(
+                            index=position, title=result.title or entry_title, status="done"
+                        )
+                    )
+                    size_limit_exceeded = storage.directory_size_bytes(job_dir) > max_zip_size_bytes
+
+                self._emit(
+                    on_event,
+                    "on_progress",
+                    position / total * 100 if total else 100.0,
+                    f"Pobrano {position} z {total} pozycji",
+                )
+
+                if size_limit_exceeded:
+                    stopped_early_reason = (
+                        f"Przekroczono limit rozmiaru ZIP-a ({settings.max_zip_size_mb} MB) "
+                        f"po pozycji {position} z {total} — pominięto pozostałe."
+                    )
+                    for offset, skipped_entry in enumerate(entries[position:], start=position + 1):
+                        items.append(
+                            PlaylistItemResult(
+                                index=offset,
+                                title=skipped_entry.get("title"),
+                                status="skipped",
+                                error_message="Pominięto — przekroczono limit rozmiaru ZIP-a.",
+                            )
+                        )
+                    break
+
+            zip_path = self._zip_job_dir(job_dir)
+
+            return PlaylistDownloadResult(
+                zip_path=zip_path,
+                items=items,
+                playlist_title=playlist_title,
+                stopped_early_reason=stopped_early_reason,
+            )
+
+        except Exception as exc:
+            message = map_download_error(exc)
+            self._emit(on_event, "on_error", 0.0, message)
+            if job_dir is not None:
+                storage.cleanup(job_dir)
+            raise EngineError(message, original_exception=exc) from exc
+
+    @staticmethod
+    def _rename_with_playlist_index(
+        result: DownloadResult, index: int, job: DownloadJob, fallback_title: str | None
+    ) -> None:
+        """Przemianowuje plik na dysku na nazwę z prefiksem numeru pozycji
+        (naming.py) — gwarantuje unikalność i kolejność w ZIP-ie, nawet gdy
+        dwie pozycje playlisty mają identyczny tytuł. Bezpieczne mimo
+        wspólnego job_dir dla wszystkich pozycji: pozycje są pobierane
+        sekwencyjnie i przemianowywane NATYCHMIAST po sukcesie, więc kolejny
+        _download_one nigdy nie nadpisze pliku poprzedniej pozycji, nawet
+        przy identycznym oryginalnym tytule."""
+        display_lang = job.subtitle_lang if job.mode in ("subtitle", "transcript") else None
+        new_name = build_display_filename(
+            result.uploader or "",
+            result.title or fallback_title or "",
+            result.path.suffix,
+            lang=display_lang,
+            index=index,
+        )
+        new_path = result.path.with_name(new_name)
+        result.path.rename(new_path)
+        result.path = new_path
+
+    @staticmethod
+    def _zip_job_dir(job_dir: Path) -> Path:
+        """Pakuje pliki wynikowe z job_dir (pomijając cookies.txt — patrz
+        _write_cookiefile, ten plik NIE ma trafić do ZIP-a oddawanego
+        użytkownikowi) do jednego archiwum WEWNĄTRZ job_dir — dzięki temu
+        jedno storage.cleanup(job_dir) później usuwa i pliki pośrednie,
+        i sam ZIP, tak jak dla pojedynczego pliku w submit(). Lista plików
+        do spakowania jest zbierana PRZED utworzeniem ZIP-a, żeby ZIP nie
+        próbował spakować samego siebie."""
+        files_to_zip = sorted(
+            entry for entry in job_dir.iterdir() if entry.is_file() and entry.name != "cookies.txt"
+        )
+        zip_path = job_dir / "playlist.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in files_to_zip:
+                zf.write(file_path, arcname=file_path.name)
+        return zip_path
+
     @staticmethod
     def _resolve_result(info: dict | None) -> DownloadResult | None:
         """Wyciąga rzeczywistą ścieżkę pliku wynikowego z info_dict PO
@@ -341,22 +538,11 @@ class DownloadEngine:
         return str(cookiefile_path)
 
     def _check_playlist_limit(self, url: str, cookiefile: str | None = None) -> None:
-        # extract_flat=_PLAYLIST_FLAT_MODE: enumeruje pozycje playlisty bez
-        # rozwiązywania pełnych metadanych każdego wideo — szybka walidacja
-        # PRZED pobraniem. NIE extract_flat=True (bool) — patrz komentarz
-        # przy _PLAYLIST_FLAT_MODE: dla URL-i "mixed" bool zwraca stub bez
-        # 'entries', co cicho WYŁĄCZAŁO tę ochronę limitu bez żadnego błędu.
-        probe_opts = _base_ydl_opts(cookiefile)
-        probe_opts["skip_download"] = True
-        probe_opts["extract_flat"] = _PLAYLIST_FLAT_MODE
-        with YoutubeDL(probe_opts) as probe:
-            info = probe.extract_info(url, download=False)
-
-        entries = info.get("entries") if info else None
+        entries, _ = _probe_playlist_entries(url, cookiefile)
         if entries is None:
             return
 
-        item_count = sum(1 for entry in entries if entry is not None)
+        item_count = len(entries)
         if item_count > settings.max_playlist_items:
             raise PlaylistTooLargeError(
                 f"playlist ma {item_count} pozycji, limit to {settings.max_playlist_items}"

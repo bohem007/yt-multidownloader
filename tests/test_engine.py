@@ -6,13 +6,15 @@ Wymaga dostępu do internetu i ffmpeg na PATH.
 
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import pytest
+from yt_dlp.utils import DownloadError
 
 import src.engine as engine_module
 from src import storage
-from src.config import settings
+from src.config import Settings, settings
 from src.engine import DownloadEngine, DownloadJob, EngineError, list_available_subtitles
 from src.errors import InvalidUrlError, PlaylistTooLargeError
 from src.progress import ProgressEvent
@@ -30,6 +32,10 @@ POLISH_TEST_VIDEO_URL = "https://www.youtube.com/watch?v=6eBSHbLKuN0"
 # rozwiązuje ten URL jako CAŁĄ playlistę (potwierdzone manualnie: 'entries'
 # w info_dict, brak 'duration' pojedynczego wideo) — dokładnie zgłoszony bug.
 MIXED_PLAYLIST_URL = "https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
+
+# Ten sam PLAYLIST_ID co MIXED_PLAYLIST_URL (12 pozycji, potwierdzone
+# manualnie) — dla testów submit_playlist w formie playlist_only (bez v=).
+PLAYLIST_ONLY_URL = "https://www.youtube.com/playlist?list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
 
 # TED talk (Ken Robinson, "Do schools kill creativity?") — manualne napisy
 # EN z prawdziwą interpunkcją, ~20 minut. TEST_VIDEO_URL ("Me at the zoo",
@@ -533,6 +539,290 @@ def test_count_playlist_items_resolves_entries_for_mixed_url_shaped_response(mon
 
     mixed_url = "https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
     assert engine_module.count_playlist_items(mixed_url) == 12
+
+
+def _fake_flat_entries(count: int, prefix: str = "vid") -> dict:
+    return {
+        "_type": "playlist",
+        "title": "Moja playlista",
+        "entries": [{"id": f"{prefix}{i}", "title": f"Tytuł {i}"} for i in range(1, count + 1)],
+    }
+
+
+def test_submit_playlist_all_success_produces_zip_with_prefixed_names_in_order(monkeypatch, tmp_path):
+    """Kryterium akceptacji 1: 3 pozycje, wszystkie sukces → PlaylistDownloadResult
+    z 3 PlaylistItemResult(status="done"), ZIP zawiera 3 pliki z unikalnymi,
+    prefiksowanymi nazwami we właściwej kolejności."""
+    flat_info = _fake_flat_entries(3)
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        media_path = tmp_path / f"RawVideo{item_number}.mp4"
+        media_path.write_bytes(b"fake mp4 bytes")
+        return _FakeYDL(
+            opts,
+            {
+                "requested_downloads": [{"filepath": str(media_path)}],
+                "uploader": "Channel",
+                "title": f"Video {item_number}",
+            },
+        )
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-success",
+        playlist_scope="all",
+    )
+
+    result = engine.submit_playlist(job)
+
+    assert len(result.items) == 3
+    assert [item.status for item in result.items] == ["done", "done", "done"]
+    assert [item.index for item in result.items] == [1, 2, 3]
+    assert result.playlist_title == "Moja playlista"
+    assert result.stopped_early_reason is None
+
+    with zipfile.ZipFile(result.zip_path) as zf:
+        names = zf.namelist()
+    assert len(names) == 3
+    assert names == sorted(names)
+    assert names[0].startswith("01 - ")
+    assert names[1].startswith("02 - ")
+    assert names[2].startswith("03 - ")
+    assert "cookies.txt" not in names
+
+
+def test_submit_playlist_continues_after_single_item_error(monkeypatch, tmp_path):
+    """Kryterium akceptacji 2: środkowa pozycja rzuca DownloadError → wynik
+    ma 2×done + 1×error z komunikatem, ZIP zawiera tylko 2 pliki,
+    submit_playlist() nie rzuca wyjątku na zewnątrz."""
+    flat_info = _fake_flat_entries(3)
+    call_count = 0
+
+    class _RaisingFakeYDL:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def extract_info(self, url: str, download: bool = True) -> dict:
+            raise DownloadError("Video unavailable")
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        if item_number == 2:
+            return _RaisingFakeYDL()
+        media_path = tmp_path / f"RawVideo{item_number}.mp4"
+        media_path.write_bytes(b"fake mp4 bytes")
+        return _FakeYDL(
+            opts,
+            {
+                "requested_downloads": [{"filepath": str(media_path)}],
+                "uploader": "Channel",
+                "title": f"Video {item_number}",
+            },
+        )
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-item-error",
+        playlist_scope="all",
+    )
+
+    result = engine.submit_playlist(job)  # brak wyjątku
+
+    assert [item.status for item in result.items] == ["done", "error", "done"]
+    assert result.items[1].error_message
+    with zipfile.ZipFile(result.zip_path) as zf:
+        assert len(zf.namelist()) == 2
+
+
+def test_submit_playlist_stops_when_cumulative_size_exceeds_max_zip_size(monkeypatch, tmp_path):
+    """Kryterium akceptacji 3: skumulowany rozmiar przekracza zamockowany
+    max_zip_size_mb po 2. pozycji → pętla zatrzymuje się, wynik zawiera
+    2 pozycje "done" + informację (per-pozycja i stopped_early_reason) o
+    zatrzymaniu z powodu limitu."""
+    monkeypatch.setattr(engine_module, "settings", Settings.from_env({"MAX_ZIP_SIZE_MB": "1"}))
+
+    flat_info = _fake_flat_entries(3)
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        media_path = tmp_path / f"RawVideo{item_number}.mp4"
+        # 0.6 MB każdy — po 2. pozycji suma (1.2 MB) przekracza limit 1 MB.
+        media_path.write_bytes(b"0" * int(0.6 * 1024 * 1024))
+        return _FakeYDL(
+            opts,
+            {
+                "requested_downloads": [{"filepath": str(media_path)}],
+                "uploader": "Channel",
+                "title": f"Video {item_number}",
+            },
+        )
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-zip-limit",
+        playlist_scope="all",
+    )
+
+    result = engine.submit_playlist(job)
+
+    assert result.stopped_early_reason is not None
+    assert [item.status for item in result.items] == ["done", "done", "skipped"]
+    assert result.items[2].error_message
+    with zipfile.ZipFile(result.zip_path) as zf:
+        assert len(zf.namelist()) == 2
+
+
+def test_submit_playlist_raises_before_downloading_when_over_limit_for_video_mode(
+    monkeypatch, tmp_path
+):
+    """Kryterium akceptacji 4: Tryb video/audio, liczba pozycji > MAX_PLAYLIST_ITEMS
+    → submit_playlist() rzuca PlaylistTooLargeError PRZED próbą pobrania
+    czegokolwiek (zabezpieczenie na poziomie silnika, nie tylko UI)."""
+    flat_info = _fake_flat_entries(settings.max_playlist_items + 5)
+    download_attempted = False
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal download_attempted
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        download_attempted = True
+        return _FakeYDL(opts, {})
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-over-limit",
+        playlist_scope="all",
+    )
+
+    with pytest.raises(EngineError) as exc_info:
+        engine.submit_playlist(job)
+
+    assert isinstance(exc_info.value.original_exception, PlaylistTooLargeError)
+    assert download_attempted is False
+
+
+def test_submit_playlist_allows_over_limit_for_subtitle_mode(monkeypatch, tmp_path):
+    """Kryterium akceptacji 5: Tryb subtitle/transcript, liczba pozycji >
+    MAX_PLAYLIST_ITEMS → brak błędu limitu, pętla rusza normalnie i
+    przetwarza WSZYSTKIE pozycje."""
+    entries_count = settings.max_playlist_items + 3
+    flat_info = _fake_flat_entries(entries_count)
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        vtt_path = tmp_path / f"RawVideo{item_number}.en.vtt"
+        vtt_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHi.\n", encoding="utf-8")
+        return _FakeYDL(
+            opts,
+            {
+                "requested_subtitles": {"en": {"filepath": str(vtt_path)}},
+                "uploader": "Channel",
+                "title": f"Video {item_number}",
+            },
+        )
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="subtitle",
+        output_format="srt",
+        session_id="test-session",
+        job_id="test-job-playlist-subtitle-over-limit",
+        subtitle_lang="en",
+        playlist_scope="all",
+    )
+
+    result = engine.submit_playlist(job)
+
+    assert len(result.items) == entries_count
+    assert all(item.status == "done" for item in result.items)
+
+
+@pytest.mark.slow
+def test_submit_playlist_real_small_playlist_produces_zip_with_expected_file_count():
+    """Kryterium akceptacji 7: realna, mała playlista (≤ MAX_PLAYLIST_ITEMS
+    pozycji) — ZIP faktycznie powstaje i zawiera oczekiwaną liczbę plików.
+    Używa trybu Subtitle (napisy, nie media) dla szybkości — rozmiar/czas
+    pobrania per pozycja jest znikomy w porównaniu do wideo/audio."""
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="subtitle",
+        output_format="srt",
+        session_id="test-session",
+        job_id="test-job-playlist-real",
+        subtitle_lang="en",
+        playlist_scope="all",
+    )
+
+    result = None
+    try:
+        result = engine.submit_playlist(job)
+        assert result.zip_path.exists()
+
+        with zipfile.ZipFile(result.zip_path) as zf:
+            names = zf.namelist()
+
+        done_count = sum(1 for item in result.items if item.status == "done")
+        assert done_count > 0, "oczekiwano co najmniej jednej pozycji z napisami EN"
+        assert len(names) == done_count
+    finally:
+        if result is not None:
+            storage.cleanup(result.zip_path.parent)
 
 
 def test_list_available_subtitles_passes_cookiefile_pointing_to_real_file_with_content(monkeypatch):
