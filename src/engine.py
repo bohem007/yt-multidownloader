@@ -207,34 +207,7 @@ class DownloadEngine:
             if job.playlist_scope == "all" and job.mode in ("video", "audio"):
                 self._check_playlist_limit(job.url, cookiefile_path)
 
-            profile = get_profile(
-                job.mode,
-                job.output_format,
-                audio_bitrate_kbps=job.audio_bitrate_kbps,
-                subtitle_lang=job.subtitle_lang,
-            )
-            ydl_opts = self._build_ydl_opts(job, profile, job_dir, on_event, cookiefile_path)
-
-            with YoutubeDL(ydl_opts) as ydl:
-                # extract_info(download=True) (a nie ydl.download()) — tylko
-                # ten wariant zwraca info_dict, z którego wyciągamy
-                # RZECZYWISTĄ ścieżkę pliku PO postprocessingu (patrz
-                # _resolve_result_path). ydl.download() zwraca wyłącznie
-                # kod wyjścia, więc bez tego app.py musiałoby zgadywać
-                # nazwę pliku na podstawie outtmpl sprzed konwersji ffmpeg
-                # (np. .webm zamiast finalnego .mp3) — dokładnie ten bug.
-                info = ydl.extract_info(job.url, download=True)
-
-            result = self._resolve_result(info)
-            if result is None:
-                raise RuntimeError("Nie udało się ustalić ścieżki pliku wynikowego po pobraniu.")
-
-            if job.mode == "transcript":
-                # Ta sama ścieżka resolvowania co Subtitle (profil transcript
-                # zawsze wymusza VTT — patrz profiles.py) — różnica jest w
-                # tym, co użytkownik dostaje: surowe napisy nigdy nie
-                # docierają na wierzch, tylko oczyszczony tekst.
-                result = self._finalize_transcript(result)
+            result = self._download_one(job.url, job, job_dir, cookiefile_path, on_event)
 
             # yt-dlp nie zawsze zna finalny rozmiar pliku z góry (np. po
             # transkodowaniu FFmpeg do mp3/flac) — limit sprawdzamy
@@ -249,6 +222,52 @@ class DownloadEngine:
             if job_dir is not None:
                 storage.cleanup(job_dir)
             raise EngineError(message, original_exception=exc) from exc
+
+    def _download_one(
+        self,
+        url: str,
+        job: DownloadJob,
+        job_dir: Path,
+        cookiefile_path: str | None,
+        on_event: OnEventCallback | None = None,
+    ) -> DownloadResult:
+        """Pobiera JEDEN materiał (wideo/audio/napisy/transkrypt) — logika
+        wydzielona z submit() (Faza 1), żeby submit_playlist() (Faza 2a)
+        mogła wywoływać ją wielokrotnie, per pozycja playlisty, bez
+        duplikowania budowy ydl_opts/resolvowania wyniku/finalizacji
+        transkryptu. `url` jest parametrem osobnym od `job.url` — dla
+        pozycji playlisty to URL KONKRETNEGO wideo z entries, nie oryginalny
+        URL playlisty przekazany przez użytkownika."""
+        profile = get_profile(
+            job.mode,
+            job.output_format,
+            audio_bitrate_kbps=job.audio_bitrate_kbps,
+            subtitle_lang=job.subtitle_lang,
+        )
+        ydl_opts = self._build_ydl_opts(job, profile, job_dir, on_event, cookiefile_path)
+
+        with YoutubeDL(ydl_opts) as ydl:
+            # extract_info(download=True) (a nie ydl.download()) — tylko
+            # ten wariant zwraca info_dict, z którego wyciągamy
+            # RZECZYWISTĄ ścieżkę pliku PO postprocessingu (patrz
+            # _resolve_result_path). ydl.download() zwraca wyłącznie
+            # kod wyjścia, więc bez tego app.py musiałoby zgadywać
+            # nazwę pliku na podstawie outtmpl sprzed konwersji ffmpeg
+            # (np. .webm zamiast finalnego .mp3) — dokładnie ten bug.
+            info = ydl.extract_info(url, download=True)
+
+        result = self._resolve_result(info)
+        if result is None:
+            raise RuntimeError("Nie udało się ustalić ścieżki pliku wynikowego po pobraniu.")
+
+        if job.mode == "transcript":
+            # Ta sama ścieżka resolvowania co Subtitle (profil transcript
+            # zawsze wymusza VTT — patrz profiles.py) — różnica jest w
+            # tym, co użytkownik dostaje: surowe napisy nigdy nie
+            # docierają na wierzch, tylko oczyszczony tekst.
+            result = self._finalize_transcript(result)
+
+        return result
 
     @staticmethod
     def _resolve_result(info: dict | None) -> DownloadResult | None:
