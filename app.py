@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import mimetypes
 import queue as queue_module
+import re
 import time
 import uuid
 from pathlib import Path
@@ -27,7 +28,12 @@ logger = logging.getLogger(__name__)
 from src import storage
 from src.config import settings
 from src.db import Database
-from src.engine import DownloadJob, count_playlist_items, list_available_subtitles
+from src.engine import (
+    DownloadJob,
+    count_playlist_items,
+    list_available_subtitles,
+    resolve_representative_video_url,
+)
 from src.errors import InvalidUrlError, map_download_error
 from src.job_runner import JobRunner
 from src.naming import build_display_filename
@@ -77,11 +83,60 @@ def _cached_count_playlist_items(url: str, cookie_data: bytes | None) -> int | N
     return count_playlist_items(url, cookie_data=cookie_data)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_resolve_representative_video_url(url: str, cookie_data: bytes | None) -> str | None:
+    """Faza 2b: dla playlist_scope=="all" sonda języka napisów
+    (_cached_list_available_subtitles) nie może dostać surowego URL-a
+    playlisty — patrz resolve_representative_video_url w engine.py.
+    show_spinner=False: to wewnętrzny krok tej samej operacji, spinner
+    sondy napisów niżej już informuje użytkownika o oczekiwaniu."""
+    return resolve_representative_video_url(url, cookie_data=cookie_data)
+
+
 def _guess_mime(file_name: str | None) -> str:
     if not file_name:
         return "application/octet-stream"
     mime_type, _ = mimetypes.guess_type(file_name)
     return mime_type or "application/octet-stream"
+
+
+_ILLEGAL_WINDOWS_CHARS = re.compile(r'[:/\\*?"<>|]')
+
+
+def _build_playlist_zip_filename(playlist_title: str | None) -> str:
+    """Nazwa ZIP-a widoczna dla użytkownika — celowo NIE przez
+    build_display_filename() (ta jest dla pojedynczych materiałów, format
+    "Autor-Tytuł", semantycznie nie pasuje do ZIP-a całej playlisty)."""
+    if not playlist_title:
+        return "playlista.zip"
+    sanitized = _ILLEGAL_WINDOWS_CHARS.sub("_", playlist_title)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    return f"Playlista-{sanitized}.zip" if sanitized else "playlista.zip"
+
+
+def _playlist_report_summary(items: list) -> tuple[int, int, str]:
+    """(liczba pobranych, liczba pozycji ogółem, tekst podsumowania) —
+    reużywane przez _render_progress (do error_message w historii DB) i
+    _render_result (do wyświetlenia w UI), żeby nie liczyć tego dwukrotnie
+    z możliwością rozjazdu tekstu."""
+    done_count = sum(1 for item in items if item.status == "done")
+    total_count = len(items)
+    summary = f"{done_count}/{total_count} pobranych"
+    if done_count < total_count:
+        summary += f"; {total_count - done_count} błędów/pominiętych"
+    return done_count, total_count, summary
+
+
+def _render_playlist_report(items: list) -> None:
+    done_count, total_count, _ = _playlist_report_summary(items)
+    st.caption(f"{done_count} z {total_count} pozycji pobranych.")
+
+    problems = [item for item in items if item.status != "done"]
+    if problems:
+        with st.expander(f"Pozycje z błędami lub pominięte ({len(problems)})"):
+            for item in problems:
+                label = item.title or f"Pozycja {item.index}"
+                st.write(f"**{item.index}. {label}** — {item.error_message or item.status}")
 
 
 def _log_job_finish(
@@ -157,6 +212,30 @@ def _render_progress(state: SessionState) -> None:
                 _log_job_finish(
                     state, status="error", duration_ms=duration_ms, error_message=state.error_message
                 )
+            elif terminal_event.playlist_items is not None:
+                # Faza 2b: wynik submit_playlist() — result_path to ZIP,
+                # playlist_items niesie raport per pozycja (done/error/skipped).
+                data = result_file.read_bytes()
+                storage.cleanup(result_file.parent)
+                items = terminal_event.playlist_items
+                done_count, _total_count, summary = _playlist_report_summary(items)
+                state.set_done(
+                    result_file,
+                    data=data,
+                    file_name=_build_playlist_zip_filename(terminal_event.playlist_title),
+                    playlist_report=items,
+                    playlist_title=terminal_event.playlist_title,
+                )
+                # Decyzja produktowa: status="done" gdy CHOĆ JEDNA pozycja
+                # się udała (z podsumowaniem w error_message) — "error"
+                # tylko gdy zero pozycji się udało.
+                _log_job_finish(
+                    state,
+                    status="done" if done_count > 0 else "error",
+                    duration_ms=duration_ms,
+                    file_size_bytes=len(data),
+                    error_message=summary,
+                )
             else:
                 data = result_file.read_bytes()
                 # Wczytane do RAM — katalog tymczasowy natychmiast usuwamy,
@@ -192,20 +271,28 @@ def _render_result(state: SessionState) -> None:
         st.error("Brak danych wynikowych.")
         return
 
-    # Nazwa widoczna dla użytkownika ({Uploader}-{Tytuł}[.{jezyk}].{ext})
-    # jest NIEZALEŻNA od wewnętrznej nazwy pliku na dysku serwera (patrz
-    # src/naming.py) — ta ostatnia i tak już nie istnieje (usunięta zaraz
-    # po wczytaniu do RAM), result_file_name służy tu tylko do ustalenia
-    # prawdziwego rozszerzenia i do zgadywania MIME.
-    ext = Path(state.result_file_name or "").suffix.lstrip(".") or "bin"
-    display_name = build_display_filename(
-        state.result_uploader or "",
-        state.result_title or (state.result_file_name or "download"),
-        ext,
-        lang=state.subtitle_lang,
-    )
+    if state.playlist_report is not None:
+        # ZIP całej playlisty — nazwa już jest gotowa do wyświetlenia
+        # (_build_playlist_zip_filename w _render_progress), NIE przez
+        # build_display_filename (ta jest dla pojedynczych materiałów).
+        display_name = state.result_file_name or "playlista.zip"
+        st.success("Pobieranie playlisty zakończone.")
+        _render_playlist_report(state.playlist_report)
+    else:
+        # Nazwa widoczna dla użytkownika ({Uploader}-{Tytuł}[.{jezyk}].{ext})
+        # jest NIEZALEŻNA od wewnętrznej nazwy pliku na dysku serwera (patrz
+        # src/naming.py) — ta ostatnia i tak już nie istnieje (usunięta zaraz
+        # po wczytaniu do RAM), result_file_name służy tu tylko do ustalenia
+        # prawdziwego rozszerzenia i do zgadywania MIME.
+        ext = Path(state.result_file_name or "").suffix.lstrip(".") or "bin"
+        display_name = build_display_filename(
+            state.result_uploader or "",
+            state.result_title or (state.result_file_name or "download"),
+            ext,
+            lang=state.subtitle_lang,
+        )
+        st.success("Pobieranie zakończone.")
 
-    st.success("Pobieranie zakończone.")
     st.download_button(
         "Zapisz plik",
         data=state.result_data,
@@ -342,8 +429,22 @@ with tab_download:
             output_format = "txt"
 
         if url:
+            # Sonda języka napisów dla playlist_scope=="all" nie może dostać
+            # surowego URL-a playlisty — patrz resolve_representative_video_url
+            # w engine.py. submit_playlist() (job dalej w tym pliku) wciąż
+            # dostaje oryginalny `url`, tylko TA sonda używa reprezentanta.
+            subtitle_probe_url = url
+            if playlist_scope == "all":
+                try:
+                    representative_url = _cached_resolve_representative_video_url(url, cookie_data)
+                except Exception:
+                    logger.exception("resolve_representative_video_url failed for url=%s", url)
+                    representative_url = None
+                if representative_url:
+                    subtitle_probe_url = representative_url
+
             try:
-                available = _cached_list_available_subtitles(url, cookie_data)
+                available = _cached_list_available_subtitles(subtitle_probe_url, cookie_data)
             except Exception:
                 st.warning("Nie udało się sprawdzić dostępnych napisów dla tego adresu.")
                 subtitle_lang_missing = True
@@ -371,7 +472,7 @@ with tab_download:
     # Tylko jeśli jest faktycznie coś do wyczyszczenia (is_terminal()) —
     # w trakcie pobierania (status "running") zmiana widgetów nie ma tu
     # znaczenia, bo są zablokowane niżej przez download_disabled/inne joby.
-    current_mode_format = (mode, output_format)
+    current_mode_format = (mode, output_format, playlist_scope)
     if state.is_terminal() and state.last_mode_format not in (None, current_mode_format):
         state.clear_result()
     state.set_last_mode_format(current_mode_format)
@@ -431,15 +532,6 @@ with tab_download:
     if download_clicked:
         if not validate_url(url):
             st.error(map_download_error(InvalidUrlError(url)))
-        elif playlist_scope == "all":
-            # Faza 2 (pobranie wielu pozycji — ZIP, agregacja postępu) nie
-            # jest jeszcze zaimplementowana w engine.py — nigdy nie tworzymy
-            # tu joba, który by tam dotarł. download_disabled już zablokował
-            # przycisk, jeśli N przekracza limit dla Video/Audio; to gałąź
-            # dla przypadków POD limitem (albo Subtitle/Transcript, dla
-            # których limit nie obowiązuje) — wybranie "Cała playlista" i
-            # kliknięcie "Pobierz" pokazuje ten placeholder niezależnie od Trybu.
-            st.info("Ta funkcja jest w przygotowaniu — wkrótce dostępna.")
         elif not runner.is_slot_available():
             st.warning(
                 f"Wszystkie {settings.max_concurrent_jobs} miejsca pobierania są zajęte "
