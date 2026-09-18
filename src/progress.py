@@ -8,7 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    # Tylko do podpowiedzi typów — engine.py importuje z progress.py,
+    # więc import na poziomie modułu utworzyłby cykl. `from __future__
+    # import annotations` (wyżej) sprawia, że adnotacje są stringami,
+    # więc runtime nigdy nie potrzebuje tego importu.
+    from src.engine import PlaylistItemResult
 
 EventType = Literal["on_start", "on_progress", "on_finished", "on_error"]
 
@@ -28,3 +35,8 @@ class ProgressEvent:
     result_path: Path | None = None
     result_uploader: str | None = None
     result_title: str | None = None
+    # Faza 2b — wynik batcha submit_playlist() (job_runner.py), tylko na
+    # finalnym "on_finished" dla joba playlisty. None dla pojedynczych
+    # pobrań — zero zmian w zachowaniu istniejących odbiorców.
+    playlist_items: list["PlaylistItemResult"] | None = None
+    playlist_title: str | None = None
