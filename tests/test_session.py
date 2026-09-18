@@ -169,3 +169,26 @@ def test_reset_returns_playlist_scope_to_single():
     state.reset()
 
     assert state.playlist_scope == "single"
+
+
+def test_playlist_report_and_title_default_none_and_are_settable_via_set_done():
+    state = SessionState({})
+
+    assert state.playlist_report is None
+    assert state.playlist_title is None
+
+    items = [object(), object()]
+    state.set_done(Path("playlist.zip"), data=b"zip", playlist_report=items, playlist_title="Moja playlista")
+
+    assert state.playlist_report == items
+    assert state.playlist_title == "Moja playlista"
+
+
+def test_clear_result_also_clears_playlist_report_and_title():
+    state = SessionState({})
+    state.set_done(Path("playlist.zip"), data=b"zip", playlist_report=[object()], playlist_title="Tytuł")
+
+    state.clear_result()
+
+    assert state.playlist_report is None
+    assert state.playlist_title is None
