@@ -10,12 +10,16 @@ przebiegu), żeby testy były szybkie, deterministyczne i offline.
 from __future__ import annotations
 
 import queue as queue_module
+import threading
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
+import src.config as config_module
 import src.engine as engine_module
+from src.config import Settings
 from src.db import Database
+from src.engine import PlaylistDownloadResult, PlaylistItemResult
 from src.progress import ProgressEvent
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
@@ -148,9 +152,12 @@ def test_playlist_only_url_shows_radio_with_single_forced_all_scope(monkeypatch)
 
 
 def test_playlist_scope_all_over_limit_blocks_download_for_video_mode(monkeypatch):
-    """N > MAX_PLAYLIST_ITEMS (domyślnie 10) dla Video musi zablokować
-    przycisk "Pobierz" PRZED kliknięciem, z komunikatem podającym realny
-    limit — nie zaszytą liczbę."""
+    """N > MAX_PLAYLIST_ITEMS dla Video musi zablokować przycisk "Pobierz"
+    PRZED kliknięciem, z komunikatem podającym realny limit — nie zaszytą
+    liczbę. settings PINOWANE monkeypatchem (nie ambient .env developera) —
+    bez tego test byłby niedeterministyczny: przechodzi/pada zależnie od
+    tego, co akurat ma lokalny .env (patrz diagnoza "zaszyta wartość 10")."""
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({}))
     monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 15)
 
     at = _run_app(monkeypatch)
@@ -164,6 +171,48 @@ def test_playlist_scope_all_over_limit_blocks_download_for_video_mode(monkeypatc
     assert at.button(key="download_button").proto.disabled is True
     warning_messages = [w.value for w in at.warning]
     assert any("15" in message and "10" in message for message in warning_messages)
+
+
+def test_playlist_scope_all_gating_uses_configured_limit_not_hardcoded_default(monkeypatch):
+    """Regresja: dotychczasowe testy limitu playlisty zawsze porównywały
+    przeciw domyślnej wartości MAX_PLAYLIST_ITEMS=10 — literalna "10"
+    zaszyta w gatingu/komunikacie zamiast settings.max_playlist_items
+    przechodziłaby więc niezauważona. Tu limit jest jawnie skonfigurowany
+    na NIEDOMYŚLNĄ wartość (5) w obie strony sprawdzenia: liczba pozycji
+    (7) > 5 musi zablokować przycisk, a komunikat musi podawać "5", nie "10"."""
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "5"}))
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 7)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=configtest1&list=PLconfigtest1"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (7 pozycji)").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is True
+    warning_messages = [w.value for w in at.warning]
+    assert any("7" in message and "5" in message for message in warning_messages)
+    assert not any("10" in message for message in warning_messages)
+
+
+def test_playlist_scope_all_allows_download_under_configured_higher_limit(monkeypatch):
+    """Odwrotność powyższego — limit skonfigurowany WYŻEJ niż domyślne 10
+    (tu 15) musi odblokować przycisk dla liczby pozycji POD tym limitem
+    (12), mimo że 12 > domyślne 10. To jest dokładny scenariusz z
+    manualnego testu, który zgłosił błędną blokadę."""
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "15"}))
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 12)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=configtest2&list=PLconfigtest2"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (12 pozycji)").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+    assert not any(w.value for w in at.warning)
 
 
 def test_playlist_scope_all_over_limit_does_not_block_download_for_subtitle_mode(monkeypatch):
@@ -188,12 +237,26 @@ def test_playlist_scope_all_over_limit_does_not_block_download_for_subtitle_mode
     assert at.button(key="download_button").proto.disabled is False
 
 
-def test_clicking_download_with_playlist_scope_all_shows_placeholder_without_starting_job(monkeypatch):
-    """Faza 2 (realne pobranie wielu pozycji) nie jest zaimplementowana —
-    kliknięcie "Pobierz" z wybraną "Cała playlista" (pod limitem, więc
-    przycisk NIE jest zablokowany) musi pokazać placeholder, a NIE
-    faktycznie wystartować joba (state.status musi zostać "idle")."""
+def test_clicking_download_with_playlist_scope_all_starts_real_job(monkeypatch, tmp_path):
+    """Faza 2b: placeholder usunięty — kliknięcie "Pobierz" z wybraną
+    "Cała playlista" (pod limitem) musi faktycznie wystartować joba
+    (submit_playlist przez JobRunner), tak jak dla playlist_scope="single",
+    nie pokazywać już żadnego placeholdera. Fałszywy silnik jest natychmiastowy
+    (bez realnego I/O), więc w tym samym rerunie AppTest zdąży też odebrać
+    terminalny event z fragmentu _render_progress — dlatego asercja sprawdza
+    finalny sukces (download_button), nie ulotny stan "running", który jest
+    z natury zależny od wyścigu wątku w tle."""
     monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 3)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+    submit_playlist_called = threading.Event()
+
+    def _fake_submit_playlist(self, job, on_event=None):
+        submit_playlist_called.set()
+        return PlaylistDownloadResult(zip_path=zip_file, items=[], playlist_title="Fake")
+
+    monkeypatch.setattr(engine_module.DownloadEngine, "submit_playlist", _fake_submit_playlist)
 
     at = _run_app(monkeypatch)
     at.text_input(key="url_input").input(
@@ -208,7 +271,198 @@ def test_clicking_download_with_playlist_scope_all_shows_placeholder_without_sta
 
     assert not at.exception
     info_messages = [info.value for info in at.info]
-    assert any("w przygotowaniu" in message for message in info_messages)
+    assert not any("w przygotowaniu" in message for message in info_messages)
+    assert submit_playlist_called.wait(timeout=5.0)
+    assert at.session_state["status"] in ("running", "done")
+    if at.session_state["status"] != "done":
+        at.run()
+    assert at.session_state["status"] == "done"
+    assert len(at.download_button) >= 1
+
+
+def test_completed_playlist_job_shows_zip_download_button_with_report(monkeypatch, tmp_path):
+    """Kryterium akceptacji 1+2: submit_playlist() zwrócił ZIP + raport
+    per pozycja (jedna pozycja error) — status="done" (bo ≥1 sukces),
+    nazwa pliku "Playlista-{tytuł}.zip" (nie przez build_display_filename),
+    raport (podsumowanie + lista błędów) widoczny w _render_result."""
+    at = _run_app(monkeypatch)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+
+    items = [
+        PlaylistItemResult(index=1, title="Wideo 1", status="done"),
+        PlaylistItemResult(index=2, title="Wideo 2", status="error", error_message="Video unavailable"),
+    ]
+
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=zip_file,
+            playlist_items=items,
+            playlist_title="Moja playlista",
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista.zip"
+    assert at.session_state["result_data"] == b"fake zip bytes"
+    assert len(at.download_button) >= 1
+
+    caption_texts = [c.value for c in at.caption]
+    assert any("1 z 2 pozycji pobranych" in text for text in caption_texts)
+    write_texts = [w.value for w in at.markdown]
+    assert any("Wideo 2" in text and "Video unavailable" in text for text in write_texts)
+
+
+def test_playlist_job_logs_error_status_only_when_all_items_failed(monkeypatch, tmp_path):
+    """Decyzja produktowa: status w historii DB = "error" TYLKO gdy ZERO
+    pozycji się udało — inaczej "done" z podsumowaniem w error_message."""
+    logged: dict = {}
+
+    def _fake_log_job_finish(self, job_id, status, duration_ms=None, file_size_bytes=None, error_message=None):
+        logged["status"] = status
+        logged["error_message"] = error_message
+
+    monkeypatch.setattr(Database, "log_job_finish", _fake_log_job_finish)
+
+    at = _run_app(monkeypatch)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+
+    items = [
+        PlaylistItemResult(index=1, title="Wideo 1", status="error", error_message="boom"),
+    ]
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=zip_file,
+            playlist_items=items,
+            playlist_title="Moja playlista",
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+    at.session_state["db_job_id"] = 42
+
+    at.run()
+
+    assert not at.exception
+    assert logged["status"] == "error"
+    assert "0/1" in logged["error_message"]
+
+
+def test_playlist_job_logs_done_status_with_summary_when_some_items_succeed(monkeypatch, tmp_path):
+    logged: dict = {}
+
+    def _fake_log_job_finish(self, job_id, status, duration_ms=None, file_size_bytes=None, error_message=None):
+        logged["status"] = status
+        logged["error_message"] = error_message
+
+    monkeypatch.setattr(Database, "log_job_finish", _fake_log_job_finish)
+
+    at = _run_app(monkeypatch)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+
+    items = [
+        PlaylistItemResult(index=1, title="Wideo 1", status="done"),
+        PlaylistItemResult(index=2, title="Wideo 2", status="skipped", error_message="Pominięto."),
+    ]
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=zip_file,
+            playlist_items=items,
+            playlist_title="Moja playlista",
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+    at.session_state["db_job_id"] = 42
+
+    at.run()
+
+    assert not at.exception
+    assert logged["status"] == "done"
+    assert "1/2" in logged["error_message"]
+
+
+def test_playlist_subtitle_probe_uses_representative_video_url_not_playlist_url(monkeypatch):
+    """Kryterium akceptacji 3: dla playlist_scope="all" + Napisy/Transkrypt,
+    dropdown języka musi być odpytany o URL PIERWSZEJ pozycji
+    (resolve_representative_video_url), NIE surowy URL playlisty — sonda
+    napisów na URL-u playlisty jest dokładnie tą samą klasą buga, jaką
+    miał oryginalny extract_flat dla count_playlist_items."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 2)
+    monkeypatch.setattr(
+        engine_module,
+        "resolve_representative_video_url",
+        lambda url, cookie_data=None: "https://www.youtube.com/watch?v=representative1",
+    )
+
+    captured_urls: list[str] = []
+
+    def _fake_list_available_subtitles(url, cookie_data=None):
+        captured_urls.append(url)
+        return {"manual": ["en"], "automatic": []}
+
+    monkeypatch.setattr(engine_module, "list_available_subtitles", _fake_list_available_subtitles)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/playlist?list=PLrepresentativetest1"
+    ).run()
+    at.selectbox(key="mode_select").select("Napisy (SRT / VTT)").run()
+
+    assert not at.exception
+    assert captured_urls == ["https://www.youtube.com/watch?v=representative1"]
+    assert list(at.selectbox(key="subtitle_lang_select").proto.options) == ["en"]
+
+
+def test_switching_playlist_scope_after_completed_job_clears_previous_result(monkeypatch, tmp_path):
+    """Kryterium akceptacji 4: zmiana zakresu "Tylko to wideo" <-> "Cała
+    playlista" po zakończonym pobraniu czyści poprzedni wynik/raport."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 3)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest5&list=PLmixedtest5"
+    ).run()
+
+    result_file = tmp_path / "Uploader-Title.mp3"
+    result_file.write_bytes(b"fake mp3 bytes")
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=result_file,
+            result_uploader="Test Uploader",
+            result_title="Test Title",
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+    at.run()
+    assert at.session_state["status"] == "done"
+
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (3 pozycji)").run()
+
+    assert not at.exception
     assert at.session_state["status"] == "idle"
 
 
