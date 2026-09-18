@@ -15,7 +15,13 @@ import queue as queue_module
 import time
 import uuid
 from pathlib import Path
-from typing import Literal, MutableMapping
+from typing import TYPE_CHECKING, Literal, MutableMapping
+
+if TYPE_CHECKING:
+    # Tylko do podpowiedzi typów (patrz analogiczny import w progress.py) —
+    # engine.py nie importuje session.py, więc cyklu tu nie ma, ale bez
+    # potrzeby resolwowania w runtime i tak importujemy leniwie/warunkowo.
+    from src.engine import PlaylistItemResult
 
 Status = Literal["idle", "running", "done", "error"]
 
@@ -37,6 +43,8 @@ _URL_LOCKED = "url_locked"
 _LAST_MODE_FORMAT = "last_mode_format"
 _SUBTITLE_LANG = "subtitle_lang"
 _PLAYLIST_SCOPE = "playlist_scope"
+_PLAYLIST_REPORT = "playlist_report"
+_PLAYLIST_TITLE = "playlist_title"
 
 # Pola "wyniku" zadania — czyszczone razem przy starcie nowego zadania
 # (set_running) i przy zmianie trybu/formatu z URL wciąż wypełnionym
@@ -49,6 +57,8 @@ _RESULT_FIELDS: dict = {
     _RESULT_UPLOADER: None,
     _RESULT_TITLE: None,
     _ERROR_MESSAGE: None,
+    _PLAYLIST_REPORT: None,
+    _PLAYLIST_TITLE: None,
 }
 
 _DEFAULTS: dict = {
@@ -110,6 +120,20 @@ class SessionState:
         return self._store[_ERROR_MESSAGE]
 
     @property
+    def playlist_report(self) -> "list[PlaylistItemResult] | None":
+        """Lista PlaylistItemResult (src/engine.py) ostatniego zakończonego
+        joba playlisty — None dla pojedynczych pobrań (playlist_scope="single")
+        i czyszczone razem z resztą wyniku (clear_result/set_running)."""
+        return self._store[_PLAYLIST_REPORT]
+
+    @property
+    def playlist_title(self) -> str | None:
+        """Tytuł playlisty z ostatniego zakończonego joba — używany do
+        nazwy ZIP-a widocznej dla użytkownika (app.py), NIE przez
+        build_display_filename (ta jest dla pojedynczych materiałów)."""
+        return self._store[_PLAYLIST_TITLE]
+
+    @property
     def job_id(self) -> str | None:
         return self._store[_JOB_ID]
 
@@ -140,9 +164,11 @@ class SessionState:
         return self._store[_URL_LOCKED]
 
     @property
-    def last_mode_format(self) -> tuple[str, str] | None:
-        """(mode, output_format) zapamiętane z poprzedniego przebiegu —
-        do wykrywania zmiany trybu/formatu (Warstwa 2, UX)."""
+    def last_mode_format(self) -> tuple[str, ...] | None:
+        """(mode, output_format, playlist_scope) zapamiętane z poprzedniego
+        przebiegu — do wykrywania zmiany trybu/formatu/zakresu (Warstwa 2,
+        UX; playlist_scope dołączony w Fazie 2b, żeby przełączenie "Tylko
+        to wideo" <-> "Cała playlista" też czyściło poprzedni wynik/raport)."""
         return self._store[_LAST_MODE_FORMAT]
 
     @property
@@ -219,6 +245,8 @@ class SessionState:
         file_name: str | None = None,
         uploader: str | None = None,
         title: str | None = None,
+        playlist_report: "list[PlaylistItemResult] | None" = None,
+        playlist_title: str | None = None,
     ) -> None:
         self._store[_STATUS] = "done"
         self._store[_PERCENT] = 100.0
@@ -227,6 +255,8 @@ class SessionState:
         self._store[_RESULT_FILE_NAME] = file_name
         self._store[_RESULT_UPLOADER] = uploader
         self._store[_RESULT_TITLE] = title
+        self._store[_PLAYLIST_REPORT] = playlist_report
+        self._store[_PLAYLIST_TITLE] = playlist_title
 
     def set_error(self, message: str) -> None:
         self._store[_STATUS] = "error"
