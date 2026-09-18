@@ -24,7 +24,7 @@ import pytest
 from src import job_runner as job_runner_module
 from src import storage
 from src.config import Settings
-from src.engine import DownloadJob, DownloadResult
+from src.engine import DownloadJob, DownloadResult, PlaylistDownloadResult, PlaylistItemResult
 from src.job_runner import JobRunner
 from src.progress import ProgressEvent
 
@@ -55,6 +55,69 @@ class _BlockingFakeEngine:
         if on_event is not None:
             on_event(ProgressEvent(event_type="on_finished", percent=100.0, message="fake done"))
         return DownloadResult(path=Path("/fake/path"), uploader="Fake Uploader", title="Fake Title")
+
+
+class _BlockingFakePlaylistEngine:
+    """Podobny do _BlockingFakeEngine, ale rozróżnia submit()/submit_playlist()
+    — testuje, że JobRunner._run() kieruje playlist_scope=="all" do
+    submit_playlist(), a NIE do submit() (Faza 2b)."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release_gate = threading.Event()
+        self.submit_called = False
+        self.submit_playlist_called = False
+
+    def submit(self, job: DownloadJob, on_event=None) -> DownloadResult:
+        self.submit_called = True
+        raise AssertionError("submit() nie powinno być wołane dla playlist_scope=='all'")
+
+    def submit_playlist(self, job: DownloadJob, on_event=None) -> PlaylistDownloadResult:
+        self.submit_playlist_called = True
+        self.started.set()
+        self.release_gate.wait(timeout=10.0)
+        return PlaylistDownloadResult(
+            zip_path=Path("/fake/playlist.zip"),
+            items=[
+                PlaylistItemResult(index=1, title="Wideo 1", status="done"),
+                PlaylistItemResult(index=2, title="Wideo 2", status="error", error_message="boom"),
+            ],
+            playlist_title="Fake Playlist",
+        )
+
+
+def test_run_routes_playlist_scope_all_to_submit_playlist_and_carries_items():
+    fake_engine = _BlockingFakePlaylistEngine()
+    runner = JobRunner(engine=fake_engine)
+    events: list[ProgressEvent] = []
+
+    job = DownloadJob(
+        url=TEST_VIDEO_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="job-playlist-routing",
+        playlist_scope="all",
+    )
+
+    assert runner.start(job, on_state=events.append) == "started"
+    assert fake_engine.started.wait(timeout=5.0)
+    fake_engine.release_gate.set()
+
+    assert _wait_until(
+        lambda: any(e.event_type == "on_finished" and e.playlist_items is not None for e in events),
+        timeout=5.0,
+    )
+
+    assert fake_engine.submit_playlist_called is True
+    assert fake_engine.submit_called is False
+
+    final_events = [e for e in events if e.event_type == "on_finished"]
+    final = final_events[-1]
+    assert final.result_path == Path("/fake/playlist.zip")
+    assert final.playlist_title == "Fake Playlist"
+    assert final.result_title == "Fake Playlist"
+    assert [item.status for item in final.playlist_items] == ["done", "error"]
 
 
 @pytest.mark.slow
