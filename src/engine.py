@@ -222,6 +222,28 @@ def _probe_playlist_entries(
     return entries, playlist_title
 
 
+def resolve_representative_video_url(url: str, cookie_data: bytes | None = None) -> str | None:
+    """Dla playlisty zwraca URL PIERWSZEJ pozycji — sondy jednego wideo
+    (list_available_subtitles) nie działają poprawnie na surowym URL-u
+    playlisty (ta sama klasa problemu, dla której _probe_playlist_entries
+    używa _PLAYLIST_FLAT_MODE, nie extract_flat=True). Używane przez app.py
+    (Faza 2b) jako klucz sondy języka napisów dla playlist_scope=="all",
+    ZAMIAST oryginalnego URL-a playlisty przekazanego przez użytkownika —
+    submit_playlist() wciąż dostaje ten oryginalny URL.
+
+    Zwraca None, jeśli url nie jest playlistą LUB playlista jest pusta —
+    wołający wtedy używa oryginalnego url bez zmian."""
+    with _temp_cookiefile(cookie_data) as cookiefile_path:
+        entries, _ = _probe_playlist_entries(url, cookiefile_path)
+
+    if not entries:
+        return None
+
+    first = entries[0]
+    video_id = first.get("id")
+    return first.get("url") or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None)
+
+
 def count_playlist_items(url: str, cookie_data: bytes | None = None) -> int | None:
     """Liczy pozycje playlisty (bez rozwiązywania pełnych metadanych każdego
     wideo) — używane przez UI (app.py) do pokazania realnej liczby pozycji
