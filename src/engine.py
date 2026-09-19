@@ -52,6 +52,12 @@ class DownloadJob:
     # jeszcze niezaimplementowana) na razie pokazuje dla "all" placeholder,
     # nigdy nie tworzy z tym joba, który faktycznie wywołałby submit_playlist().
     playlist_scope: str = "single"
+    # Faza 2c — pozycja BEZWZGLĘDNA (1-based, licząc od początku playlisty),
+    # od której submit_playlist() ma wznowić pobieranie po wcześniejszym
+    # zatrzymaniu z powodu MAX_ZIP_SIZE_MB (patrz
+    # PlaylistDownloadResult.next_start_index). Domyślne 1 = od początku,
+    # jak dotychczas — zero zmian zachowania dla nowych jobów.
+    start_index: int = 1
 
 
 @dataclass
@@ -96,6 +102,12 @@ class PlaylistDownloadResult:
     items: list[PlaylistItemResult]
     playlist_title: str | None = None
     stopped_early_reason: str | None = None
+    # Faza 2c — pozycja BEZWZGLĘDNA pierwszej nieprzetworzonej pozycji, gdy
+    # pętla zatrzymała się przedwcześnie (MAX_ZIP_SIZE_MB) I zostały jeszcze
+    # nieprzetworzone pozycje. None = pętla doszła do końca entries (nawet
+    # jeśli część pozycji się nie udała) — sygnał dla UI "nie ma czego
+    # kontynuować" — patrz app.py, przycisk "Pobierz kolejne pozycje".
+    next_start_index: int | None = None
 
 
 class EngineError(Exception):
@@ -347,14 +359,23 @@ class DownloadEngine:
         return result
 
     def submit_playlist(
-        self, job: DownloadJob, on_event: OnEventCallback | None = None
+        self,
+        job: DownloadJob,
+        on_event: OnEventCallback | None = None,
+        start_index: int = 1,
     ) -> PlaylistDownloadResult:
-        """Pobiera WSZYSTKIE pozycje playlisty (job.playlist_scope=="all")
-        do jednego ZIP-a. Błąd pojedynczej pozycji NIE przerywa reszty
-        (decyzja produktowa: pomiń, kontynuuj, zbierz raport w items) —
-        tylko błędy na poziomie CAŁEGO joba (walidacja URL, sonda, limit
-        MAX_PLAYLIST_ITEMS) trafiają do zewnętrznego except/EngineError,
-        tak jak w submit()."""
+        """Pobiera pozycje playlisty (job.playlist_scope=="all") od
+        `start_index` (bezwzględna, 1-based) do jednego ZIP-a. Błąd
+        pojedynczej pozycji NIE przerywa reszty (decyzja produktowa: pomiń,
+        kontynuuj, zbierz raport w items) — tylko błędy na poziomie CAŁEGO
+        joba (walidacja URL, sonda, limit MAX_PLAYLIST_ITEMS) trafiają do
+        zewnętrznego except/EngineError, tak jak w submit().
+
+        `start_index` (Faza 2c) pozwala wznowić pobieranie po wcześniejszym
+        zatrzymaniu z powodu MAX_ZIP_SIZE_MB — indeksowanie w items/nazwach
+        plików pozostaje BEZWZGLĘDNE względem oryginalnej playlisty (pozycja
+        11 nadal daje plik "11 - ..."), zamiast liczenia od 1 przy każdym
+        wznowieniu."""
         job_dir: Path | None = None
         try:
             if not validate_url(job.url):
@@ -365,21 +386,28 @@ class DownloadEngine:
 
             entries, playlist_title = _probe_playlist_entries(job.url, cookiefile_path)
             entries = entries or []
+            total = len(entries)
 
             # Zabezpieczenie na poziomie SILNIKA, nie tylko UI (Faza 2b) —
             # limit liczby pozycji nie dotyczy Subtitle/Transcript (te same
-            # zasady co _check_playlist_limit w submit()).
-            if job.mode in ("video", "audio") and len(entries) > settings.max_playlist_items:
+            # zasady co _check_playlist_limit w submit()). Sprawdzany na
+            # PEŁNEJ długości playlisty (przed slice'em start_index) —
+            # wznowienie nie omija tej bramki ani jej nie duplikuje: jeśli
+            # pierwsze wywołanie już przez nią przeszło, playlista nie
+            # urośnie między wznowieniami w ramach jednej sesji użytkownika.
+            if job.mode in ("video", "audio") and total > settings.max_playlist_items:
                 raise PlaylistTooLargeError(
-                    f"playlist ma {len(entries)} pozycji, limit to {settings.max_playlist_items}"
+                    f"playlist ma {total} pozycji, limit to {settings.max_playlist_items}"
                 )
 
+            remaining_entries = entries[start_index - 1 :]
+
             items: list[PlaylistItemResult] = []
-            total = len(entries)
             stopped_early_reason: str | None = None
+            next_start_index: int | None = None
             max_zip_size_bytes = settings.max_zip_size_mb * 1024 * 1024
 
-            for position, entry in enumerate(entries, start=1):
+            for position, entry in enumerate(remaining_entries, start=start_index):
                 video_url = entry.get("url") or f"https://www.youtube.com/watch?v={entry.get('id')}"
                 entry_title = entry.get("title")
                 size_limit_exceeded = False
@@ -420,7 +448,12 @@ class DownloadEngine:
                         f"Przekroczono limit rozmiaru ZIP-a ({settings.max_zip_size_mb} MB) "
                         f"po pozycji {position} z {total} — pominięto pozostałe."
                     )
-                    for offset, skipped_entry in enumerate(entries[position:], start=position + 1):
+                    remaining_after = entries[position:]
+                    if remaining_after:
+                        # Faza 2c — jest jeszcze co wznowić; None (domyślne)
+                        # oznaczałoby błędnie "koniec playlisty" dla UI.
+                        next_start_index = position + 1
+                    for offset, skipped_entry in enumerate(remaining_after, start=position + 1):
                         items.append(
                             PlaylistItemResult(
                                 index=offset,
@@ -438,6 +471,7 @@ class DownloadEngine:
                 items=items,
                 playlist_title=playlist_title,
                 stopped_early_reason=stopped_early_reason,
+                next_start_index=next_start_index,
             )
 
         except Exception as exc:
