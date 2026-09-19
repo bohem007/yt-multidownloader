@@ -111,7 +111,9 @@ class JobRunner:
                 # pozycja przez on_state — tu dołączamy jedyny finalny
                 # "on_finished", niosący ZIP + raport per pozycja, żeby
                 # odbiorca (app.py) nie musiał doodpytywać engine.py.
-                result = self._engine.submit_playlist(job, on_event=on_state)
+                result = self._engine.submit_playlist(
+                    job, on_event=on_state, start_index=job.start_index
+                )
                 on_state(
                     ProgressEvent(
                         event_type="on_finished",
@@ -121,6 +123,7 @@ class JobRunner:
                         result_title=result.playlist_title,
                         playlist_items=result.items,
                         playlist_title=result.playlist_title,
+                        next_start_index=result.next_start_index,
                     )
                 )
             else:
