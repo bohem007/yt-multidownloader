@@ -68,6 +68,7 @@ class Settings:
     max_playlist_items: int = 10
     max_zip_size_mb: int = 500
     max_concurrent_jobs: int = 2
+    download_link_ttl_minutes: int = 30
     rate_limit_per_ip: int = 10
     rate_limiting_enabled: bool = True
     ip_hash_secret: str = ""
@@ -98,6 +99,9 @@ class Settings:
             max_playlist_items=int(env.get("MAX_PLAYLIST_ITEMS", defaults.max_playlist_items)),
             max_zip_size_mb=int(env.get("MAX_ZIP_SIZE_MB", defaults.max_zip_size_mb)),
             max_concurrent_jobs=int(env.get("MAX_CONCURRENT_JOBS", defaults.max_concurrent_jobs)),
+            download_link_ttl_minutes=int(
+                env.get("DOWNLOAD_LINK_TTL_MINUTES", defaults.download_link_ttl_minutes)
+            ),
             rate_limit_per_ip=int(env.get("RATE_LIMIT_PER_IP", defaults.rate_limit_per_ip)),
             rate_limiting_enabled=_parse_bool(
                 env.get("RATE_LIMITING_ENABLED"), defaults.rate_limiting_enabled
