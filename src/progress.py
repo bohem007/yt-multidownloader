@@ -40,3 +40,7 @@ class ProgressEvent:
     # pobrań — zero zmian w zachowaniu istniejących odbiorców.
     playlist_items: list["PlaylistItemResult"] | None = None
     playlist_title: str | None = None
+    # Faza 2c — pozycja BEZWZGLĘDNA, od której wznowić pobieranie (przycisk
+    # "Pobierz kolejne pozycje" w app.py) — None = nic do wznowienia
+    # (playlista przetworzona do końca, patrz PlaylistDownloadResult).
+    next_start_index: int | None = None
