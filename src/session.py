@@ -30,6 +30,7 @@ _PERCENT = "percent"
 _MESSAGE = "message"
 _RESULT_PATH = "result_path"
 _RESULT_DATA = "result_data"
+_RESULT_DOWNLOAD_TOKEN = "result_download_token"
 _RESULT_FILE_NAME = "result_file_name"
 _RESULT_UPLOADER = "result_uploader"
 _RESULT_TITLE = "result_title"
@@ -45,6 +46,7 @@ _SUBTITLE_LANG = "subtitle_lang"
 _PLAYLIST_SCOPE = "playlist_scope"
 _PLAYLIST_REPORT = "playlist_report"
 _PLAYLIST_TITLE = "playlist_title"
+_PLAYLIST_NEXT_START_INDEX = "playlist_next_start_index"
 
 # Pola "wyniku" zadania — czyszczone razem przy starcie nowego zadania
 # (set_running) i przy zmianie trybu/formatu z URL wciąż wypełnionym
@@ -53,12 +55,14 @@ _PLAYLIST_TITLE = "playlist_title"
 _RESULT_FIELDS: dict = {
     _RESULT_PATH: None,
     _RESULT_DATA: None,
+    _RESULT_DOWNLOAD_TOKEN: None,
     _RESULT_FILE_NAME: None,
     _RESULT_UPLOADER: None,
     _RESULT_TITLE: None,
     _ERROR_MESSAGE: None,
     _PLAYLIST_REPORT: None,
     _PLAYLIST_TITLE: None,
+    _PLAYLIST_NEXT_START_INDEX: None,
 }
 
 _DEFAULTS: dict = {
@@ -104,6 +108,12 @@ class SessionState:
         return self._store[_RESULT_DATA]
 
     @property
+    def result_download_token(self) -> str | None:
+        """Token linku do pobrania z dysku (src/downloads.py) — ustawiany
+        zamiast result_data dla dużych wyników (ZIP playlisty)."""
+        return self._store[_RESULT_DOWNLOAD_TOKEN]
+
+    @property
     def result_file_name(self) -> str | None:
         return self._store[_RESULT_FILE_NAME]
 
@@ -132,6 +142,13 @@ class SessionState:
         nazwy ZIP-a widocznej dla użytkownika (app.py), NIE przez
         build_display_filename (ta jest dla pojedynczych materiałów)."""
         return self._store[_PLAYLIST_TITLE]
+
+    @property
+    def playlist_next_start_index(self) -> int | None:
+        """Faza 2c — pozycja BEZWZGLĘDNA, od której wznowić pobieranie
+        ("Pobierz kolejne pozycje" w app.py). None = nic do wznowienia
+        (playlista przetworzona do końca) — przycisk się nie pokazuje."""
+        return self._store[_PLAYLIST_NEXT_START_INDEX]
 
     @property
     def job_id(self) -> str | None:
@@ -207,18 +224,49 @@ class SessionState:
         self._store[_MESSAGE] = ""
         self._store.update(_RESULT_FIELDS)
 
-    def begin_job(self, job_id: str, subtitle_lang: str | None = None) -> "queue_module.Queue":
+    def begin_job(
+        self,
+        job_id: str,
+        subtitle_lang: str | None = None,
+        *,
+        clear_previous_result: bool = True,
+    ) -> "queue_module.Queue":
         """Startuje nowe zadanie: status->running, nowe job_id, świeża
         kolejka na zdarzenia postępu (most z wątku w tle) i znacznik czasu
         startu. Zwraca kolejkę, którą wołający ma podłączyć do callbacku
-        przekazywanego dalej do JobRunner.start()."""
-        self.set_running()
+        przekazywanego dalej do JobRunner.start().
+
+        clear_previous_result=False (Faza 2c, "Pobierz kolejne pozycje"):
+        NIE czyści pól wyniku poprzedniego zadania (ZIP/raport playlisty)
+        — pozostają widoczne w UI, dopóki NOWE zadanie faktycznie się nie
+        zakończy (set_done/set_error nadpisze je dopiero wtedy). Domyślne
+        True = dotychczasowe zachowanie (set_running() czyści od razu)."""
+        self._store[_STATUS] = "running"
+        self._store[_PERCENT] = 0.0
+        self._store[_MESSAGE] = ""
+        if clear_previous_result:
+            self._store.update(_RESULT_FIELDS)
         self._store[_JOB_ID] = job_id
         self._store[_STARTED_AT] = time.monotonic()
         self._store[_SUBTITLE_LANG] = subtitle_lang
         q: queue_module.Queue = queue_module.Queue()
         self._store[_QUEUE] = q
         return q
+
+    def cancel_queued_job(self) -> None:
+        """Odwraca begin_job(), gdy JobRunner.start() zwróci "queued"
+        (rzadki wyścig z is_slot_available() — nierezerwujące sprawdzenie) —
+        zadanie nigdy faktycznie nie wystartowało. Status wraca do "done",
+        jeśli wynik poprzedniego zadania wciąż jest w store (kontynuacja
+        playlisty z clear_previous_result=False), inaczej do "idle"."""
+        self._store[_JOB_ID] = None
+        self._store[_QUEUE] = None
+        self._store[_STARTED_AT] = None
+        has_result = (
+            self._store[_RESULT_DATA] is not None
+            or self._store[_RESULT_DOWNLOAD_TOKEN] is not None
+        )
+        self._store[_STATUS] = "done" if has_result else "idle"
 
     def set_db_job_id(self, db_job_id: int) -> None:
         self._store[_DB_JOB_ID] = db_job_id
@@ -242,21 +290,25 @@ class SessionState:
         result_path: Path | str,
         *,
         data: bytes | None = None,
+        download_token: str | None = None,
         file_name: str | None = None,
         uploader: str | None = None,
         title: str | None = None,
         playlist_report: "list[PlaylistItemResult] | None" = None,
         playlist_title: str | None = None,
+        playlist_next_start_index: int | None = None,
     ) -> None:
         self._store[_STATUS] = "done"
         self._store[_PERCENT] = 100.0
         self._store[_RESULT_PATH] = result_path
         self._store[_RESULT_DATA] = data
+        self._store[_RESULT_DOWNLOAD_TOKEN] = download_token
         self._store[_RESULT_FILE_NAME] = file_name
         self._store[_RESULT_UPLOADER] = uploader
         self._store[_RESULT_TITLE] = title
         self._store[_PLAYLIST_REPORT] = playlist_report
         self._store[_PLAYLIST_TITLE] = playlist_title
+        self._store[_PLAYLIST_NEXT_START_INDEX] = playlist_next_start_index
 
     def set_error(self, message: str) -> None:
         self._store[_STATUS] = "error"
