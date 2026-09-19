@@ -192,3 +192,103 @@ def test_clear_result_also_clears_playlist_report_and_title():
 
     assert state.playlist_report is None
     assert state.playlist_title is None
+
+
+def test_playlist_next_start_index_defaults_none_and_settable_via_set_done():
+    state = SessionState({})
+
+    assert state.playlist_next_start_index is None
+
+    state.set_done(Path("playlist.zip"), data=b"zip", playlist_next_start_index=6)
+
+    assert state.playlist_next_start_index == 6
+
+
+def test_clear_result_also_clears_playlist_next_start_index():
+    state = SessionState({})
+    state.set_done(Path("playlist.zip"), data=b"zip", playlist_next_start_index=6)
+
+    state.clear_result()
+
+    assert state.playlist_next_start_index is None
+
+
+def test_begin_job_with_clear_previous_result_false_keeps_previous_result():
+    """Faza 2c: "Pobierz kolejne pozycje" nie może wyczyścić poprzedniego
+    ZIP-a/raportu, dopóki NOWY job faktycznie się nie zakończy — użytkownik
+    mógł jeszcze nie zdążyć zapisać poprzedniego pliku."""
+    state = SessionState({})
+    state.set_done(
+        Path("playlist.zip"),
+        data=b"previous zip bytes",
+        file_name="Playlista-Tytul.zip",
+        playlist_report=[object()],
+        playlist_title="Tytuł",
+        playlist_next_start_index=6,
+    )
+
+    state.begin_job("job-continue", clear_previous_result=False)
+
+    assert state.status == "running"
+    assert state.result_data == b"previous zip bytes"
+    assert state.playlist_report is not None
+    assert state.playlist_title == "Tytuł"
+    assert state.playlist_next_start_index == 6
+
+
+def test_begin_job_default_clears_previous_result_as_before():
+    """Zero regresji: domyślne begin_job() (bez argumentu) zachowuje się
+    jak dotychczas — czyści wynik poprzedniego zadania."""
+    state = SessionState({})
+    state.set_done(Path("x.mp3"), data=b"abc", uploader="Chan", title="Tit")
+
+    state.begin_job("job-fresh")
+
+    assert state.result_data is None
+    assert state.result_uploader is None
+
+
+def test_cancel_queued_job_restores_done_when_previous_result_present():
+    state = SessionState({})
+    state.set_done(Path("playlist.zip"), data=b"previous zip bytes", playlist_next_start_index=6)
+    state.begin_job("job-continue", clear_previous_result=False)
+
+    state.cancel_queued_job()
+
+    assert state.status == "done"
+    assert state.result_data == b"previous zip bytes"
+    assert state.job_id is None
+    assert state.queue is None
+
+
+def test_cancel_queued_job_restores_idle_when_no_previous_result():
+    state = SessionState({})
+    state.begin_job("job-fresh")
+
+    state.cancel_queued_job()
+
+    assert state.status == "idle"
+
+
+def test_set_done_stores_download_token_and_clear_result_drops_it():
+    state = SessionState({})
+
+    state.set_done(Path("playlist.zip"), download_token="tok-123", file_name="Playlista-X.zip")
+
+    assert state.result_download_token == "tok-123"
+    assert state.result_data is None
+
+    state.clear_result()
+
+    assert state.result_download_token is None
+
+
+def test_cancel_queued_job_restores_done_when_previous_result_is_a_download_token():
+    state = SessionState({})
+    state.set_done(Path("playlist.zip"), download_token="tok-123", playlist_next_start_index=6)
+    state.begin_job("job-continue", clear_previous_result=False)
+
+    state.cancel_queued_job()
+
+    assert state.status == "done"
+    assert state.result_download_token == "tok-123"
