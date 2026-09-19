@@ -707,8 +707,153 @@ def test_submit_playlist_stops_when_cumulative_size_exceeds_max_zip_size(monkeyp
     assert result.stopped_early_reason is not None
     assert [item.status for item in result.items] == ["done", "done", "skipped"]
     assert result.items[2].error_message
+    # Faza 2c: jest jeszcze 1 nieprzetworzona pozycja (3.) → next_start_index
+    # wskazuje na nią (bezwzględnie), żeby "Pobierz kolejne pozycje" wiedziało,
+    # od czego wznowić.
+    assert result.next_start_index == 3
     with zipfile.ZipFile(result.zip_path) as zf:
         assert len(zf.namelist()) == 2
+
+
+def test_submit_playlist_resumes_from_start_index_with_absolute_numbering(monkeypatch, tmp_path):
+    """Kryterium akceptacji 2 (Faza 2c): start_index=3 pomija pozycje 1-2
+    (zero prób pobrania dla nich) i pobiera WYŁĄCZNIE pozycje 3-5, ale
+    numeracja w items/nazwach plików w ZIP-ie pozostaje BEZWZGLĘDNA
+    względem oryginalnej playlisty ("03 - ...", nie "01 - ...")."""
+    flat_info = _fake_flat_entries(5)
+    call_count = 0
+    attempted_ids: list[str] = []
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        attempted_ids.append(item_number)
+        media_path = tmp_path / f"RawVideo{item_number}.mp4"
+        media_path.write_bytes(b"fake mp4 bytes")
+        return _FakeYDL(
+            opts,
+            {
+                "requested_downloads": [{"filepath": str(media_path)}],
+                "uploader": "Channel",
+                "title": f"Video {item_number}",
+            },
+        )
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-resume",
+        playlist_scope="all",
+    )
+
+    result = engine.submit_playlist(job, start_index=3)
+
+    assert len(attempted_ids) == 3  # tylko pozycje 3, 4, 5 — nie 1, 2
+    assert [item.index for item in result.items] == [3, 4, 5]
+    assert [item.status for item in result.items] == ["done", "done", "done"]
+    assert result.next_start_index is None  # pętla doszła do końca entries
+
+    with zipfile.ZipFile(result.zip_path) as zf:
+        names = sorted(zf.namelist())
+    assert len(names) == 3
+    assert names[0].startswith("03 - ")
+    assert names[1].startswith("04 - ")
+    assert names[2].startswith("05 - ")
+
+
+def test_submit_playlist_stop_on_last_entry_leaves_next_start_index_none(monkeypatch, tmp_path):
+    """Edge case (Faza 2c): zatrzymanie limitem ZIP-a dokładnie na OSTATNIEJ
+    pozycji playlisty → next_start_index musi zostać None (nic do
+    wznowienia), mimo że stopped_early_reason jest ustawiony."""
+    monkeypatch.setattr(engine_module, "settings", Settings.from_env({"MAX_ZIP_SIZE_MB": "1"}))
+
+    flat_info = _fake_flat_entries(2)
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        media_path = tmp_path / f"RawVideo{item_number}.mp4"
+        media_path.write_bytes(b"0" * int(0.6 * 1024 * 1024))
+        return _FakeYDL(
+            opts,
+            {
+                "requested_downloads": [{"filepath": str(media_path)}],
+                "uploader": "Channel",
+                "title": f"Video {item_number}",
+            },
+        )
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-zip-limit-last-item",
+        playlist_scope="all",
+    )
+
+    result = engine.submit_playlist(job)
+
+    assert result.stopped_early_reason is not None
+    assert [item.status for item in result.items] == ["done", "done"]
+    assert result.next_start_index is None
+
+
+def test_submit_playlist_max_playlist_items_checked_on_full_length_not_remaining(
+    monkeypatch, tmp_path
+):
+    """Faza 2c: MAX_PLAYLIST_ITEMS jest sprawdzany na PEŁNEJ długości
+    playlisty, PRZED slice'em start_index — wznowienie nie omija tej
+    bramki (nawet gdy pozycje OD start_index są już pod limitem)."""
+    total = settings.max_playlist_items + 5
+    flat_info = _fake_flat_entries(total)
+    download_attempted = False
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal download_attempted
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        download_attempted = True
+        return _FakeYDL(opts, {})
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-resume-over-limit",
+        playlist_scope="all",
+    )
+
+    # start_index dostatecznie duży, żeby "pozycje od start_index" osobno
+    # zmieściłyby się pod limitem — bramka musi mimo to zadziałać, bo liczy
+    # PEŁNĄ długość (total), nie total - start_index + 1.
+    with pytest.raises(EngineError) as exc_info:
+        engine.submit_playlist(job, start_index=total - settings.max_playlist_items + 1)
+
+    assert isinstance(exc_info.value.original_exception, PlaylistTooLargeError)
+    assert download_attempted is False
 
 
 def test_submit_playlist_raises_before_downloading_when_over_limit_for_video_mode(

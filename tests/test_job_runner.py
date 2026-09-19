@@ -62,18 +62,21 @@ class _BlockingFakePlaylistEngine:
     — testuje, że JobRunner._run() kieruje playlist_scope=="all" do
     submit_playlist(), a NIE do submit() (Faza 2b)."""
 
-    def __init__(self) -> None:
+    def __init__(self, next_start_index_to_return: int | None = None) -> None:
         self.started = threading.Event()
         self.release_gate = threading.Event()
         self.submit_called = False
         self.submit_playlist_called = False
+        self.received_start_index: int | None = None
+        self.next_start_index_to_return = next_start_index_to_return
 
     def submit(self, job: DownloadJob, on_event=None) -> DownloadResult:
         self.submit_called = True
         raise AssertionError("submit() nie powinno być wołane dla playlist_scope=='all'")
 
-    def submit_playlist(self, job: DownloadJob, on_event=None) -> PlaylistDownloadResult:
+    def submit_playlist(self, job: DownloadJob, on_event=None, start_index: int = 1) -> PlaylistDownloadResult:
         self.submit_playlist_called = True
+        self.received_start_index = start_index
         self.started.set()
         self.release_gate.wait(timeout=10.0)
         return PlaylistDownloadResult(
@@ -83,6 +86,7 @@ class _BlockingFakePlaylistEngine:
                 PlaylistItemResult(index=2, title="Wideo 2", status="error", error_message="boom"),
             ],
             playlist_title="Fake Playlist",
+            next_start_index=self.next_start_index_to_return,
         )
 
 
@@ -114,10 +118,43 @@ def test_run_routes_playlist_scope_all_to_submit_playlist_and_carries_items():
 
     final_events = [e for e in events if e.event_type == "on_finished"]
     final = final_events[-1]
+    assert fake_engine.received_start_index == 1  # domyślne, job.start_index nie ustawiony
     assert final.result_path == Path("/fake/playlist.zip")
     assert final.playlist_title == "Fake Playlist"
     assert final.result_title == "Fake Playlist"
     assert [item.status for item in final.playlist_items] == ["done", "error"]
+
+
+def test_run_passes_job_start_index_to_submit_playlist_and_carries_next_start_index():
+    """Faza 2c: DownloadJob.start_index (ustawiony przez "Pobierz kolejne
+    pozycje" w app.py) musi trafić do submit_playlist() jako start_index=,
+    a wynikowe next_start_index musi dotrzeć do finalnego ProgressEvent."""
+    fake_engine = _BlockingFakePlaylistEngine(next_start_index_to_return=6)
+    runner = JobRunner(engine=fake_engine)
+    events: list[ProgressEvent] = []
+
+    job = DownloadJob(
+        url=TEST_VIDEO_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="job-playlist-resume-routing",
+        playlist_scope="all",
+        start_index=5,
+    )
+
+    assert runner.start(job, on_state=events.append) == "started"
+    assert fake_engine.started.wait(timeout=5.0)
+    fake_engine.release_gate.set()
+
+    assert _wait_until(
+        lambda: any(e.event_type == "on_finished" and e.playlist_items is not None for e in events),
+        timeout=5.0,
+    )
+
+    assert fake_engine.received_start_index == 5
+    final = [e for e in events if e.event_type == "on_finished"][-1]
+    assert final.next_start_index == 6
 
 
 @pytest.mark.slow
