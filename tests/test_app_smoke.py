@@ -9,13 +9,16 @@ przebiegu), żeby testy były szybkie, deterministyczne i offline.
 
 from __future__ import annotations
 
+import dataclasses
 import queue as queue_module
 import threading
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 import src.config as config_module
+import src.downloads as downloads
 import src.engine as engine_module
 from src.config import Settings
 from src.db import Database
@@ -23,6 +26,33 @@ from src.engine import PlaylistDownloadResult, PlaylistItemResult
 from src.progress import ProgressEvent
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_links_dir(monkeypatch, tmp_path_factory):
+    """Katalog linków do pobrania (src/downloads.py) MUSI leżeć poza tmp_path
+    testu — app.py woła storage.cleanup(result_file.parent), a ZIP-y w
+    testach leżą wprost w tmp_path, więc wspólny katalog zostałby skasowany."""
+    links_base = tmp_path_factory.mktemp("links-base")
+    monkeypatch.setattr(
+        downloads,
+        "settings",
+        dataclasses.replace(downloads.settings, storage_base_dir=str(links_base)),
+    )
+    downloads.set_route_enabled(True)
+    yield
+    downloads.set_route_enabled(False)
+    downloads.purge_all()
+
+
+def _publish_seed_zip(directory: Path, content: bytes, name: str = "Playlista-Moja playlista.zip"):
+    source = directory / f"seed-{len(content)}.zip"
+    source.write_bytes(content)
+    return downloads.publish(source, name)
+
+
+def _link_urls(at: AppTest) -> list[str]:
+    return [element.proto.url for element in at.get("link_button")]
 
 
 def _run_app(monkeypatch) -> AppTest:
@@ -252,7 +282,7 @@ def test_clicking_download_with_playlist_scope_all_starts_real_job(monkeypatch, 
     zip_file.write_bytes(b"fake zip bytes")
     submit_playlist_called = threading.Event()
 
-    def _fake_submit_playlist(self, job, on_event=None):
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1):
         submit_playlist_called.set()
         return PlaylistDownloadResult(zip_path=zip_file, items=[], playlist_title="Fake")
 
@@ -277,10 +307,13 @@ def test_clicking_download_with_playlist_scope_all_starts_real_job(monkeypatch, 
     if at.session_state["status"] != "done":
         at.run()
     assert at.session_state["status"] == "done"
-    assert len(at.download_button) >= 1
+    token = at.session_state["result_download_token"]
+    assert token is not None and downloads.lookup(token) is not None
+    assert _link_urls(at) == [downloads.download_url(token)]
+    assert len(at.download_button) == 0
 
 
-def test_completed_playlist_job_shows_zip_download_button_with_report(monkeypatch, tmp_path):
+def test_completed_playlist_job_shows_zip_download_link_with_report(monkeypatch, tmp_path):
     """Kryterium akceptacji 1+2: submit_playlist() zwrócił ZIP + raport
     per pozycja (jedna pozycja error) — status="done" (bo ≥1 sukces),
     nazwa pliku "Playlista-{tytuł}.zip" (nie przez build_display_filename),
@@ -313,13 +346,253 @@ def test_completed_playlist_job_shows_zip_download_button_with_report(monkeypatc
     assert not at.exception
     assert at.session_state["status"] == "done"
     assert at.session_state["result_file_name"] == "Playlista-Moja playlista.zip"
-    assert at.session_state["result_data"] == b"fake zip bytes"
-    assert len(at.download_button) >= 1
+    # ZIP zostaje na dysku pod nieodgadywalnym tokenem — NIE w RAM/session_state.
+    assert at.session_state["result_data"] is None
+    token = at.session_state["result_download_token"]
+    link = downloads.lookup(token)
+    assert link is not None
+    assert link.path.read_bytes() == b"fake zip bytes"
+    assert link.file_name == "Playlista-Moja playlista.zip"
+    assert _link_urls(at) == [downloads.download_url(token)]
+    assert len(at.download_button) == 0
 
+    # Ostatnia tura (brak kontynuacji): "zakończone" + uczciwy czas ważności.
+    assert [s.value for s in at.success] == ["Pobieranie playlisty zakończone."]
     caption_texts = [c.value for c in at.caption]
+    assert "Link do pobrania jest ważny przez 30 minut." in caption_texts
+    assert not any("zostanie zastąpiony" in text for text in caption_texts)
     assert any("1 z 2 pozycji pobranych" in text for text in caption_texts)
     write_texts = [w.value for w in at.markdown]
     assert any("Wideo 2" in text and "Video unavailable" in text for text in write_texts)
+
+    # Faza 2c: brak next_start_index (domyślne None, nic nie zatrzymało
+    # pętli przed końcem) → nie ma przycisku "Pobierz kolejne pozycje".
+    assert "continue_playlist_button" not in [b.key for b in at.button]
+
+
+def test_completed_playlist_job_with_next_start_index_shows_continue_button_and_context_message(
+    monkeypatch, tmp_path
+):
+    """Kryterium akceptacji 1 (Faza 2c): next_start_index ustawiony →
+    widoczny przycisk "Pobierz kolejne pozycje" oraz komunikat kontekstowy
+    o zamierzonym zatrzymaniu (nie błąd) z numerem pozycji do wznowienia."""
+    at = _run_app(monkeypatch)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+
+    items = [
+        PlaylistItemResult(index=1, title="Wideo 1", status="done"),
+        PlaylistItemResult(index=2, title="Wideo 2", status="done"),
+    ]
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=zip_file,
+            playlist_items=items,
+            playlist_title="Moja playlista",
+            next_start_index=3,
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    # Pierwsze wywołanie (start_index=1 domyślnie) — nazwa BEZ zakresu
+    # pozycji, zero regresji względem Fazy 2b.
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista.zip"
+    assert at.session_state["playlist_next_start_index"] == 3
+
+    info_messages = [i.value for i in at.info]
+    assert any("pozycji 2" in m and "pozycji 3" in m for m in info_messages)
+    assert "continue_playlist_button" in [b.key for b in at.button]
+
+    # Tura z kontynuacją: NIE "playlisty zakończone", NIE stały czas ważności.
+    assert [s.value for s in at.success] == ["Tura zakończona: pobrano pozycje 1-2."]
+    caption_texts = [c.value for c in at.caption]
+    assert "Ten plik zostanie zastąpiony, gdy pobierzesz kolejne pozycje." in caption_texts
+    assert not any("minut" in text for text in caption_texts)
+
+
+def test_clicking_continue_button_starts_continuation_and_replaces_result_on_completion(
+    monkeypatch, tmp_path
+):
+    """Kryteria akceptacji 2+3 (Faza 2c): kliknięcie "Pobierz kolejne
+    pozycje" startuje nowy job z start_index=next_start_index (bezwzględny);
+    poprzedni ZIP/raport są widoczne PRZED kliknięciem; po zakończeniu
+    kontynuacji nowy ZIP (z zakresem pozycji w nazwie) zastępuje poprzedni,
+    a next_start_index=None (koniec playlisty) chowa przycisk."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 5)
+
+    received: dict = {}
+    continuation_zip = tmp_path / "continuation.zip"
+    continuation_zip.write_bytes(b"continuation zip bytes")
+
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1):
+        received["start_index"] = start_index
+        return PlaylistDownloadResult(
+            zip_path=continuation_zip,
+            items=[
+                PlaylistItemResult(index=3, title="Wideo 3", status="done"),
+                PlaylistItemResult(index=4, title="Wideo 4", status="done"),
+                PlaylistItemResult(index=5, title="Wideo 5", status="done"),
+            ],
+            playlist_title="Moja playlista",
+            next_start_index=None,
+        )
+
+    monkeypatch.setattr(engine_module.DownloadEngine, "submit_playlist", _fake_submit_playlist)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest6&list=PLmixedtest6"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (5 pozycji)").run()
+
+    # Symulacja zakończonego PIERWSZEGO wywołania, zatrzymanego po pozycji 2
+    # (wstrzyknięte bezpośrednio — to samo, co job_runner.py zrobiłby przez
+    # ProgressEvent, tylko bez realnego wątku w tle).
+    first_link = _publish_seed_zip(tmp_path, b"first zip bytes")
+    at.session_state["status"] = "done"
+    at.session_state["result_download_token"] = first_link.token
+    at.session_state["result_file_name"] = "Playlista-Moja playlista.zip"
+    at.session_state["playlist_report"] = [
+        PlaylistItemResult(index=1, title="Wideo 1", status="done"),
+        PlaylistItemResult(index=2, title="Wideo 2", status="done"),
+    ]
+    at.session_state["playlist_title"] = "Moja playlista"
+    at.session_state["playlist_next_start_index"] = 3
+    at.session_state["job_id"] = "first-job-id"
+
+    at.run()
+
+    assert not at.exception
+    first_urls = _link_urls(at)
+    assert first_urls == [downloads.download_url(first_link.token)]  # poprzedni ZIP wciąż dostępny
+    assert "continue_playlist_button" in [b.key for b in at.button]
+
+    at.button(key="continue_playlist_button").click().run()
+    assert not at.exception
+
+    for _ in range(10):
+        if at.session_state["status"] == "done" and received.get("start_index") is not None:
+            break
+        at.run()
+
+    assert received["start_index"] == 3
+    assert at.session_state["status"] == "done"
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-3-5.zip"
+    assert at.session_state["playlist_next_start_index"] is None
+    assert "continue_playlist_button" not in [b.key for b in at.button]
+
+    new_token = at.session_state["result_download_token"]
+    assert new_token != first_link.token
+    assert downloads.lookup(new_token).path.read_bytes() == b"continuation zip bytes"
+    # Poprzedni ZIP zwolniony z dysku, gdy nowy wynik go zastąpił.
+    assert downloads.lookup(first_link.token) is None
+    assert not first_link.path.exists()
+    assert _link_urls(at) == [downloads.download_url(new_token)]
+
+
+def test_download_link_stays_unique_across_full_continuation_chain_including_last_turn(
+    monkeypatch, tmp_path
+):
+    """Regresja: fix poprzedniej sesji (key oparty o job_id + running/final)
+    naprawił przejścia MIĘDZY kontynuacjami, ale manualny retest na pełnym
+    łańcuchu (4 tury: 1-3, 4-6, 7-9, 10-12) pokazał, że przycisk "Zapisz
+    plik" znów nie reaguje TYLKO w OSTATNIEJ turze — tej, po której
+    next_start_index=None (brak przycisku "Pobierz kolejne pozycje" niżej).
+    Ten test symuluje CAŁY łańcuch (3 kontynuacje, ostatnia bez dalszego
+    ciągu) i porównuje key/url widgetu download_button dla KAŻDEJ kolejnej
+    pary renderów — w tym pary (przedostatnia tura → ostatnia), która
+    poprzednio przeszła niezauważona, bo poprzedni test kończył się na
+    JEDNYM przejściu z next_start_index wciąż ustawionym po obu stronach."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 12)
+
+    calls: list[int] = []
+    # (start_index, first, last, next_start_index_po_tej_turze) — ostatnia
+    # tura (10-12) ma next_start_index=None, czyli "koniec łańcucha".
+    turns = [
+        (4, 4, 6, 7),
+        (7, 7, 9, 10),
+        (10, 10, 12, None),
+    ]
+
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1):
+        n = len(calls)
+        calls.append(start_index)
+        _start, first, last, next_after = turns[n]
+        turn_dir = tmp_path / f"turn{n}"
+        turn_dir.mkdir()
+        zip_path = turn_dir / f"turn{n}.zip"
+        zip_path.write_bytes(f"turn {n} zip bytes".encode())
+        items = [
+            PlaylistItemResult(index=i, title=f"Wideo {i}", status="done")
+            for i in range(first, last + 1)
+        ]
+        return PlaylistDownloadResult(
+            zip_path=zip_path, items=items, playlist_title="Moja playlista", next_start_index=next_after
+        )
+
+    monkeypatch.setattr(engine_module.DownloadEngine, "submit_playlist", _fake_submit_playlist)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (12 pozycji)").run()
+
+    # Symulacja zakończonej PIERWSZEJ tury (pozycje 1-3, next_start_index=4)
+    # — punkt startowy dla trzech kolejnych kontynuacji symulowanych niżej.
+    seed_link = _publish_seed_zip(tmp_path, b"turn seed zip bytes")
+    at.session_state["status"] = "done"
+    at.session_state["result_download_token"] = seed_link.token
+    at.session_state["result_file_name"] = "Playlista-Moja playlista.zip"
+    at.session_state["playlist_report"] = [
+        PlaylistItemResult(index=i, title=f"Wideo {i}", status="done") for i in (1, 2, 3)
+    ]
+    at.session_state["playlist_title"] = "Moja playlista"
+    at.session_state["playlist_next_start_index"] = 4
+    at.session_state["job_id"] = "seed-job"
+    at.run()
+
+    seen_urls = _link_urls(at)
+    assert len(seen_urls) == 1
+
+    for turn_index in range(3):
+        assert "continue_playlist_button" in [b.key for b in at.button], (
+            f"brak przycisku kontynuacji przed turą {turn_index}"
+        )
+        at.button(key="continue_playlist_button").click().run()
+        for _ in range(10):
+            if at.session_state["status"] == "done" and len(calls) > turn_index:
+                break
+            at.run()
+
+        assert calls[turn_index] == turns[turn_index][0]
+        urls = _link_urls(at)
+        assert len(urls) == 1
+        seen_urls.append(urls[0])
+
+    # Ostatnia tura: next_start_index=None → koniec łańcucha, przycisk
+    # "Pobierz kolejne pozycje" musi zniknąć.
+    assert at.session_state["playlist_next_start_index"] is None
+    assert "continue_playlist_button" not in [b.key for b in at.button]
+    last_link = downloads.lookup(at.session_state["result_download_token"])
+    assert last_link.path.read_bytes() == b"turn 2 zip bytes"
+
+    # WSZYSTKIE 4 renderowania (seed + 3 tury, w tym przedostatnia→ostatnia)
+    # mają unikalny link, a na dysku zostaje tylko ostatni plik — każda
+    # kontynuacja zwolniła poprzedni.
+    assert len(seen_urls) == len(set(seen_urls)), seen_urls
+    assert seen_urls[-1] == downloads.download_url(last_link.token)
+    remaining = [p for p in Path(downloads.settings.storage_base_dir).rglob("*") if p.is_file()]
+    assert len(remaining) == 1
 
 
 def test_playlist_job_logs_error_status_only_when_all_items_failed(monkeypatch, tmp_path):
@@ -466,6 +739,136 @@ def test_switching_playlist_scope_after_completed_job_clears_previous_result(mon
     assert at.session_state["status"] == "idle"
 
 
+def test_switching_mode_after_playlist_stopped_early_clears_next_start_index_and_hides_continue_button(
+    monkeypatch, tmp_path
+):
+    """Kryterium akceptacji 5 (Faza 2c): zmiana trybu między wznowieniami
+    musi wyczyścić stan wznowienia (playlist_next_start_index) — inaczej
+    "Pobierz kolejne pozycje" wznowiłoby playlistę dla trybu, którego
+    użytkownik już nie wybrał."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 5)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest7&list=PLmixedtest7"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (5 pozycji)").run()
+
+    link = _publish_seed_zip(tmp_path, b"first zip bytes")
+    at.session_state["status"] = "done"
+    at.session_state["result_download_token"] = link.token
+    at.session_state["result_file_name"] = "Playlista-Moja playlista.zip"
+    at.session_state["playlist_report"] = [
+        PlaylistItemResult(index=1, title="Wideo 1", status="done"),
+    ]
+    at.session_state["playlist_title"] = "Moja playlista"
+    at.session_state["playlist_next_start_index"] = 2
+    at.run()
+
+    assert "continue_playlist_button" in [b.key for b in at.button]
+
+    at.selectbox(key="mode_select").select("Audio (MP3 / FLAC)").run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "idle"
+    assert at.session_state["playlist_next_start_index"] is None
+    assert at.session_state["result_download_token"] is None
+    assert "continue_playlist_button" not in [b.key for b in at.button]
+    # Czyszczenie wyniku zwalnia też plik z dysku, nie zostawia go do TTL.
+    assert downloads.lookup(link.token) is None
+    assert not link.path.exists()
+
+
+def test_new_url_button_releases_playlist_zip_from_disk(monkeypatch, tmp_path):
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest8&list=PLmixedtest8"
+    ).run()
+
+    link = _publish_seed_zip(tmp_path, b"zip to release")
+    at.session_state["status"] = "done"
+    at.session_state["result_download_token"] = link.token
+    at.session_state["result_file_name"] = link.file_name
+    at.session_state["playlist_report"] = [PlaylistItemResult(index=1, title="Wideo 1", status="done")]
+    at.run()
+    assert _link_urls(at) == [downloads.download_url(link.token)]
+
+    at.button(key="new_url_button").click().run()
+
+    assert not at.exception
+    assert downloads.lookup(link.token) is None
+    assert not link.path.exists()
+    assert _link_urls(at) == []
+
+
+def test_expired_download_link_shows_warning_instead_of_dead_button(monkeypatch, tmp_path):
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest9&list=PLmixedtest9"
+    ).run()
+
+    link = _publish_seed_zip(tmp_path, b"expiring zip")
+    downloads.release(link.token)
+    at.session_state["status"] = "done"
+    at.session_state["result_download_token"] = link.token
+    at.session_state["result_file_name"] = link.file_name
+    at.session_state["playlist_report"] = [PlaylistItemResult(index=1, title="Wideo 1", status="done")]
+    at.run()
+
+    assert not at.exception
+    assert _link_urls(at) == []
+    assert any("wygasł" in w.value for w in at.warning)
+
+
+def test_playlist_result_without_download_route_shows_launch_instruction(monkeypatch, tmp_path):
+    """Zabezpieczenie przed uruchomieniem `streamlit run app.py` wprost —
+    bez trasy HTTP link do pobrania byłby martwy."""
+    downloads.set_route_enabled(False)
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=mixedtest10&list=PLmixedtest10"
+    ).run()
+
+    link = _publish_seed_zip(tmp_path, b"zip")
+    at.session_state["status"] = "done"
+    at.session_state["result_download_token"] = link.token
+    at.session_state["result_file_name"] = link.file_name
+    at.session_state["playlist_report"] = [PlaylistItemResult(index=1, title="Wideo 1", status="done")]
+    at.run()
+
+    assert not at.exception
+    assert _link_urls(at) == []
+    assert any("asgi_app.py" in e.value for e in at.error)
+
+
+def test_playlist_publish_failure_reports_error_instead_of_crashing(monkeypatch, tmp_path):
+    def _boom(source, file_name):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(downloads, "publish", _boom)
+    at = _run_app(monkeypatch)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=zip_file,
+            playlist_items=[PlaylistItemResult(index=1, title="Wideo 1", status="done")],
+            playlist_title="Moja playlista",
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "error"
+    assert "przygotować pliku" in at.session_state["error_message"]
+
+
 def test_invalid_url_shows_error_on_download_click(monkeypatch):
     at = _run_app(monkeypatch)
 
@@ -583,6 +986,46 @@ def test_completed_job_with_result_path_shows_download_button(monkeypatch, tmp_p
     assert at.session_state["status"] == "done"
     assert at.session_state["result_data"] == b"fake mp3 bytes"
     assert len(at.download_button) >= 1
+
+
+def test_download_result_button_does_not_trigger_script_rerun_on_click(monkeypatch, tmp_path):
+    """Regresja (trzecia iteracja buga "Zapisz plik nie reaguje"): domyślne
+    on_click="rerun" na st.download_button zmuszałoby KAŻDE kliknięcie do
+    przejścia przez tę samą, jednowątkową kolejkę rerunów skryptu, którą
+    (potwierdzone w źródłach streamlit.runtime.fragment/scriptrunner)
+    mogą zapychać osierocone auto-reruny fragmentu run_every=0.5 z
+    _render_progress — ten fragment nigdy nie dostaje jawnego sygnału
+    zatrzymania (stop_auto_rerun) po tym, jak zwykły pełny rerun przestaje
+    go wywoływać. on_click="ignore" usuwa tę zależność: pobranie ZIP-a/
+    pojedynczego pliku ma być czysto przeglądarkowe, bez rerunu.
+
+    AppTest nie odtworzy realnego narastania ruchu WebSocket w tle — ten
+    test weryfikuje TYLKO konfigurację widgetu (proto.ignore_rerun), nie
+    zachowanie sieciowe. Manualna weryfikacja w przeglądarce (DevTools →
+    Network, obserwacja po zakończeniu joba) wciąż jest potrzebna."""
+    at = _run_app(monkeypatch)
+
+    result_file = tmp_path / "Uploader-Title.mp3"
+    result_file.write_bytes(b"fake mp3 bytes")
+
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=result_file,
+            result_uploader="Test Uploader",
+            result_title="Test Title",
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+
+    at.run()
+
+    assert not at.exception
+    assert len(at.download_button) >= 1
+    assert at.download_button[0].proto.ignore_rerun is True
 
 
 def test_both_finished_events_in_same_queue_batch_resolve_to_done(monkeypatch, tmp_path):
