@@ -26,6 +26,7 @@ Ustalone wartości domyślne:
 - `MAX_FILE_SIZE_MB=500`
 - `MAX_PLAYLIST_ITEMS=10`
 - `MAX_CONCURRENT_JOBS=2`
+- `DOWNLOAD_LINK_TTL_MINUTES=30` (jak długo ZIP playlisty czeka na dysku pod linkiem)
 - `RATE_LIMIT_PER_IP=10` (żądań/godzinę)
 - `RATE_LIMITING_ENABLED` — domyślnie włączone w `production`, opcjonalne lokalnie
 - `ENVIRONMENT=local|production`
@@ -64,8 +65,11 @@ Punkt wejścia do pracy to więc od razu implementacja modułów z sekcji
 ## Komendy (development, nie setup)
 
 ```powershell
-# Uruchomienie
-uv run streamlit run app.py
+# Uruchomienie — ZAWSZE przez asgi_app.py (nie `streamlit run app.py`:
+# bez owijki st.App nie ma trasy /api/download i link "Zapisz plik" dla
+# playlist byłby martwy). Ta sama komenda w Dockerfile (CMD) dla HF.
+uv run streamlit run asgi_app.py
+# Uwaga: st.App nie otwiera przeglądarki sam — wejdź na http://localhost:8501
 
 # Testy
 uv run pytest
@@ -80,7 +84,8 @@ uv run pytest
 ├── pyproject.toml / uv.lock
 ├── schema.sql
 ├── .env.example
-├── app.py                  # UI, bez logiki yt-dlp
+├── asgi_app.py             # PUNKT WEJŚCIA serwera: st.App("app.py") + trasa /api/download
+├── app.py                  # skrypt UI (ładowany przez asgi_app.py) i cel testów AppTest; bez logiki yt-dlp
 ├── src/
 │   ├── config.py            # JEDYNE miejsce odczytu env/limitów
 │   ├── validators.py        # walidacja URL (whitelist domen YouTube)
@@ -89,6 +94,8 @@ uv run pytest
 │   ├── engine.py             # JEDYNY moduł importujący yt_dlp bezpośrednio
 │   ├── profiles.py           # profile formatów (video/mp3/flac/subtitle/transcript)
 │   ├── storage.py            # katalog tymczasowy per-job, wczytanie do RAM, natychmiastowy rmtree
+│   ├── downloads.py          # linki do pobrania z dysku (ZIP playlisty): token, TTL, sprzątanie
+│   ├── download_routes.py    # trasa HTTP GET /api/download/{token} (FileResponse, streaming)
 │   ├── transcript_cleaner.py # czyszczenie VTT/SRT -> TXT
 │   ├── db.py                 # psycopg, pooled connection (host -pooler), 1-2 conn
 │   ├── rate_limit.py          # licznik per IP, in-memory (deque + timestamp window)
@@ -106,6 +113,13 @@ uv run pytest
   zmiany schematu = ręczny `ALTER TABLE IF EXISTS ... ADD COLUMN IF NOT EXISTS`.
 - **Baza nie przechowuje plików.** Tylko metadane zadań (`jobs`). Pliki multimedialne
   żyją tymczasowo na dysku, są wczytywane do RAM i natychmiast usuwane po wysyłce.
+  **Wyjątek: ZIP playlisty** (tryb "Cała playlista") NIE trafia do RAM —
+  `st.download_button(data=<~1 GB>)` zawieszał się bezterminowo. ZIP zostaje na
+  dysku (`src/downloads.py`) pod nieodgadywalnym tokenem i jest serwowany
+  strumieniowo przez `GET /api/download/{token}` (`asgi_app.py`), do
+  `DOWNLOAD_LINK_TTL_MINUTES`, albo do zastąpienia nowym wynikiem / resetu
+  sesji. `server.enableStaticServing` odpada: Streamlit 1.63 zwraca 404 dla
+  plików >200 MB w `static/`.
 - **Anonimowość.** Brak tabeli użytkowników/sesji. `client_ip_hash` — hash, nigdy
   surowy IP.
 - **Współbieżność:** `threading.Semaphore(MAX_CONCURRENT_JOBS)`, domyślnie 2.
