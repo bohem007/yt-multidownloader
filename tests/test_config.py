@@ -17,6 +17,7 @@ def test_defaults_match_claude_md():
     assert s.max_playlist_items == 10
     assert s.max_zip_size_mb == 500
     assert s.max_concurrent_jobs == 2
+    assert s.download_link_ttl_minutes == 30
     assert s.rate_limit_per_ip == 10
     assert s.rate_limiting_enabled is True
     assert s.ip_hash_secret == ""
@@ -31,6 +32,7 @@ def test_env_vars_override_defaults():
         "MAX_PLAYLIST_ITEMS": "5",
         "MAX_ZIP_SIZE_MB": "300",
         "MAX_CONCURRENT_JOBS": "4",
+        "DOWNLOAD_LINK_TTL_MINUTES": "10",
         "RATE_LIMIT_PER_IP": "20",
         "RATE_LIMITING_ENABLED": "false",
         "IP_HASH_SECRET": "super-secret",
@@ -44,6 +46,7 @@ def test_env_vars_override_defaults():
     assert s.max_playlist_items == 5
     assert s.max_zip_size_mb == 300
     assert s.max_concurrent_jobs == 4
+    assert s.download_link_ttl_minutes == 10
     assert s.rate_limit_per_ip == 20
     assert s.rate_limiting_enabled is False
     assert s.ip_hash_secret == "super-secret"
