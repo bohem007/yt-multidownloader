@@ -68,6 +68,7 @@ class Settings:
     max_playlist_items: int = 10
     max_zip_size_mb: int = 500
     max_concurrent_jobs: int = 2
+    item_download_timeout_seconds: int = 180
     download_link_ttl_minutes: int = 30
     rate_limit_per_ip: int = 10
     rate_limiting_enabled: bool = True
@@ -99,6 +100,9 @@ class Settings:
             max_playlist_items=int(env.get("MAX_PLAYLIST_ITEMS", defaults.max_playlist_items)),
             max_zip_size_mb=int(env.get("MAX_ZIP_SIZE_MB", defaults.max_zip_size_mb)),
             max_concurrent_jobs=int(env.get("MAX_CONCURRENT_JOBS", defaults.max_concurrent_jobs)),
+            item_download_timeout_seconds=int(
+                env.get("ITEM_DOWNLOAD_TIMEOUT_SECONDS", defaults.item_download_timeout_seconds)
+            ),
             download_link_ttl_minutes=int(
                 env.get("DOWNLOAD_LINK_TTL_MINUTES", defaults.download_link_ttl_minutes)
             ),
