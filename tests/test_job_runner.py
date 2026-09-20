@@ -68,15 +68,23 @@ class _BlockingFakePlaylistEngine:
         self.submit_called = False
         self.submit_playlist_called = False
         self.received_start_index: int | None = None
+        self.received_selected_indices: list[int] | None = None
         self.next_start_index_to_return = next_start_index_to_return
 
     def submit(self, job: DownloadJob, on_event=None) -> DownloadResult:
         self.submit_called = True
-        raise AssertionError("submit() nie powinno być wołane dla playlist_scope=='all'")
+        raise AssertionError("submit() nie powinno być wołane dla playlist_scope w ('all', 'selected')")
 
-    def submit_playlist(self, job: DownloadJob, on_event=None, start_index: int = 1) -> PlaylistDownloadResult:
+    def submit_playlist(
+        self,
+        job: DownloadJob,
+        on_event=None,
+        start_index: int = 1,
+        selected_indices: list[int] | None = None,
+    ) -> PlaylistDownloadResult:
         self.submit_playlist_called = True
         self.received_start_index = start_index
+        self.received_selected_indices = selected_indices
         self.started.set()
         self.release_gate.wait(timeout=10.0)
         return PlaylistDownloadResult(
@@ -119,10 +127,47 @@ def test_run_routes_playlist_scope_all_to_submit_playlist_and_carries_items():
     final_events = [e for e in events if e.event_type == "on_finished"]
     final = final_events[-1]
     assert fake_engine.received_start_index == 1  # domyślne, job.start_index nie ustawiony
+    assert fake_engine.received_selected_indices is None
     assert final.result_path == Path("/fake/playlist.zip")
     assert final.playlist_title == "Fake Playlist"
     assert final.result_title == "Fake Playlist"
+    assert final.playlist_scope == "all"
     assert [item.status for item in final.playlist_items] == ["done", "error"]
+
+
+def test_run_routes_playlist_scope_selected_to_submit_playlist_with_indices():
+    """2026-09-20 (punkt 4): playlist_scope=="selected" musi trafić do
+    submit_playlist() z job.selected_indices, NIE z job.start_index (te
+    dwa mechanizmy są wzajemnie wyłączne, patrz engine.py::submit_playlist)."""
+    fake_engine = _BlockingFakePlaylistEngine()
+    runner = JobRunner(engine=fake_engine)
+    events: list[ProgressEvent] = []
+
+    job = DownloadJob(
+        url=TEST_VIDEO_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="job-playlist-selected-routing",
+        playlist_scope="selected",
+        selected_indices=[21, 28],
+    )
+
+    assert runner.start(job, on_state=events.append) == "started"
+    assert fake_engine.started.wait(timeout=5.0)
+    fake_engine.release_gate.set()
+
+    assert _wait_until(
+        lambda: any(e.event_type == "on_finished" and e.playlist_items is not None for e in events),
+        timeout=5.0,
+    )
+
+    assert fake_engine.submit_playlist_called is True
+    assert fake_engine.submit_called is False
+    assert fake_engine.received_selected_indices == [21, 28]
+
+    final = [e for e in events if e.event_type == "on_finished"][-1]
+    assert final.playlist_scope == "selected"
 
 
 def test_run_passes_job_start_index_to_submit_playlist_and_carries_next_start_index():
