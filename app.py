@@ -107,6 +107,51 @@ def _guess_mime(file_name: str | None) -> str:
 _ILLEGAL_WINDOWS_CHARS = re.compile(r'[:/\\*?"<>|]')
 
 
+_SELECTED_INDEX_TOKEN = re.compile(r"^\d+$")
+
+
+def _parse_selected_indices(raw: str, total: int | None) -> tuple[list[int] | None, str | None]:
+    """Parsuje pole "Wybrane numery wideo z playlisty" (np. "21, 28") na
+    listę numerów pozycji BEZWZGLĘDNYCH (1-based), posortowaną rosnąco.
+    Zwraca (lista, None) przy sukcesie, (None, komunikat_błędu) inaczej.
+
+    To jest wygoda UX (błąd widoczny PRZED kliknięciem "Pobierz") —
+    engine.py::submit_playlist waliduje zakres niezależnie jako backstop
+    (InvalidPlaylistSelectionError), na wypadek gdyby playlista zmieniła
+    długość między tą sondą a właściwym pobraniem. `total=None` (liczba
+    pozycji playlisty nieznana — sonda się nie powiodła) pomija walidację
+    zakresu, ale nie blokuje składniowo poprawnego wejścia."""
+    tokens = [t.strip() for t in raw.split(",")]
+    tokens = [t for t in tokens if t]  # puste fragmenty (np. przecinek na końcu) ignorujemy
+    if not tokens:
+        return None, "Podaj co najmniej jeden numer pozycji, np. 15 albo 21, 28."
+
+    numbers: list[int] = []
+    for token in tokens:
+        if not _SELECTED_INDEX_TOKEN.match(token):
+            return None, (
+                f'Nieprawidłowy numer pozycji: "{token}" — podaj liczby całkowite '
+                "oddzielone przecinkami."
+            )
+        numbers.append(int(token))
+
+    if any(n < 1 for n in numbers):
+        return None, "Numery pozycji muszą być większe od zera."
+
+    if len(set(numbers)) != len(numbers):
+        return None, "Lista zawiera powtórzone numery pozycji."
+
+    if total is not None:
+        out_of_range = sorted(n for n in numbers if n > total)
+        if out_of_range:
+            return None, (
+                f"Playlista ma {total} pozycji — numery poza zakresem: "
+                f"{', '.join(str(n) for n in out_of_range)}."
+            )
+
+    return sorted(set(numbers)), None
+
+
 def _playlist_processed_range(items: list) -> tuple[int, int] | None:
     """(pierwsza, ostatnia) BEZWZGLĘDNA pozycja faktycznie spróbowana w TYM
     wywołaniu submit_playlist() — czyli status != "skipped" (pozycje
@@ -119,16 +164,30 @@ def _playlist_processed_range(items: list) -> tuple[int, int] | None:
     return processed[0].index, processed[-1].index
 
 
-def _build_playlist_zip_filename(playlist_title: str | None, items: list) -> str:
+_MAX_SELECTED_INDICES_IN_FILENAME = 5
+
+
+def _build_playlist_zip_filename(
+    playlist_title: str | None, items: list, playlist_scope: str = "all"
+) -> str:
     """Nazwa ZIP-a widoczna dla użytkownika — celowo NIE przez
     build_display_filename() (ta jest dla pojedynczych materiałów, format
     "Autor-Tytuł", semantycznie nie pasuje do ZIP-a całej playlisty).
 
-    Faza 2c: dla KONTYNUACJI (pierwsza przetworzona pozycja w tym wywołaniu
-    > 1, czyli start_index > 1) dopisuje zakres bezwzględnych pozycji
-    ("-pozycje-{start}-{end}"), żeby kilka paczek pobranych w tym samym
-    folderze nie kolidowały nazwą. Pierwsze wywołanie (od pozycji 1)
-    zachowuje nazwę z Fazy 2b bez zmian — zero regresji."""
+    Faza 2c: KAŻDA tura ciągłego pobierania ("all", łącznie z pierwszą)
+    dostaje sufiks zakresu bezwzględnych pozycji ("-pozycje-{start}-{end}"),
+    żeby kilka paczek pobranych w tym samym folderze nie kolidowały nazwą —
+    fix regresji: poprzednio pierwsza tura (start=1) nie dostawała sufiksu
+    wcale, co dla playlist dzielonych na >1 turę dawało niespójną, myloną
+    nazwę ("Playlista-X.zip" obok "Playlista-X-pozycje-14-21.zip"). Zakres
+    jest zero-padded do szerokości większej liczby w PARZE (min. 2 cyfry),
+    żeby "01-13" wizualnie pasowało do "14-21" z kolejnej tury.
+
+    2026-09-20 (punkt 4): playlist_scope=="selected" ma osobną gałąź — wybór
+    jest z natury nieciągły, więc "-pozycje-{start}-{end}" sugerowałby
+    błędnie, że pobrano WSZYSTKO między start a end. Krótka lista (≤5
+    pozycji) trafia do nazwy wprost ("-pozycje-15,21,28"), dłuższa dostaje
+    fallback "-pozycje-wybrane", żeby nazwa pliku nie urosła bez ograniczeń."""
     if not playlist_title:
         base = "playlista"
     else:
@@ -136,11 +195,21 @@ def _build_playlist_zip_filename(playlist_title: str | None, items: list) -> str
         sanitized = re.sub(r"\s+", " ", sanitized).strip()
         base = f"Playlista-{sanitized}" if sanitized else "playlista"
 
+    if playlist_scope == "selected":
+        indices = sorted({item.index for item in items if item.status != "skipped"})
+        if not indices:
+            return f"{base}.zip"
+        if len(indices) <= _MAX_SELECTED_INDICES_IN_FILENAME:
+            suffix = ",".join(str(i) for i in indices)
+            return f"{base}-pozycje-{suffix}.zip"
+        return f"{base}-pozycje-wybrane.zip"
+
     processed_range = _playlist_processed_range(items)
-    if processed_range and processed_range[0] > 1:
-        start, end = processed_range
-        return f"{base}-pozycje-{start}-{end}.zip"
-    return f"{base}.zip"
+    if processed_range is None:
+        return f"{base}.zip"
+    start, end = processed_range
+    width = max(2, len(str(end)))
+    return f"{base}-pozycje-{start:0{width}d}-{end:0{width}d}.zip"
 
 
 def _playlist_report_summary(items: list) -> tuple[int, int, str]:
@@ -257,7 +326,9 @@ def _render_progress(state: SessionState) -> None:
                 # zawieszał się dla ~1 GB) — przenosimy go do src/downloads.py
                 # i serwujemy jako zwykły link HTTP z dysku.
                 items = terminal_event.playlist_items
-                zip_name = _build_playlist_zip_filename(terminal_event.playlist_title, items)
+                zip_name = _build_playlist_zip_filename(
+                    terminal_event.playlist_title, items, terminal_event.playlist_scope or "all"
+                )
                 previous_token = state.result_download_token
                 try:
                     link = downloads.publish(result_file, zip_name)
@@ -473,6 +544,11 @@ with tab_download:
     url_classification = classify_url(url) if url else "single"
     playlist_item_count: int | None = None
     playlist_scope = "single"
+    selected_indices: list[int] | None = None
+    selected_indices_error: str | None = None
+
+    _SCOPE_SINGLE_LABEL = "Tylko to wideo"
+    _SCOPE_SELECTED_LABEL = "Wybrane numery wideo z playlisty"
 
     if url_classification != "single":
         try:
@@ -483,22 +559,38 @@ with tab_download:
         count_label = (
             f"{playlist_item_count} pozycji" if playlist_item_count is not None else "nieznana liczba pozycji"
         )
+        scope_all_label = f"Cała playlista ({count_label})"
 
         if url_classification == "mixed":
-            scope_choice = st.radio(
-                "Zakres pobierania",
-                ["Tylko to wideo", f"Cała playlista ({count_label})"],
-                key="playlist_scope_radio",
-            )
-            playlist_scope = "single" if scope_choice == "Tylko to wideo" else "all"
+            scope_options = [_SCOPE_SINGLE_LABEL, scope_all_label, _SCOPE_SELECTED_LABEL]
         else:
             # "playlist_only" (np. /playlist?list=...) — nie ma pojedynczego
-            # wideo do wybrania, tylko jedna opcja.
-            st.radio(
-                "Zakres pobierania",
-                [f"Cała playlista ({count_label})"],
-                key="playlist_scope_radio",
+            # wideo do wybrania.
+            scope_options = [scope_all_label, _SCOPE_SELECTED_LABEL]
+
+        scope_choice = st.radio("Zakres pobierania", scope_options, key="playlist_scope_radio")
+
+        if scope_choice == _SCOPE_SINGLE_LABEL:
+            playlist_scope = "single"
+        elif scope_choice == _SCOPE_SELECTED_LABEL:
+            playlist_scope = "selected"
+            # 2026-09-20 (punkt 4): obejście przejściowych błędów 403 na
+            # pojedynczych pozycjach playlisty bez ściągania jej od nowa —
+            # patrz DownloadJob.selected_indices / submit_playlist w engine.py.
+            selected_indices_raw = st.text_input(
+                "Numery pozycji do pobrania (oddzielone przecinkami)",
+                placeholder="np. 15 albo 21, 28",
+                key="selected_indices_input",
             )
+            if selected_indices_raw.strip():
+                selected_indices, selected_indices_error = _parse_selected_indices(
+                    selected_indices_raw, playlist_item_count
+                )
+                if selected_indices_error:
+                    st.error(selected_indices_error)
+            else:
+                selected_indices_error = "Podaj co najmniej jeden numer pozycji."
+        else:
             playlist_scope = "all"
 
     state.set_playlist_scope(playlist_scope)
@@ -543,12 +635,16 @@ with tab_download:
             output_format = "txt"
 
         if url:
-            # Sonda języka napisów dla playlist_scope=="all" nie może dostać
-            # surowego URL-a playlisty — patrz resolve_representative_video_url
-            # w engine.py. submit_playlist() (job dalej w tym pliku) wciąż
-            # dostaje oryginalny `url`, tylko TA sonda używa reprezentanta.
+            # Sonda języka napisów dla playlist_scope w ("all", "selected")
+            # nie może dostać surowego URL-a playlisty — patrz
+            # resolve_representative_video_url w engine.py. submit_playlist()
+            # (job dalej w tym pliku) wciąż dostaje oryginalny `url`, tylko
+            # TA sonda używa reprezentanta (pierwszej pozycji playlisty —
+            # przybliżenie: dla "selected" prawdziwa wybrana pozycja może
+            # mieć inny zestaw języków, ale to tylko sonda pomocnicza do UI,
+            # nie blokuje faktycznego pobrania konkretnej pozycji).
             subtitle_probe_url = url
-            if playlist_scope == "all":
+            if playlist_scope in ("all", "selected"):
                 try:
                     representative_url = _cached_resolve_representative_video_url(url, cookie_data)
                 except Exception:
@@ -597,24 +693,42 @@ with tab_download:
     # Limit MAX_PLAYLIST_ITEMS dotyczy tylko Video/Audio (patrz
     # PLAYLIST_LIMITED_MODES) — blokujemy PRZED kliknięciem "Pobierz", żeby
     # user nie czekał na to samo odrzucenie dopiero w engine.py::submit().
-    playlist_limit_exceeded = (
-        playlist_scope == "all"
-        and mode in PLAYLIST_LIMITED_MODES
-        and playlist_item_count is not None
-        and playlist_item_count > settings.max_playlist_items
-    )
-    if playlist_limit_exceeded:
-        st.warning(
-            f"Playlista ma {playlist_item_count} pozycji — limit dla trybu "
-            f"{MODE_LABELS[mode]} to {settings.max_playlist_items}. Wybierz "
-            'opcję "Tylko to wideo" albo krótszą playlistę.'
+    # Dla "selected" (2026-09-20, punkt 4) limit dotyczy LICZBY WYBRANYCH
+    # pozycji, nie długości całej playlisty — inaczej tryb byłby bezużyteczny
+    # dla dokładnie tych długich playlist, do których jest pomyślany (patrz
+    # ten sam wybór w engine.py::submit_playlist).
+    if playlist_scope == "selected":
+        playlist_limit_exceeded = (
+            mode in PLAYLIST_LIMITED_MODES
+            and selected_indices is not None
+            and len(selected_indices) > settings.max_playlist_items
         )
+        if playlist_limit_exceeded:
+            st.warning(
+                f"Wybrano {len(selected_indices)} pozycji — limit dla trybu "
+                f"{MODE_LABELS[mode]} to {settings.max_playlist_items}. Wybierz mniej pozycji."
+            )
+    else:
+        playlist_limit_exceeded = (
+            playlist_scope == "all"
+            and mode in PLAYLIST_LIMITED_MODES
+            and playlist_item_count is not None
+            and playlist_item_count > settings.max_playlist_items
+        )
+        if playlist_limit_exceeded:
+            st.warning(
+                f"Playlista ma {playlist_item_count} pozycji — limit dla trybu "
+                f"{MODE_LABELS[mode]} to {settings.max_playlist_items}. Wybierz "
+                'opcję "Tylko to wideo" albo krótszą playlistę.'
+            )
+    selected_indices_blocked = playlist_scope == "selected" and selected_indices_error is not None
     download_disabled = (
         mode not in READY_MODES
         or not url
         or job_in_progress
         or subtitle_blocked
         or playlist_limit_exceeded
+        or selected_indices_blocked
     )
     # "Nowy URL" nie może przerwać aktywnego pobierania — zerwałoby to
     # wątek w tle i zostawiłoby niezwolniony permit semafora współbieżności.
@@ -686,6 +800,7 @@ with tab_download:
             subtitle_lang=subtitle_lang,
             playlist_scope=playlist_scope,
             start_index=start_index,
+            selected_indices=selected_indices if playlist_scope == "selected" else None,
         )
 
         def on_state(event: ProgressEvent, _queue: "queue_module.Queue" = job_queue) -> None:
