@@ -7,6 +7,7 @@ Wymaga dostępu do internetu i ffmpeg na PATH.
 from __future__ import annotations
 
 import re
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from yt_dlp.utils import DownloadError
 import src.engine as engine_module
 from src import storage
 from src.config import Settings, settings
+from src.errors import ItemDownloadTimeoutError
 from src.engine import DownloadEngine, DownloadJob, EngineError, list_available_subtitles
 from src.errors import InvalidUrlError, PlaylistTooLargeError
 from src.progress import ProgressEvent
@@ -747,6 +749,103 @@ def test_submit_playlist_continues_after_single_item_error(monkeypatch, tmp_path
 
     assert [item.status for item in result.items] == ["done", "error", "done"]
     assert result.items[1].error_message
+    with zipfile.ZipFile(result.zip_path) as zf:
+        assert len(zf.namelist()) == 2
+
+
+class _HangingFakeYDL:
+    """Podstawia YoutubeDL, którego extract_info() nigdy nie wraca w
+    rozsądnym czasie — symuluje zaobserwowaną manualnie 2026-09-20 pętlę
+    retry (403/connection timeout do googlevideo.com bez końca). `time.sleep`
+    (nie `threading.Event().wait()` bez timeoutu) celowo: wątek MUSI kiedyś
+    naturalnie zakończyć się sam, inaczej dangling non-daemon thread
+    zablokowałby wyjście procesu pytest (atexit hook w
+    concurrent.futures.thread czeka na wszystkie wątki executor-a,
+    niezależnie od shutdown(wait=False))."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def extract_info(self, url: str, download: bool = True) -> dict:
+        time.sleep(2)
+        return {"requested_downloads": [{"filepath": "/never/reached.mp4"}]}
+
+
+def test_download_one_raises_item_timeout_when_yt_dlp_hangs(monkeypatch, tmp_path):
+    """Regresja centralna tego briefu (2026-09-20): defense-in-depth —
+    nawet gdy yt-dlp/extract_info() zawiesza się dłużej niż
+    ITEM_DOWNLOAD_TIMEOUT_SECONDS (niezależnie od jego WEWNĘTRZNYCH
+    retries/fragment_retries/extractor_retries), _download_one() musi
+    zwrócić kontrolę wołającemu po upływie tego limitu, podnosząc
+    ItemDownloadTimeoutError, zamiast wisieć bez końca."""
+    monkeypatch.setattr(
+        engine_module, "settings", Settings.from_env({"ITEM_DOWNLOAD_TIMEOUT_SECONDS": "1"})
+    )
+    monkeypatch.setattr(engine_module, "YoutubeDL", lambda opts: _HangingFakeYDL())
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url="https://www.youtube.com/watch?v=jNQXAC9IVRw",
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-item-timeout",
+    )
+
+    started_at = time.monotonic()
+    with pytest.raises(ItemDownloadTimeoutError):
+        engine._download_one(job.url, job, tmp_path, None)
+    elapsed = time.monotonic() - started_at
+
+    # Musi wrócić NIEDŁUGO po limicie (1s), NIE po pełnym 2s "zawieszenia"
+    # symulowanego przez fake — inaczej timeout nic by nie chronił.
+    assert elapsed < 1.9
+
+
+def test_submit_playlist_marks_hung_item_as_error_and_continues(monkeypatch, tmp_path):
+    """End-to-end (submit_playlist): pozycja, która "wisi" dłużej niż
+    ITEM_DOWNLOAD_TIMEOUT_SECONDS, ląduje jako status="error" z czytelnym
+    komunikatem — job idzie dalej do kolejnych pozycji, dokładnie tak jak
+    przy każdym innym pojedynczym niepowodzeniu (nie blokuje reszty kolejki)."""
+    monkeypatch.setattr(
+        engine_module, "settings", Settings.from_env({"ITEM_DOWNLOAD_TIMEOUT_SECONDS": "1"})
+    )
+    flat_info = _fake_flat_entries(3)
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        if item_number == 2:
+            return _HangingFakeYDL()
+        media_path = tmp_path / f"RawVideo{item_number}.mp4"
+        media_path.write_bytes(b"fake mp4 bytes")
+        return _FakeYDL(opts, {"requested_downloads": [{"filepath": str(media_path)}]})
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-item-timeout",
+        playlist_scope="all",
+    )
+
+    result = engine.submit_playlist(job)  # brak wyjątku, mimo zawieszonej pozycji 2
+
+    assert [item.status for item in result.items] == ["done", "error", "done"]
+    assert "limit czasu" in result.items[1].error_message
     with zipfile.ZipFile(result.zip_path) as zf:
         assert len(zf.namelist()) == 2
 
