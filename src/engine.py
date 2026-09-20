@@ -9,6 +9,7 @@ widocznej dla użytkownika — patrz _resolve_result.
 
 from __future__ import annotations
 
+import concurrent.futures
 import tempfile
 import zipfile
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from src.config import settings
 from src.errors import (
     InvalidPlaylistSelectionError,
     InvalidUrlError,
+    ItemDownloadTimeoutError,
     PlaylistTooLargeError,
     map_download_error,
 )
@@ -361,13 +363,62 @@ class DownloadEngine:
         cookiefile_path: str | None,
         on_event: OnEventCallback | None = None,
     ) -> DownloadResult:
+        """Defense-in-depth: twardy limit ścienny (wall-clock) na CAŁE
+        pobranie jednej pozycji (settings.item_download_timeout_seconds),
+        niezależny od retries/fragment_retries/extractor_retries
+        skonfigurowanych w _build_ydl_opts. Zaobserwowane manualnie
+        2026-09-20: mimo fragment_retries=3, pojedyncza pozycja playlisty
+        potrafiła zapętlić się na serii błędów 403/connection timeout do
+        googlevideo.com praktycznie bez końca (do ręcznego Ctrl+C), blokując
+        resztę kolejki — prawdopodobnie yt-dlp przechodził przez wiele
+        formatów fallbackowych, każdy z własnym budżetem retries, sumarycznie
+        dając czas liczony w dziesiątkach minut zamiast faktycznej awarii.
+
+        Chroni RÓWNIEŻ submit() (pojedyncze wideo/audio/napisy/transkrypt) —
+        wołany stąd, jak i z submit_playlist() per pozycja. Zawieszone
+        pobranie bez tego limitu trzymałoby permit
+        threading.Semaphore(MAX_CONCURRENT_JOBS) na zawsze, degradując
+        przepustowość całego serwera dla innych użytkowników, nie tylko
+        tego jednego zadania.
+
+        Ograniczenie: Python nie potrafi bezpiecznie ubić wątku z zewnątrz
+        (CLAUDE.md zabrania subprocess dla yt-dlp — "moduł Python, nie
+        subprocess") — po przekroczeniu limitu wątek roboczy yt-dlp może
+        dokończyć się w tle o własnych siłach, ale WOŁAJĄCY dostaje kontrolę
+        z powrotem od razu i ta pozycja jest traktowana jak każde inne
+        niepowodzenie (status="error"), zamiast wisieć bez końca."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            self._download_one_impl, url, job, job_dir, cookiefile_path, on_event
+        )
+        try:
+            return future.result(timeout=settings.item_download_timeout_seconds)
+        except concurrent.futures.TimeoutError as exc:
+            raise ItemDownloadTimeoutError(
+                f"przekroczono limit {settings.item_download_timeout_seconds}s "
+                "na pobranie jednej pozycji"
+            ) from exc
+        finally:
+            # wait=False: shutdown() NIE MOŻE blokować, czekając na
+            # zawieszony wątek — patrz ograniczenie w docstringu wyżej.
+            executor.shutdown(wait=False)
+
+    def _download_one_impl(
+        self,
+        url: str,
+        job: DownloadJob,
+        job_dir: Path,
+        cookiefile_path: str | None,
+        on_event: OnEventCallback | None = None,
+    ) -> DownloadResult:
         """Pobiera JEDEN materiał (wideo/audio/napisy/transkrypt) — logika
         wydzielona z submit() (Faza 1), żeby submit_playlist() (Faza 2a)
         mogła wywoływać ją wielokrotnie, per pozycja playlisty, bez
         duplikowania budowy ydl_opts/resolvowania wyniku/finalizacji
         transkryptu. `url` jest parametrem osobnym od `job.url` — dla
         pozycji playlisty to URL KONKRETNEGO wideo z entries, nie oryginalny
-        URL playlisty przekazany przez użytkownika."""
+        URL playlisty przekazany przez użytkownika. Wołana WYŁĄCZNIE przez
+        _download_one() (timeout wrapper) — nigdy bezpośrednio."""
         profile = get_profile(
             job.mode,
             job.output_format,
@@ -703,8 +754,20 @@ class DownloadEngine:
         ydl_opts.update(
             {
                 "outtmpl": outtmpl,
+                # Diagnoza 2026-09-20: retries/fragment_retries już były
+                # ograniczone tutaj, ale extractor_retries (osobny budżet dla
+                # samej ekstrakcji/wyboru formatu, domyślnie 3 w yt-dlp, ale
+                # NIEUSTAWIONE jawnie tutaj wcześniej) nie było — dodane dla
+                # jawności/spójności. Rzeczywistym twardym ograniczeniem
+                # przeciw zaobserwowanej "nieskończonej" pętli retry jest
+                # jednak _download_one() (timeout wrapper) niżej, NIE te
+                # liczby — yt-dlp może próbować wielu formatów fallbackowych
+                # pod rząd, każdy z własnym budżetem retries, sumarycznie
+                # dając czas liczony w dziesiątkach minut mimo małych liczb
+                # tutaj.
                 "retries": 3,
                 "fragment_retries": 3,
+                "extractor_retries": 3,
                 "progress_hooks": [self._make_progress_hook(on_event)],
                 "noprogress": True,
                 # Bez tego URL zawierający jednocześnie v= i list= (typowy
