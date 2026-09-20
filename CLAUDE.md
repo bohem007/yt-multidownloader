@@ -26,10 +26,16 @@ Ustalone wartości domyślne:
 - `MAX_FILE_SIZE_MB=500`
 - `MAX_PLAYLIST_ITEMS=10`
 - `MAX_CONCURRENT_JOBS=2`
+- `ITEM_DOWNLOAD_TIMEOUT_SECONDS=180` (twardy limit ścienny na pobranie JEDNEJ
+  pozycji — defense-in-depth, niezależny od retries/fragment_retries yt-dlp)
 - `DOWNLOAD_LINK_TTL_MINUTES=30` (jak długo ZIP playlisty czeka na dysku pod linkiem)
 - `RATE_LIMIT_PER_IP=10` (żądań/godzinę)
 - `RATE_LIMITING_ENABLED` — domyślnie włączone w `production`, opcjonalne lokalnie
 - `ENVIRONMENT=local|production`
+
+`settings` (`config.py`) to zamrożony singleton (`frozen=True`) tworzony raz
+przy imporcie — zmiana `.env` wymaga restartu procesu, nie samego odświeżenia
+strony.
 
 ## Stack technologiczny
 
@@ -75,6 +81,20 @@ uv run streamlit run asgi_app.py
 uv run pytest
 ```
 
+## Oszczędność kontekstu
+
+- Przed odczytem dużego pliku (zwłaszcza `src/engine.py`, `app.py`,
+  `tests/test_engine.py`) użyj Grep, znajdź właściwą funkcję/zakres i czytaj
+  fragment (`offset`/`limit`), nie cały plik.
+- Nie czytaj ponownie pliku już odczytanego w tej sesji, jeśli się nie zmienił —
+  wynik zostaje w kontekście do końca rozmowy.
+- Testy uruchamiaj skrótowo (`uv run pytest -q`; `-x`/konkretny test dopiero
+  przy błędzie), długie wyjścia przycinaj (`| Select-Object -Last 50`).
+- Szerokie przeszukiwanie ("gdzie wołane jest X") deleguj do sub-agenta
+  (Explore) — jego odczyty nie trafiają do głównego kontekstu.
+- Jedno zadanie = jedna sesja: `/clear` przy zmianie tematu, `/compact`
+  z instrukcją co zachować w połowie długiej sesji.
+
 ## Struktura repozytorium
 
 ```
@@ -91,8 +111,10 @@ uv run pytest
 │   ├── validators.py        # walidacja URL (whitelist domen YouTube)
 │   ├── session.py            # st.session_state — app.py nigdy nie dotyka go bezpośrednio
 │   ├── progress.py           # zdarzenia postępu (on_start/on_progress/on_finished/on_error)
-│   ├── engine.py             # JEDYNY moduł importujący yt_dlp bezpośrednio
+│   ├── job_runner.py         # wątek roboczy per job: woła engine.py, emituje ProgressEvent do queue.Queue
+│   ├── engine.py             # JEDYNY moduł importujący yt_dlp; opcje w _build_ydl_opts, timeout w _download_one
 │   ├── profiles.py           # profile formatów (video/mp3/flac/subtitle/transcript)
+│   ├── naming.py             # build_display_filename — konwencja nazw plików do pobrania
 │   ├── storage.py            # katalog tymczasowy per-job, wczytanie do RAM, natychmiastowy rmtree
 │   ├── downloads.py          # linki do pobrania z dysku (ZIP playlisty): token, TTL, sprzątanie
 │   ├── download_routes.py    # trasa HTTP GET /api/download/{token} (FileResponse, streaming)
@@ -129,6 +151,20 @@ uv run pytest
   pozycji playlisty) przez wstępny `extract_info(download=False)` PRZED pobraniem.
 - **Cookies.txt (bot-check YouTube)** — prosta implementacja od pierwszej iteracji:
   jeden `st.file_uploader`, ścieżka pliku jako `cookiefile` w opcjach `yt_dlp`.
+- **Timeout na pojedynczą pozycję pobierania.** `engine.py::DownloadEngine._download_one`
+  to wrapper (`ThreadPoolExecutor(max_workers=1)` + `future.result(timeout=
+  ITEM_DOWNLOAD_TIMEOUT_SECONDS)`) wokół właściwej logiki w `_download_one_impl`.
+  Obejmuje OBIE ścieżki — pętlę `submit_playlist()` i pojedynczy `submit()` —
+  bo zawieszone pobranie trzymałoby permit `Semaphore(MAX_CONCURRENT_JOBS)` bez
+  końca i degradowało serwer wszystkim. Każda nowa ścieżka pobierania MUSI
+  wołać `_download_one`, nigdy `_download_one_impl` bezpośrednio. Po przekroczeniu
+  limitu leci `ItemDownloadTimeoutError` (`errors.py`), obsługiwany istniejącym
+  mechanizmem pojedynczych niepowodzeń (`status="error"`, job idzie dalej).
+  Wątku roboczego nie da się bezpiecznie ubić (subprocess dla yt-dlp zabroniony) —
+  po timeoucie `shutdown(wait=False)`, wątek może dokończyć się w tle (patrz
+  dług techniczny niżej). `_build_ydl_opts` ma jawne `retries`/`fragment_retries`/
+  `extractor_retries=3`, ale to dodatkowa warstwa, nie twardy bound — rozstrzyga
+  wyłącznie timeout powyżej.
 - **FLAC z YouTube to transkodowanie z lossy źródła** (Opus/AAC) — UI musi to
   jasno komunikować (`st.caption`), to nie jest realny wzrost jakości.
 
@@ -319,3 +355,23 @@ przeciw temu kosztowi.
 Komunikat błędu w UI (errors.py) uczciwie informuje użytkownika, że to znane
 ograniczenie narzędzia, z linkiem do zgłoszenia — nie sugeruje problemu
 po stronie konta użytkownika.
+
+## Dług techniczny: timeout pojedynczej pozycji jest best-effort (2026-09-20)
+
+- (a) limit ścienny może uciąć poprawne, duże pobranie na wolnym łączu —
+  docelowo limit bezczynności resetowany w `progress_hooks`, nie sztywny czas.
+- (b) brak kooperatywnego anulowania (flaga `threading.Event` sprawdzana
+  w `progress_hooks`), żeby osierocony wątek faktycznie się kończył.
+- (c) brak jawnego `socket_timeout` i logowania per pozycja (numer, start/koniec,
+  powód) — brak dowodów przy kolejnej diagnozie podobnego przypadku.
+- (d) niepotwierdzone, czy komunikat „Przekroczono limit czasu…" faktycznie
+  dociera do UI, czy ląduje w ogólnym „Wystąpił nieoczekiwany błąd…".
+
+## Dziennik (2026-09-20): pętla retry przy pobieraniu pozycji playlisty
+
+Zgłoszenie: nieskończona pętla 403/connection timeout na 1 pozycji testowej
+15-elementowej playlisty (`PL6vMAFPIKMUgzavWeCoKvQXlRImrZr80f`), blokująca
+cały job do ręcznego Ctrl+C. Fix: timeout ścienny na pozycję (patrz „Zasady
+architektoniczne") + jawny `extractor_retries=3`. Wynik: fast suite 189 passed,
+manualny retest OK — pozycje 3 i 12 tej playlisty niepobieralne z YouTube
+także pojedynczo (problem po stronie YouTube, nie aplikacji).
