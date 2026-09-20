@@ -106,13 +106,20 @@ class JobRunner:
 
     def _run(self, job: DownloadJob, on_state: OnStateCallback, semaphore: threading.Semaphore) -> None:
         try:
-            if job.playlist_scope == "all":
+            if job.playlist_scope in ("all", "selected"):
                 # submit_playlist() (Faza 2a) emituje już "on_progress" per
                 # pozycja przez on_state — tu dołączamy jedyny finalny
                 # "on_finished", niosący ZIP + raport per pozycja, żeby
                 # odbiorca (app.py) nie musiał doodpytywać engine.py.
+                # "selected" (2026-09-20) — selected_indices ZAMIAST
+                # start_index (wzajemnie wyłączne, patrz submit_playlist).
                 result = self._engine.submit_playlist(
-                    job, on_event=on_state, start_index=job.start_index
+                    job,
+                    on_event=on_state,
+                    start_index=job.start_index,
+                    selected_indices=(
+                        job.selected_indices if job.playlist_scope == "selected" else None
+                    ),
                 )
                 on_state(
                     ProgressEvent(
@@ -124,6 +131,7 @@ class JobRunner:
                         playlist_items=result.items,
                         playlist_title=result.playlist_title,
                         next_start_index=result.next_start_index,
+                        playlist_scope=job.playlist_scope,
                     )
                 )
             else:
