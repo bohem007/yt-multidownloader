@@ -25,6 +25,16 @@ class FileTooLargeError(Exception):
     """Wynikowy plik/katalog przekracza MAX_FILE_SIZE_MB — podnoszone przez storage.py."""
 
 
+class ItemDownloadTimeoutError(Exception):
+    """Pobranie JEDNEJ pozycji (submit()/pojedynczy element playlisty)
+    przekroczyło twardy limit ITEM_DOWNLOAD_TIMEOUT_SECONDS — podnoszone
+    przez engine.py::DownloadEngine._download_one jako defense-in-depth,
+    niezależny od retries/fragment_retries/extractor_retries skonfigurowanych
+    w yt-dlp (patrz _build_ydl_opts). Zaobserwowane manualnie 2026-09-20:
+    mimo skonfigurowanych retries, pojedyncza pozycja potrafiła zapętlić się
+    na serii błędów 403/connection timeout praktycznie bez końca."""
+
+
 class InvalidPlaylistSelectionError(Exception):
     """Ręcznie wskazane numery pozycji (playlist_scope="selected") poza
     zakresem 1..liczba pozycji playlisty — podnoszone przez engine.py jako
@@ -70,6 +80,13 @@ def map_download_error(exc: Exception) -> str:
         return (
             f"Wynikowy plik przekracza limit {settings.max_file_size_mb} MB "
             f"darmowego tieru. Wybierz krótszy materiał lub niższą jakość."
+        )
+
+    if isinstance(exc, ItemDownloadTimeoutError):
+        return (
+            f"Przekroczono limit czasu ({settings.item_download_timeout_seconds}s) "
+            "pobierania tego materiału — YouTube mógł tymczasowo ograniczać "
+            "przepustowość dla tego strumienia. Spróbuj ponownie później."
         )
 
     if isinstance(exc, InvalidPlaylistSelectionError):
