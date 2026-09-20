@@ -151,7 +151,8 @@ def test_completed_transcript_job_shows_txt_download_button(monkeypatch, tmp_pat
 
 def test_mixed_url_shows_playlist_scope_radio_with_real_item_count(monkeypatch):
     """URL z v= i list= (typowy link "autoplay z listy") musi pokazać radio
-    z DWIEMA opcjami i realną (sondowaną) liczbą pozycji, nie zaślepką."""
+    z TRZEMA opcjami (2026-09-20: dodano "Wybrane numery...") i realną
+    (sondowaną) liczbą pozycji, nie zaślepką."""
     monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 7)
 
     at = _run_app(monkeypatch)
@@ -161,13 +162,17 @@ def test_mixed_url_shows_playlist_scope_radio_with_real_item_count(monkeypatch):
 
     assert not at.exception
     radio = at.radio(key="playlist_scope_radio")
-    assert radio.options == ["Tylko to wideo", "Cała playlista (7 pozycji)"]
+    assert radio.options == [
+        "Tylko to wideo",
+        "Cała playlista (7 pozycji)",
+        "Wybrane numery wideo z playlisty",
+    ]
     assert radio.value == "Tylko to wideo"  # domyślnie pojedyncze wideo
 
 
-def test_playlist_only_url_shows_radio_with_single_forced_all_scope(monkeypatch):
+def test_playlist_only_url_shows_radio_with_no_single_video_option(monkeypatch):
     """URL bez v= (np. /playlist?list=...) nie ma wariantu "tylko wideo" —
-    nic takiego nie istnieje do wybrania, więc jedyna opcja to cała lista."""
+    nic takiego nie istnieje do wybrania — ale MA opcję wyboru numerów."""
     monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 4)
 
     at = _run_app(monkeypatch)
@@ -177,7 +182,8 @@ def test_playlist_only_url_shows_radio_with_single_forced_all_scope(monkeypatch)
 
     assert not at.exception
     radio = at.radio(key="playlist_scope_radio")
-    assert radio.options == ["Cała playlista (4 pozycji)"]
+    assert radio.options == ["Cała playlista (4 pozycji)", "Wybrane numery wideo z playlisty"]
+    assert radio.value == "Cała playlista (4 pozycji)"  # domyślnie cała playlista
     assert at.session_state["playlist_scope"] == "all"
 
 
@@ -282,7 +288,7 @@ def test_clicking_download_with_playlist_scope_all_starts_real_job(monkeypatch, 
     zip_file.write_bytes(b"fake zip bytes")
     submit_playlist_called = threading.Event()
 
-    def _fake_submit_playlist(self, job, on_event=None, start_index=1):
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1, selected_indices=None):
         submit_playlist_called.set()
         return PlaylistDownloadResult(zip_path=zip_file, items=[], playlist_title="Fake")
 
@@ -313,11 +319,134 @@ def test_clicking_download_with_playlist_scope_all_starts_real_job(monkeypatch, 
     assert len(at.download_button) == 0
 
 
+def test_selecting_selected_scope_reveals_number_input_and_blocks_download_when_empty(monkeypatch):
+    """Punkt 4 (brief 2026-09-20): wybranie "Wybrane numery wideo z
+    playlisty" pokazuje pole tekstowe na numery — puste pole blokuje
+    "Pobierz" (bez komunikatu błędu, tak jak puste URL — pole po prostu
+    nie zostało jeszcze wypełnione, to nie jest błąd do zgłaszania)."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 32)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=selectedtest1&list=PLselectedtest1"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Wybrane numery wideo z playlisty").run()
+
+    assert not at.exception
+    assert at.text_input(key="selected_indices_input") is not None
+    assert at.session_state["playlist_scope"] == "selected"
+    assert at.button(key="download_button").proto.disabled is True
+    assert len(at.error) == 0
+
+
+def test_selected_scope_invalid_syntax_shows_error_and_blocks_download(monkeypatch):
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 32)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=selectedtest2&list=PLselectedtest2"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Wybrane numery wideo z playlisty").run()
+    at.text_input(key="selected_indices_input").input("15, abc").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is True
+    assert any("abc" in e.value for e in at.error)
+
+
+def test_selected_scope_rejects_duplicates_and_out_of_range(monkeypatch):
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 10)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=selectedtest3&list=PLselectedtest3"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Wybrane numery wideo z playlisty").run()
+
+    at.text_input(key="selected_indices_input").input("2, 2").run()
+    assert at.button(key="download_button").proto.disabled is True
+    assert any("powtórzone" in e.value for e in at.error)
+
+    at.text_input(key="selected_indices_input").input("2, 21").run()
+    assert at.button(key="download_button").proto.disabled is True
+    assert any("poza zakresem" in e.value and "21" in e.value for e in at.error)
+
+
+def test_selected_scope_over_max_playlist_items_blocks_video_mode(monkeypatch):
+    """Punkt 4: limit MAX_PLAYLIST_ITEMS dla "selected" dotyczy LICZBY
+    WYBRANYCH pozycji, nie długości całej playlisty (settings PINOWANE,
+    nie ambient .env — patrz test_playlist_scope_all_over_limit_...)."""
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "2"}))
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 32)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=selectedtest4&list=PLselectedtest4"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Wybrane numery wideo z playlisty").run()
+    at.text_input(key="selected_indices_input").input("5, 10, 15").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is True
+    warning_messages = [w.value for w in at.warning]
+    assert any("Wybrano 3 pozycji" in m and "limit" in m for m in warning_messages)
+
+
+def test_clicking_download_with_selected_indices_passes_them_to_job(monkeypatch, tmp_path):
+    """End-to-end (fałszywy silnik): "Pobierz" z ważnym wyborem numerów
+    musi wystartować joba z playlist_scope="selected" i przekazać
+    selected_indices do submit_playlist(), a wynikowa nazwa ZIP-a musi
+    użyć gałęzi "-pozycje-{lista}" (nie zakresu od-do)."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 32)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+    received: dict = {}
+
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1, selected_indices=None):
+        received["playlist_scope"] = job.playlist_scope
+        received["selected_indices"] = selected_indices
+        return PlaylistDownloadResult(
+            zip_path=zip_file,
+            items=[
+                PlaylistItemResult(index=15, title="Wideo 15", status="done"),
+                PlaylistItemResult(index=21, title="Wideo 21", status="done"),
+            ],
+            playlist_title="Moja playlista",
+        )
+
+    monkeypatch.setattr(engine_module.DownloadEngine, "submit_playlist", _fake_submit_playlist)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(
+        "https://www.youtube.com/watch?v=selectedtest5&list=PLselectedtest5"
+    ).run()
+    at.radio(key="playlist_scope_radio").set_value("Wybrane numery wideo z playlisty").run()
+    at.text_input(key="selected_indices_input").input("21, 15").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+
+    at.button(key="download_button").click().run()
+    for _ in range(10):
+        if at.session_state["status"] == "done":
+            break
+        at.run()
+
+    assert received["playlist_scope"] == "selected"
+    assert received["selected_indices"] == [15, 21]  # posortowane, niezależnie od kolejności wejścia
+    assert at.session_state["status"] == "done"
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-15,21.zip"
+
+
 def test_completed_playlist_job_shows_zip_download_link_with_report(monkeypatch, tmp_path):
     """Kryterium akceptacji 1+2: submit_playlist() zwrócił ZIP + raport
     per pozycja (jedna pozycja error) — status="done" (bo ≥1 sukces),
-    nazwa pliku "Playlista-{tytuł}.zip" (nie przez build_display_filename),
-    raport (podsumowanie + lista błędów) widoczny w _render_result."""
+    nazwa pliku "Playlista-{tytuł}-pozycje-{start}-{end}.zip" (nie przez
+    build_display_filename), raport (podsumowanie + lista błędów) widoczny
+    w _render_result. Sufiks zakresu jest teraz na KAŻDEJ turze, łącznie
+    z pierwszą (fix regresji z 2026-09-20 — poprzednio pierwsza tura nie
+    miała sufiksu wcale)."""
     at = _run_app(monkeypatch)
 
     zip_file = tmp_path / "playlist.zip"
@@ -345,14 +474,14 @@ def test_completed_playlist_job_shows_zip_download_link_with_report(monkeypatch,
 
     assert not at.exception
     assert at.session_state["status"] == "done"
-    assert at.session_state["result_file_name"] == "Playlista-Moja playlista.zip"
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-01-02.zip"
     # ZIP zostaje na dysku pod nieodgadywalnym tokenem — NIE w RAM/session_state.
     assert at.session_state["result_data"] is None
     token = at.session_state["result_download_token"]
     link = downloads.lookup(token)
     assert link is not None
     assert link.path.read_bytes() == b"fake zip bytes"
-    assert link.file_name == "Playlista-Moja playlista.zip"
+    assert link.file_name == "Playlista-Moja playlista-pozycje-01-02.zip"
     assert _link_urls(at) == [downloads.download_url(token)]
     assert len(at.download_button) == 0
 
@@ -403,9 +532,9 @@ def test_completed_playlist_job_with_next_start_index_shows_continue_button_and_
 
     assert not at.exception
     assert at.session_state["status"] == "done"
-    # Pierwsze wywołanie (start_index=1 domyślnie) — nazwa BEZ zakresu
-    # pozycji, zero regresji względem Fazy 2b.
-    assert at.session_state["result_file_name"] == "Playlista-Moja playlista.zip"
+    # Pierwsze wywołanie (start_index=1 domyślnie) dostaje sufiks zakresu
+    # tak samo jak kontynuacje (fix regresji z 2026-09-20).
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-01-02.zip"
     assert at.session_state["playlist_next_start_index"] == 3
 
     info_messages = [i.value for i in at.info]
@@ -433,7 +562,7 @@ def test_clicking_continue_button_starts_continuation_and_replaces_result_on_com
     continuation_zip = tmp_path / "continuation.zip"
     continuation_zip.write_bytes(b"continuation zip bytes")
 
-    def _fake_submit_playlist(self, job, on_event=None, start_index=1):
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1, selected_indices=None):
         received["start_index"] = start_index
         return PlaylistDownloadResult(
             zip_path=continuation_zip,
@@ -486,7 +615,7 @@ def test_clicking_continue_button_starts_continuation_and_replaces_result_on_com
 
     assert received["start_index"] == 3
     assert at.session_state["status"] == "done"
-    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-3-5.zip"
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-03-05.zip"
     assert at.session_state["playlist_next_start_index"] is None
     assert "continue_playlist_button" not in [b.key for b in at.button]
 
@@ -523,7 +652,7 @@ def test_download_link_stays_unique_across_full_continuation_chain_including_las
         (10, 10, 12, None),
     ]
 
-    def _fake_submit_playlist(self, job, on_event=None, start_index=1):
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1, selected_indices=None):
         n = len(calls)
         calls.append(start_index)
         _start, first, last, next_after = turns[n]
