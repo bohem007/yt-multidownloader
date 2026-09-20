@@ -25,6 +25,14 @@ class FileTooLargeError(Exception):
     """Wynikowy plik/katalog przekracza MAX_FILE_SIZE_MB — podnoszone przez storage.py."""
 
 
+class InvalidPlaylistSelectionError(Exception):
+    """Ręcznie wskazane numery pozycji (playlist_scope="selected") poza
+    zakresem 1..liczba pozycji playlisty — podnoszone przez engine.py jako
+    backstop PO walidacji app.py (Warstwa architektoniczna: engine.py
+    sprawdza limity przed pobraniem niezależnie od UI, na wypadek gdyby
+    playlista zmieniła długość między sondą app.py a właściwym pobraniem)."""
+
+
 _BOT_CHECK_MARKERS = ("confirm you're not a bot", "sign in to confirm", "not a bot")
 # Osobny, jednoznaczny przypadek od _BOT_CHECK_MARKERS: "Sign in to confirm
 # your age" (brak/nieważne cookies — problem DO ROZWIĄZANIA przez wgranie
@@ -62,6 +70,12 @@ def map_download_error(exc: Exception) -> str:
         return (
             f"Wynikowy plik przekracza limit {settings.max_file_size_mb} MB "
             f"darmowego tieru. Wybierz krótszy materiał lub niższą jakość."
+        )
+
+    if isinstance(exc, InvalidPlaylistSelectionError):
+        return (
+            "Wybrane numery pozycji playlisty są nieprawidłowe — sprawdź, "
+            "czy mieszczą się w zakresie pozycji tej playlisty, i spróbuj ponownie."
         )
 
     if isinstance(exc, DownloadError):
