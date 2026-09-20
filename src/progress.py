@@ -44,3 +44,10 @@ class ProgressEvent:
     # "Pobierz kolejne pozycje" w app.py) — None = nic do wznowienia
     # (playlista przetworzona do końca, patrz PlaylistDownloadResult).
     next_start_index: int | None = None
+    # 2026-09-20 — job.playlist_scope oryginalnego zadania ("all"/"selected"),
+    # niesiony na finalnym "on_finished" dla joba playlisty, żeby app.py
+    # mogło zbudować nazwę ZIP-a poprawnie dla trybu "selected" (zakres
+    # pozycji "-pozycje-XX-YY" nie ma sensu dla rozproszonego wyboru) BEZ
+    # polegania na aktualnym stanie widgetów UI w chwili renderowania
+    # wyniku (który mógł się już zmienić od chwili zlecenia joba).
+    playlist_scope: str | None = None
