@@ -13,6 +13,7 @@ import tempfile
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator, Literal
 
@@ -20,7 +21,12 @@ from yt_dlp import YoutubeDL
 
 from src import storage
 from src.config import settings
-from src.errors import InvalidUrlError, PlaylistTooLargeError, map_download_error
+from src.errors import (
+    InvalidPlaylistSelectionError,
+    InvalidUrlError,
+    PlaylistTooLargeError,
+    map_download_error,
+)
 from src.naming import build_display_filename
 from src.profiles import DownloadProfile, get_profile
 from src.progress import ProgressEvent
@@ -48,16 +54,26 @@ class DownloadJob:
     # "single" (domyślnie) — noplaylist=True, ściągane jest WYŁĄCZNIE wideo
     # wskazane przez `v=`, nawet jeśli URL zawiera też `list=` (patrz
     # validators.classify_url), przez submit(). "all" — submit_playlist()
-    # ściąga WSZYSTKIE pozycje do jednego ZIP-a (Faza 2a). app.py (Faza 2b,
-    # jeszcze niezaimplementowana) na razie pokazuje dla "all" placeholder,
-    # nigdy nie tworzy z tym joba, który faktycznie wywołałby submit_playlist().
+    # ściąga WSZYSTKIE pozycje do jednego ZIP-a (Faza 2a). "selected"
+    # (2026-09-20) — submit_playlist() ściąga TYLKO pozycje wskazane przez
+    # `selected_indices`, obejście przejściowych błędów 403 na pojedynczych
+    # pozycjach bez ściągania całej playlisty od nowa.
     playlist_scope: str = "single"
     # Faza 2c — pozycja BEZWZGLĘDNA (1-based, licząc od początku playlisty),
     # od której submit_playlist() ma wznowić pobieranie po wcześniejszym
     # zatrzymaniu z powodu MAX_ZIP_SIZE_MB (patrz
     # PlaylistDownloadResult.next_start_index). Domyślne 1 = od początku,
-    # jak dotychczas — zero zmian zachowania dla nowych jobów.
+    # jak dotychczas — zero zmian zachowania dla nowych jobów. Ignorowane,
+    # gdy playlist_scope=="selected" (patrz selected_indices).
     start_index: int = 1
+    # 2026-09-20 — numery pozycji BEZWZGLĘDNE (1-based) do pobrania, gdy
+    # playlist_scope=="selected"; None dla "single"/"all". Mechanizm
+    # wznowienia (start_index/next_start_index) NIE dotyczy tego trybu —
+    # wybór jest z natury nieciągły, więc "kontynuuj od pozycji N" nie ma
+    # sensu; jeśli limit MAX_ZIP_SIZE_MB przerwie pobieranie w trakcie,
+    # pozostałe WYBRANE pozycje trafiają do raportu jako "skipped" bez
+    # przycisku kontynuacji (znane, udokumentowane ograniczenie).
+    selected_indices: list[int] | None = None
 
 
 @dataclass
@@ -179,6 +195,19 @@ def _temp_cookiefile(cookie_data: bytes | None) -> Iterator[str | None]:
         path.unlink(missing_ok=True)
 
 
+def _build_transcript_footer(uploader: str | None, title: str | None, source_url: str) -> str:
+    """Stopka dopisywana na końcu KAŻDEGO pliku TXT Transkryptu (pojedyncze
+    wideo i każda pozycja playlisty) — "Autor-Tytuł" tą samą konwencją co
+    src/naming.py::build_display_filename, ale bez sanityzacji (to treść
+    pliku, nie nazwa — znaki niedozwolone w nazwach plików Windows są tu
+    nieszkodliwe). Data/godzina to czas serwera, bez sekund — wystarczające
+    dla "kiedy to pobrano", nie potrzeba ISO 8601."""
+    author = uploader or "Unknown"
+    video_title = title or "download"
+    downloaded_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"\n\nŹródło: {author}-{video_title} {source_url} {downloaded_at}"
+
+
 def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict[str, list[str]]:
     """Dostępne języki napisów dla materiału — osobno manualne
     (info_dict['subtitles']) i automatyczne (info_dict['automatic_captions']).
@@ -190,10 +219,22 @@ def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict
     naprawą: dla materiału z ograniczeniem wiekowym YouTube wymaga cookies
     już na etapie SAMEJ próby odczytu metadanych (nie tylko pobrania) — bez
     cookiefile tutaj UI nigdy nie pokaże listy języków, niezależnie od tego,
-    czy użytkownik wgrał cookies.txt do właściwego pobrania."""
+    czy użytkownik wgrał cookies.txt do właściwego pobrania.
+
+    noplaylist=True jest tu ZAWSZE wymuszone (fix buga z 2026-09-20): ta
+    sonda ma sens WYŁĄCZNIE dla jednego, konkretnego wideo. Dla mixed URL-a
+    (ma i `v=`, i `list=` — typowy link "wideo z autoplaya playlisty")
+    yt-dlp bez noplaylist=True zwraca info_dict PLAYLISTY, nie wideo —
+    'subtitles'/'automatic_captions' wtedy nie istnieją na tym poziomie,
+    więc ta funkcja fałszywie raportowała "brak napisów" dla trybu "tylko
+    to wideo", mimo że napisy realnie istniały (widoczne w trybie "cała
+    playlista", który i tak zawsze woła to z czystym URL-em pojedynczego
+    wideo przez resolve_representative_video_url — tam noplaylist=True jest
+    no-opem, nie zmienia zachowania)."""
     with _temp_cookiefile(cookie_data) as cookiefile_path:
         probe_opts = _base_ydl_opts(cookiefile_path)
         probe_opts["skip_download"] = True
+        probe_opts["noplaylist"] = True
 
         with YoutubeDL(probe_opts) as probe:
             info = probe.extract_info(url, download=False)
@@ -354,7 +395,12 @@ class DownloadEngine:
             # zawsze wymusza VTT — patrz profiles.py) — różnica jest w
             # tym, co użytkownik dostaje: surowe napisy nigdy nie
             # docierają na wierzch, tylko oczyszczony tekst.
-            result = self._finalize_transcript(result)
+            # webpage_url (kanoniczny link ustalony przez yt-dlp PO
+            # ekstrakcji) zamiast `url` — dla pozycji playlisty `url` bywa
+            # skróconym/reprezentatywnym linkiem z sondy entries, nie tym,
+            # co user rzeczywiście chciałby widzieć jako źródło w stopce.
+            source_url = info.get("webpage_url") or url
+            result = self._finalize_transcript(result, source_url)
 
         return result
 
@@ -363,19 +409,31 @@ class DownloadEngine:
         job: DownloadJob,
         on_event: OnEventCallback | None = None,
         start_index: int = 1,
+        selected_indices: list[int] | None = None,
     ) -> PlaylistDownloadResult:
-        """Pobiera pozycje playlisty (job.playlist_scope=="all") od
-        `start_index` (bezwzględna, 1-based) do jednego ZIP-a. Błąd
-        pojedynczej pozycji NIE przerywa reszty (decyzja produktowa: pomiń,
-        kontynuuj, zbierz raport w items) — tylko błędy na poziomie CAŁEGO
-        joba (walidacja URL, sonda, limit MAX_PLAYLIST_ITEMS) trafiają do
-        zewnętrznego except/EngineError, tak jak w submit().
+        """Pobiera pozycje playlisty (job.playlist_scope in ("all", "selected"))
+        do jednego ZIP-a. Błąd pojedynczej pozycji NIE przerywa reszty
+        (decyzja produktowa: pomiń, kontynuuj, zbierz raport w items) —
+        tylko błędy na poziomie CAŁEGO joba (walidacja URL, sonda, limit
+        MAX_PLAYLIST_ITEMS) trafiają do zewnętrznego except/EngineError,
+        tak jak w submit().
 
-        `start_index` (Faza 2c) pozwala wznowić pobieranie po wcześniejszym
-        zatrzymaniu z powodu MAX_ZIP_SIZE_MB — indeksowanie w items/nazwach
-        plików pozostaje BEZWZGLĘDNE względem oryginalnej playlisty (pozycja
-        11 nadal daje plik "11 - ..."), zamiast liczenia od 1 przy każdym
-        wznowieniu."""
+        `start_index` (Faza 2c) pozwala wznowić CIĄGŁE pobieranie
+        ("all") po wcześniejszym zatrzymaniu z powodu MAX_ZIP_SIZE_MB —
+        indeksowanie w items/nazwach plików pozostaje BEZWZGLĘDNE względem
+        oryginalnej playlisty (pozycja 11 nadal daje plik "11 - ...").
+
+        `selected_indices` (2026-09-20, playlist_scope=="selected") pobiera
+        WYŁĄCZNIE wskazane, bezwzględne numery pozycji — obejście dla
+        przejściowych błędów 403 na pojedynczych pozycjach bez ściągania
+        całej playlisty od nowa. Wzajemnie wyłączne ze `start_index`
+        (ignorowany, gdy podane). Limit MAX_PLAYLIST_ITEMS jest wtedy
+        sprawdzany na LICZBIE WYBRANYCH pozycji, nie na długości całej
+        playlisty — inaczej ten tryb byłby bezużyteczny dla dokładnie tych
+        długich playlist, do których jest pomyślany. Mechanizm wznowienia
+        (next_start_index) NIE działa dla tego trybu — wybór jest z natury
+        nieciągły, więc zatrzymanie limitem ZIP-a po prostu oznacza
+        pozostałe wybrane pozycje jako "skipped", bez next_start_index."""
         job_dir: Path | None = None
         try:
             if not validate_url(job.url):
@@ -388,26 +446,38 @@ class DownloadEngine:
             entries = entries or []
             total = len(entries)
 
+            if selected_indices is not None:
+                ordered_indices = sorted(set(selected_indices))
+                invalid = [i for i in ordered_indices if i < 1 or i > total]
+                if invalid:
+                    raise InvalidPlaylistSelectionError(
+                        f"nieprawidłowe numery pozycji {invalid} (playlista ma {total} pozycji)"
+                    )
+                remaining_entries = [(idx, entries[idx - 1]) for idx in ordered_indices]
+            else:
+                remaining_entries = list(enumerate(entries[start_index - 1 :], start=start_index))
+
             # Zabezpieczenie na poziomie SILNIKA, nie tylko UI (Faza 2b) —
             # limit liczby pozycji nie dotyczy Subtitle/Transcript (te same
-            # zasady co _check_playlist_limit w submit()). Sprawdzany na
-            # PEŁNEJ długości playlisty (przed slice'em start_index) —
-            # wznowienie nie omija tej bramki ani jej nie duplikuje: jeśli
-            # pierwsze wywołanie już przez nią przeszło, playlista nie
-            # urośnie między wznowieniami w ramach jednej sesji użytkownika.
-            if job.mode in ("video", "audio") and total > settings.max_playlist_items:
+            # zasady co _check_playlist_limit w submit()). Dla "all"
+            # sprawdzany na PEŁNEJ długości playlisty (przed slice'em
+            # start_index) — wznowienie nie omija tej bramki ani jej nie
+            # duplikuje. Dla "selected" sprawdzany na LICZBIE WYBRANYCH
+            # pozycji (patrz docstring) — total playlisty jest tu celowo
+            # nieistotny.
+            limited_count = len(remaining_entries) if selected_indices is not None else total
+            if job.mode in ("video", "audio") and limited_count > settings.max_playlist_items:
                 raise PlaylistTooLargeError(
-                    f"playlist ma {total} pozycji, limit to {settings.max_playlist_items}"
+                    f"{limited_count} pozycji do pobrania, limit to {settings.max_playlist_items}"
                 )
-
-            remaining_entries = entries[start_index - 1 :]
 
             items: list[PlaylistItemResult] = []
             stopped_early_reason: str | None = None
             next_start_index: int | None = None
             max_zip_size_bytes = settings.max_zip_size_mb * 1024 * 1024
+            total_to_process = len(remaining_entries)
 
-            for position, entry in enumerate(remaining_entries, start=start_index):
+            for processed_count, (position, entry) in enumerate(remaining_entries, start=1):
                 video_url = entry.get("url") or f"https://www.youtube.com/watch?v={entry.get('id')}"
                 entry_title = entry.get("title")
                 size_limit_exceeded = False
@@ -436,27 +506,37 @@ class DownloadEngine:
                     )
                     size_limit_exceeded = storage.directory_size_bytes(job_dir) > max_zip_size_bytes
 
-                self._emit(
-                    on_event,
-                    "on_progress",
-                    position / total * 100 if total else 100.0,
-                    f"Pobrano {position} z {total} pozycji",
-                )
+                if selected_indices is not None:
+                    percent = processed_count / total_to_process * 100 if total_to_process else 100.0
+                    progress_message = f"Pobrano {processed_count} z {total_to_process} wybranych pozycji"
+                else:
+                    percent = position / total * 100 if total else 100.0
+                    progress_message = f"Pobrano {position} z {total} pozycji"
+                self._emit(on_event, "on_progress", percent, progress_message)
 
                 if size_limit_exceeded:
-                    stopped_early_reason = (
-                        f"Przekroczono limit rozmiaru ZIP-a ({settings.max_zip_size_mb} MB) "
-                        f"po pozycji {position} z {total} — pominięto pozostałe."
-                    )
-                    remaining_after = entries[position:]
-                    if remaining_after:
-                        # Faza 2c — jest jeszcze co wznowić; None (domyślne)
-                        # oznaczałoby błędnie "koniec playlisty" dla UI.
-                        next_start_index = position + 1
-                    for offset, skipped_entry in enumerate(remaining_after, start=position + 1):
+                    remaining_after = remaining_entries[processed_count:]
+                    if selected_indices is not None:
+                        stopped_early_reason = (
+                            f"Przekroczono limit rozmiaru ZIP-a ({settings.max_zip_size_mb} MB) "
+                            f"po {processed_count} z {total_to_process} wybranych pozycji — "
+                            f"pominięto pozostałe."
+                        )
+                        # Brak next_start_index — wybór jest nieciągły, więc
+                        # "wznów od pozycji N" nie ma tu sensu (patrz docstring).
+                    else:
+                        stopped_early_reason = (
+                            f"Przekroczono limit rozmiaru ZIP-a ({settings.max_zip_size_mb} MB) "
+                            f"po pozycji {position} z {total} — pominięto pozostałe."
+                        )
+                        if remaining_after:
+                            # Faza 2c — jest jeszcze co wznowić; None (domyślne)
+                            # oznaczałoby błędnie "koniec playlisty" dla UI.
+                            next_start_index = position + 1
+                    for skipped_position, skipped_entry in remaining_after:
                         items.append(
                             PlaylistItemResult(
-                                index=offset,
+                                index=skipped_position,
                                 title=skipped_entry.get("title"),
                                 status="skipped",
                                 error_message="Pominięto — przekroczono limit rozmiaru ZIP-a.",
@@ -562,16 +642,20 @@ class DownloadEngine:
         return DownloadResult(path=path, uploader=info.get("uploader"), title=info.get("title"))
 
     @staticmethod
-    def _finalize_transcript(result: DownloadResult) -> DownloadResult:
+    def _finalize_transcript(result: DownloadResult, source_url: str) -> DownloadResult:
         """Zamienia surowy plik VTT (rozwiązany przez _resolve_result tą samą
         ścieżką co Subtitle) na czysty tekst — użytkownik trybu Transkrypt
-        dostaje WYŁĄCZNIE .txt, nigdy surowych napisów z timestampami."""
+        dostaje WYŁĄCZNIE .txt, nigdy surowych napisów z timestampami.
+        Dopisuje stopkę źródłową (autor/tytuł/link/data pobrania) na końcu,
+        PO podziale na akapity — czyste dopisanie, bez ingerencji w
+        czyszczenie/dzielenie tekstu."""
         vtt_content = result.path.read_text(encoding="utf-8")
         text = clean_vtt_to_text(vtt_content)
         # Podział na akapity działa na JUŻ OCZYSZCZONYM tekście (po
         # deduplikacji) — nigdy na surowym VTT, żadnego zgadywania granic
         # po znacznikach czasu (patrz transcript_cleaner.format_paragraphs).
         text = format_paragraphs(text)
+        text += _build_transcript_footer(result.uploader, result.title, source_url)
 
         txt_path = result.path.with_suffix(".txt")
         txt_path.write_text(text, encoding="utf-8")
