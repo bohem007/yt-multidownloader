@@ -6,8 +6,10 @@ przy sprzeczności między kodem a tym plikiem, zgłoś rozbieżność zamiast z
 ## Cel projektu
 
 Aplikacja webowa (Streamlit) do pobierania treści z YouTube przez `yt-dlp`:
-wideo (MP4), audio (MP3/FLAC), playlisty (limit 10 pozycji), napisy (SRT/VTT),
-transkrypt bez timestampów (TXT). Docelowy hosting: Hugging Face Spaces
+wideo (MP4), audio (MP3/FLAC), playlisty (limit `MAX_PLAYLIST_ITEMS` pozycji na
+turę, z kontynuacją kolejnych tur do limitu `MAX_ZIP_SIZE_MB` oraz trybem
+pobierania wybranych numerów pozycji), napisy (SRT/VTT), transkrypt bez
+timestampów (TXT). Docelowy hosting: Hugging Face Spaces
 (Docker SDK, widoczność **Public**, darmowy tier). Baza: Neon Postgres
 (darmowy tier), tylko anonimowa historia zadań.
 
@@ -25,6 +27,8 @@ obowiązują lokalnie (`.env`) i w produkcji (HF Secrets/Variables) — patrz `.
 Ustalone wartości domyślne:
 - `MAX_FILE_SIZE_MB=500`
 - `MAX_PLAYLIST_ITEMS=10`
+- `MAX_ZIP_SIZE_MB=500` (twardy stop pętli pobierania playlisty po przekroczeniu
+  rozmiaru ZIP-a tury — patrz „Kontrakty playlisty i pobierania")
 - `MAX_CONCURRENT_JOBS=2`
 - `ITEM_DOWNLOAD_TIMEOUT_SECONDS=180` (twardy limit ścienny na pobranie JEDNEJ
   pozycji — defense-in-depth, niezależny od retries/fragment_retries yt-dlp)
@@ -32,6 +36,10 @@ Ustalone wartości domyślne:
 - `RATE_LIMIT_PER_IP=10` (żądań/godzinę)
 - `RATE_LIMITING_ENABLED` — domyślnie włączone w `production`, opcjonalne lokalnie
 - `ENVIRONMENT=local|production`
+
+(pełna lista zmiennych, włącznie z tymi niebędącymi limitami — `DB_SCHEMA`,
+`IP_HASH_SECRET`, `STORAGE_BASE_DIR` — jest w `.env.example`, ta lista nie jest
+wyczerpująca)
 
 `settings` (`config.py`) to zamrożony singleton (`frozen=True`) tworzony raz
 przy imporcie — zmiana `.env` wymaga restartu procesu, nie samego odświeżenia
@@ -65,8 +73,12 @@ wykonywać kroków setupowych:
   Każda nowa zmienna dodana do `config.py` musi mieć odpowiednik w
   `.env.example` (z wartością przykładową, nie realną).
 
-Punkt wejścia do pracy to więc od razu implementacja modułów z sekcji
-"Kolejność implementacji" — bez `uv init`, `uv add` itp.
+Moduły z sekcji „Kolejność implementacji" (punkty 1–3) są zaimplementowane;
+funkcjonalność playlist (Fazy 1, 2a, 2b, 2c — limit pozycji, ZIP na dysku,
+tury kontynuacji, wybrane numery pozycji) jest zamknięta i przetestowana.
+Aktualne, otwarte zadania robocze są prowadzone w dokumencie „stan projektu"
+poza repozytorium — nie kopiuj go do tego pliku; przy potrzebie zapytaj
+użytkownika o aktualny stan.
 
 ## Komendy (development, nie setup)
 
@@ -77,7 +89,10 @@ Punkt wejścia do pracy to więc od razu implementacja modułów z sekcji
 uv run streamlit run asgi_app.py
 # Uwaga: st.App nie otwiera przeglądarki sam — wejdź na http://localhost:8501
 
-# Testy
+# Testy — szybki zestaw (bez integracyjnych, patrz "Oszczędność kontekstu")
+uv run pytest -q -m "not slow"
+
+# Pełny zestaw (włącznie z testami integracyjnymi @slow — realne pobrania z sieci)
 uv run pytest
 ```
 
@@ -88,8 +103,8 @@ uv run pytest
   fragment (`offset`/`limit`), nie cały plik.
 - Nie czytaj ponownie pliku już odczytanego w tej sesji, jeśli się nie zmienił —
   wynik zostaje w kontekście do końca rozmowy.
-- Testy uruchamiaj skrótowo (`uv run pytest -q`; `-x`/konkretny test dopiero
-  przy błędzie), długie wyjścia przycinaj (`| Select-Object -Last 50`).
+- Testy uruchamiaj skrótowo (`uv run pytest -q -m "not slow"`; `-x`/konkretny
+  test dopiero przy błędzie), długie wyjścia przycinaj (`| Select-Object -Last 50`).
 - Szerokie przeszukiwanie ("gdzie wołane jest X") deleguj do sub-agenta
   (Explore) — jego odczyty nie trafiają do głównego kontekstu.
 - Jedno zadanie = jedna sesja: `/clear` przy zmianie tematu, `/compact`
@@ -99,8 +114,8 @@ uv run pytest
 
 ```
 /
-├── Dockerfile              # tylko do wdrożenia HF, nie lokalnie
-├── docker-compose.yml
+├── Dockerfile              # tylko do wdrożenia HF, nie lokalnie (jeszcze nie istnieje)
+├── docker-compose.yml      # (jeszcze nie istnieje)
 ├── pyproject.toml / uv.lock
 ├── schema.sql
 ├── .env.example
@@ -149,8 +164,14 @@ uv run pytest
   włącz/wyłącz przez `RATE_LIMITING_ENABLED`.
 - **Walidacja przed pobraniem.** `engine.py` sprawdza limity (rozmiar, liczba
   pozycji playlisty) przez wstępny `extract_info(download=False)` PRZED pobraniem.
-- **Cookies.txt (bot-check YouTube)** — prosta implementacja od pierwszej iteracji:
-  jeden `st.file_uploader`, ścieżka pliku jako `cookiefile` w opcjach `yt_dlp`.
+- **Cookies.txt (bot-check YouTube)** — jeden `st.file_uploader` w `app.py`
+  (`cookie_data: bytes`). `engine.py::_base_ydl_opts` wstrzykuje `cookiefile`
+  do KAŻDEJ instancji `YoutubeDL`, z jednego miejsca. Sondy poza jobem
+  (`list_available_subtitles`, liczenie pozycji playlisty) używają
+  `_temp_cookiefile` — plik tymczasowy usuwany natychmiast po `with`; właściwe
+  pobranie zapisuje `cookies.txt` w `job_dir` przez `_write_cookiefile`, na
+  czas życia joba. `_zip_job_dir` wyklucza `cookies.txt` z ZIP-a playlisty —
+  sprzątanie idzie przez `storage.cleanup(job_dir)` jak dla innych plików.
 - **Timeout na pojedynczą pozycję pobierania.** `engine.py::DownloadEngine._download_one`
   to wrapper (`ThreadPoolExecutor(max_workers=1)` + `future.result(timeout=
   ITEM_DOWNLOAD_TIMEOUT_SECONDS)`) wokół właściwej logiki w `_download_one_impl`.
@@ -175,21 +196,48 @@ uv run pytest
 | Video (MP4) | `bestvideo*+bestaudio/best` | Remux → MP4, embed metadata/thumbnail |
 | Audio MP3 | `bestaudio/best` | `FFmpegExtractAudio` → mp3 (VBR 0 lub bitrate) |
 | Audio FLAC | `bestaudio/best` | `FFmpegExtractAudio` → flac |
-| Playlist | dziedziczy profil audio/video | `outtmpl` z `%(playlist_index)s`, ZIP w pamięci, `ignoreerrors=True` |
+| Playlist | dziedziczy profil audio/video | `outtmpl` z `%(playlist_index)s`, ZIP na dysku (`/api/download/{token}`), `ignoreerrors=True` |
 | Subtitle | `skip_download=True` | zapis SRT/VTT |
 | Transcript | `skip_download=True` + VTT | post-processing tekstowy (transcript_cleaner.py) |
 
-## Kolejność implementacji (trzymaj się tej sekwencji)
+## Kontrakty playlisty i pobierania
 
-1. `config.py` + `.env.example` + `schema.sql` + `db.py` — fundament, testowalny
-   w izolacji od yt-dlp i UI
-2. `profiles.py` + `engine.py` — rdzeń logiki, walidacja limitów PRZED pobraniem
-3. `app.py` — UI łączący warstwy, uwzględniający flagę `ENVIRONMENT`
-4. `requirements`/`pyproject.toml` + lokalne uruchomienie przez UV + `Dockerfile`
-   (przygotowany, ale nieużywany lokalnie)
+- **Tury:** `start_index`/`next_start_index` (pozycje absolutne, 1-based) wznawiają
+  ciągłe pobieranie (przycisk „Pobierz kolejne pozycje"). Twardy stop przy
+  przekroczeniu `MAX_ZIP_SIZE_MB`; pozycje spoza aktualnej tury dostają
+  `status="skipped"`.
+- **Wybrane numery (`playlist_scope="selected"`):** `selected_indices` waliduje
+  UI (`app.py::_parse_selected_indices`) i niezależnie silnik
+  (`InvalidPlaylistSelectionError` w `errors.py`) — backstop, nie duplikat.
+  `MAX_PLAYLIST_ITEMS` liczy się od liczby WYBRANYCH pozycji. Brak kontynuacji
+  tur w tym trybie (`next_start_index` zawsze `None`); `ProgressEvent.playlist_scope`
+  niesie oryginalny scope joba do UI.
+- **Nazwa ZIP-a tury** (`app.py::_build_playlist_zip_filename`): sufiks
+  `-pozycje-{start}-{end}` zawsze, zero-padded do szerokości większej liczby;
+  dla `selected` — lista numerów (`-pozycje-15,21`, ≤5 pozycji) albo fallback
+  `-pozycje-wybrane` dla dłuższych.
+- **Stopka źródłowa w TXT:** `_finalize_transcript` dopisuje po
+  `format_paragraphs` linię `Źródło: {Autor}-{Tytuł} {webpage_url} {data}` —
+  dla pojedynczego wideo i każdej pozycji playlisty.
+- **Pułapka regresyjna:** `list_available_subtitles()` MUSI wymuszać
+  `noplaylist=True` bezwarunkowo — bez tego URL z `v=`+`list=` zwraca
+  info_dict playlisty i UI zgłasza fałszywe „brak napisów".
+- **Błędy pozycji:** pojedyncze niepowodzenie = `status="error"`, job idzie
+  dalej; zawieszenie pozycji = `ItemDownloadTimeoutError` (patrz zasada
+  timeoutu wyżej).
+
+## Kolejność implementacji
+
+Zrobione: 1. `config.py`/`.env.example`/`schema.sql`/`db.py`; 2. `profiles.py`/
+`engine.py` (walidacja limitów PRZED pobraniem); 3. `app.py` (UI łączący warstwy).
+
+Do zrobienia przed wdrożeniem na HF Spaces:
+
+4. `Dockerfile` (artefakt wdrożeniowy, nieużywany lokalnie) + weryfikacja
+   `pyproject.toml`/`uv.lock` pod kątem obrazu Docker
 5. Testy jakościowe lokalne — wszystkie profile, limity, obsługa błędów
-6. `README.md` (nagłówek YAML `sdk: docker`, `app_port: 8501`) + migracja
-   Secrets/Variables do panelu HF + publikacja
+6. `README.md` (nagłówek YAML `sdk: docker`, `app_port: 8501`, obecnie puste
+   pliki) + migracja Secrets/Variables do panelu HF + publikacja
 
 ## Konwencja commitów
 
@@ -217,121 +265,31 @@ test(rate-limit)
 
 ## Znane problemy z testów manualnych (2026-09-16)
 
-Sesja A (błędy silnika — ROZWIĄZANE):
-2. Audio MP3: plik wynikowy ma rozszerzenie .webm zamiast .mp3. ROZWIĄZANE —
-   _resolve_result w engine.py wyciąga rzeczywistą ścieżkę PO postprocessingu.
-3. Brak wsparcia dla wyboru języka napisów/transkryptu — dla filmu z polskim 
-   audio tryb Napisy/Transkrypt nie generuje żadnego pliku. ROZWIĄZANE —
-   subtitleslangs jawnie ustawiane z wybranego języka (profiles.py).
-5. Komunikat dla trybu Transkrypt ujawnia wewnętrzną nazwę pliku 
-   (transcript_cleaner.py) — nieprofesjonalne dla użytkownika końcowego.
-   ROZWIĄZANE — placeholder usunięty, tryb faktycznie działa (patrz sekcja
-   "Tryb Transkrypt — zaimplementowany" niżej).
+Wszystkie rozwiązane (Sesja A — błędy silnika; Sesja B — rozbudowa UX, m.in.
+blokada URL/„Nowy URL", konwencja nazw plików). Szczegóły: `docs/HISTORIA.md`.
 
-Sesja B (rozbudowa UX — zaplanowana, jeszcze nie zaczęta):
-1. Blokada pola URL po wprowadzeniu + przycisk "Nowy URL" resetujący cały stan.
-4. Konwencja nazw pobieranych plików: Autor-Tytuł_wideo.jezyk.rozszerzenie 
-   (separator: łącznik).
-6. Zmiana trybu/formatu przy już pobranym pliku ma czyścić komunikaty 
-   i ukrywać "Zapisz plik".
+## Stan diagnozy — tryb Subtitle (2026-09-16, zamknięte)
 
-## Stan diagnozy — tryb Subtitle, sesja 2026-09-16 (kontynuacja)
-
-Kontekst: po naprawie 3 bugów (przedwczesny on_finished, fantomowa ścieżka .webm,
-filtr języków pl/de/en), tryb Subtitle nadal zgłaszał w przeglądarce
-"Zadanie zakończone, ale nie znaleziono pliku wynikowego" dla języków FAKTYCZNIE
-dostępnych — mimo że testy engine.py/job_runner.py (bezpośrednie i przez pełny
-JobRunner) przechodzą poprawnie dla tych samych scenariuszy (Manual EN/DE SRT,
-Manual EN VTT, Automatic PL SRT).
-
-Kluczowa obserwacja: JobRunner emituje DWA zdarzenia on_finished dla trybu
-Subtitle (pierwsze bez result_path, drugie z result_path) — inaczej niż
-Video/Audio (prawdopodobnie jedno on_finished od razu z path).
-
-Hipoteza (niepotwierdzona): pętla drenująca queue.Queue w app.py (wewnątrz
-st.fragment) może nie wyciągać wszystkich zdarzeń z kolejki w jednym cyklu
-odświeżenia, i/lub traktuje jako terminalne KAŻDE zdarzenie event_type=="finished"
-niezależnie od obecności result_path — co dla Subtitle skutkowałoby zatrzymaniem
-się na pierwszym (pustym) on_finished, zanim drugie (z prawidłową ścieżką)
-zostanie odczytane.
-
-Następny krok: zbadać dokładny mechanizm drenowania kolejki w app.py, naprawić
-tak by zawsze wyciągał wszystkie dostępne zdarzenia w jednym cyklu, dodać test
-AppTest symulujący dwa zdarzenia finished w jednej kolejce, potwierdzić testami
-i ponownym testem w przeglądarce PO TWARDYM RESTARCIE streamlit run app.py.
-
-Nic niecommitowane. Poprzednie 3 fixy (on_finished bez result_path traktowany
-jako informacyjny, .exists() guard w _resolve_result, filtr pl/de/en) są
-zweryfikowane testami, ale wciąż nie potwierdzone w przeglądarce z powodu
-powyższego, oddzielnego problemu.
-
-### Weryfikacja hipotezy (kontynuacja, ten sam dzień)
-
-Hipoteza "pętla drenująca nie wyciąga wszystkich zdarzeń w jednym cyklu"
-zweryfikowana i OBALONA: `_render_progress` w app.py już używa `while True: ...
-get_nowait() ... except Empty: break` — to WYCIĄGA cały zawartość kolejki
-w jednym cyklu fragmentu, poprawnie rozróżniając premature `on_finished`
-(result_path=None, tylko `set_progress`) od prawdziwie terminalnego
-(result_path ustawiony, ląduje w `terminal_event`).
-
-Dodano regresyjny test `test_both_finished_events_in_same_queue_batch_resolve_to_done`
-w tests/test_app_smoke.py — symuluje DOKŁADNIE opisany scenariusz (oba zdarzenia
-w kolejce ZANIM fragment ją odpyta). Test PRZECHODZI bez żadnej zmiany w app.py —
-potwierdza, że kod już obsługuje ten przypadek poprawnie.
-
-Wynik: nie znaleziono dalszego błędu poprzez statyczną analizę + testy
-(engine.py bezpośrednio, JobRunner wątkowo, AppTest na poziomie UI) dla
-kombinacji: napisy manualne/automatyczne × SRT/VTT × 2 filmy testowe ×
-pojedyncze/wsadowe zdarzenia w kolejce. Jedyny napotkany błąd w tej sesji to
-zewnętrzny HTTP 429 z endpointu napisów YouTube (przejściowy rate-limit po
-wielu zapytaniach diagnostycznych) — generuje INNY komunikat ("Brak napisów
-w żądanym języku...") niż zgłoszony ("nie znaleziono pliku wynikowego").
-
-Status: zablokowane na braku konkretnej reprodukcji od użytkownika (URL +
-język + typ napisów manual/automatic + format SRT/VTT + dokładny komunikat
-z przeglądarki). Do potwierdzenia: świeży `streamlit run app.py` (restart,
-nie tylko hot-reload) i retest w przeglądarce.
-
-**OSTATECZNIE ZAMKNIĘTE (2026-09-16):** Trzykrotnie potwierdzone jako non-issue —
-(1) ręczny test w przeglądarce po twardym restarcie streamlita: działa; (2) testy
-izolowane engine.py/JobRunner: przechodzą; (3) dedykowany test regresyjny
-test_both_finished_events_in_same_queue_batch_resolve_to_done w test_app_smoke.py,
-symulujący dokładnie sporny scenariusz (dwa on_finished w jednej kolejce): przechodzi
-bez zmian w kodzie. _render_progress poprawnie drenuje całą kolejkę w pętli
-while/get_nowait/except Empty i poprawnie rozróżnia premature/terminal po result_path.
-Brak dalszego działania. Nie badać tego ponownie.
+Zgłoszony błąd ("zadanie zakończone, ale nie znaleziono pliku wynikowego" dla
+dostępnych języków napisów) nie miał przyczyny w pętli drenującej kolejkę —
+`_render_progress` w `app.py` poprawnie wyciąga WSZYSTKIE zdarzenia z
+`queue.Queue` w jednym cyklu i poprawnie rozróżnia premature/terminalny
+`on_finished` po `result_path`. Status: **zamknięte, nie badać ponownie** —
+potwierdzone testem manualnym po restarcie, testami engine.py/JobRunner i
+dedykowanym testem regresyjnym `test_both_finished_events_in_same_queue_batch_resolve_to_done`
+(`tests/test_app_smoke.py`). Pełny przebieg diagnozy: `docs/HISTORIA.md`.
 
 ## Tryb Transkrypt — zaimplementowany (2026-09-16)
 
-Reużywa całą infrastrukturę Subtitle (DownloadResult, _resolve_result,
-list_available_subtitles, naming.build_display_filename, JobRunner, kolejkę
-postępu w app.py). profiles.py::_transcript_profile wymusza subtitlesformat="vtt"
-niezależnie od output_format joba — transcript_cleaner.py czyści wyłącznie VTT.
-
-Pipeline w engine.py::_finalize_transcript (wołany z submit() po
-_resolve_result, tylko dla mode="transcript"):
-1. clean_vtt_to_text — usuwa nagłówek/tagi/znaczniki czasu, dedup LOKALNY
-   (tylko sąsiadujące linie — rolling captions YouTube) żeby nie usuwać
-   legalnych odległych powtórzeń tego samego zdania.
-2. format_paragraphs — dzieli oczyszczony tekst na akapity po 4 zdania
-   (podział po . ! ? z lookaheadem na wielką literę/cyfrę, żeby odróżnić
-   koniec zdania od skrótu typu "np."). Działa WYŁĄCZNIE na już
-   zdeduplikowanym tekście, nigdy na surowym VTT/znacznikach czasu.
-3. Zapis .txt, usunięcie oryginalnego .vtt — użytkownik dostaje tylko
-   czysty tekst, nigdy surowych napisów.
-
-Znany edge case (udokumentowany testem, nie wymaga fixu): filmy z bardzo
-krótkimi/nieformalnymi napisami manualnymi (np. "Me at the zoo", 19s) mogą
-mieć ZERO interpunkcji kończącej zdanie — cały transkrypt wychodzi jako
-jeden akapit. To jest poprawne zachowanie (nie ma zdań do podziału), nie bug.
-Test end-to-end z podziałem na akapity (test_engine_submit_transcript_downloads_and_cleans_manual_caption_to_txt)
-używa więc LONG_TEST_VIDEO_URL (TED talk, ~20 min, manualne napisy EN z
-realną interpunkcją) — TEST_VIDEO_URL do tego nie wystarcza strukturalnie.
-
-Drugi udokumentowany edge case (w kodzie transcript_cleaner.py, niekrytyczny):
-skrót przed WIELKĄ literą ("godz. Warszawa nie śpi") wygląda identycznie jak
-koniec zdania i zostanie rozdzielony — rzadkie w praktyce (YouTube
-auto-punktuacja jest uboga), nierozwiązywane bez słownika skrótów.
+Pipeline `engine.py::_finalize_transcript` (wołany z `submit()` po
+`_resolve_result`, tylko dla `mode="transcript"`): `clean_vtt_to_text` (usuwa
+nagłówek/tagi/znaczniki czasu, dedup LOKALNY sąsiadujących linii) →
+`format_paragraphs` (akapity po 4 zdania, z lookaheadem na skróty typu „np.") →
+zapis `.txt` i usunięcie oryginalnego `.vtt`. `profiles.py::_transcript_profile`
+wymusza `subtitlesformat="vtt"` niezależnie od formatu joba. Znane edge case'y
+(niekrytyczne, bez fixu): napisy bez interpunkcji dają jeden akapit (poprawne
+zachowanie); skrót przed wielką literą bywa mylnie rozdzielany jako koniec
+zdania. Pełny opis: `docs/HISTORIA.md`.
 
 ## Znane ograniczenie: filmy z ograniczeniem wiekowym dla zalogowanych sesji (2026-09-16)
 
@@ -370,8 +328,7 @@ po stronie konta użytkownika.
 ## Dziennik (2026-09-20): pętla retry przy pobieraniu pozycji playlisty
 
 Zgłoszenie: nieskończona pętla 403/connection timeout na 1 pozycji testowej
-15-elementowej playlisty (`PL6vMAFPIKMUgzavWeCoKvQXlRImrZr80f`), blokująca
-cały job do ręcznego Ctrl+C. Fix: timeout ścienny na pozycję (patrz „Zasady
-architektoniczne") + jawny `extractor_retries=3`. Wynik: fast suite 189 passed,
-manualny retest OK — pozycje 3 i 12 tej playlisty niepobieralne z YouTube
-także pojedynczo (problem po stronie YouTube, nie aplikacji).
+playlisty blokowała cały job. Fix: timeout ścienny na pozycję + jawny
+`extractor_retries=3` (patrz „Zasady architektoniczne", punkt o timeoucie).
+Wynik: testy zielone; pozycje sprawiające problem były niepobieralne z
+YouTube także pojedynczo (problem po stronie YouTube, nie aplikacji).
