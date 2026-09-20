@@ -6,7 +6,9 @@ Wymaga dostępu do internetu i ffmpeg na PATH.
 
 from __future__ import annotations
 
+import re
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -244,13 +246,17 @@ def test_engine_submit_transcript_mode_converts_vtt_to_txt(monkeypatch, tmp_path
     """Regresja: submit() w trybie transcript musi zwrócić .txt oczyszczony
     przez transcript_cleaner, a NIE surowy .vtt zwracany przez _resolve_result
     (dokładnie ta sama ścieżka rozwiązywania co Subtitle) — i musi usunąć
-    oryginalny plik .vtt (użytkownik dostaje tylko czysty tekst)."""
+    oryginalny plik .vtt (użytkownik dostaje tylko czysty tekst). Treść
+    kończy się stopką źródłową (patrz test_build_transcript_footer_format
+    dla dokładnego formatu) — tu sprawdzamy tylko, że treść WŁAŚCIWA
+    zostaje nienaruszona przed stopką."""
     vtt_path = tmp_path / "Video.en.vtt"
     vtt_path.write_text(
         "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello world.\n", encoding="utf-8"
     )
 
     fake_info = {
+        "webpage_url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
         "requested_subtitles": {"en": {"filepath": str(vtt_path)}},
         # Fantomowy wpis medialny (skip_download=True) — nigdy nie istnieje
         # na dysku, _resolve_result musi go zignorować (patrz .exists() guard).
@@ -277,10 +283,94 @@ def test_engine_submit_transcript_mode_converts_vtt_to_txt(monkeypatch, tmp_path
     result = engine.submit(job)
 
     assert result.path.suffix == ".txt"
-    assert result.path.read_text(encoding="utf-8") == "Hello world."
+    content = result.path.read_text(encoding="utf-8")
+    assert content.startswith("Hello world.\n\nŹródło: ")
     assert not vtt_path.exists()
     assert result.uploader == "Channel"
     assert result.title == "Video"
+
+
+def test_build_transcript_footer_format():
+    """Kryterium akceptacji (punkt 3, brief 2026-09-20): stopka dopisywana
+    do KAŻDEGO pliku TXT Transkryptu — "Autor-Tytuł" (ta sama konwencja co
+    naming.build_display_filename), link źródłowy i data/godzina pobrania
+    (czas serwera, bez sekund)."""
+    before = datetime.now()
+    footer = engine_module._build_transcript_footer(
+        "Channel", "My Video", "https://www.youtube.com/watch?v=abc123"
+    )
+    after = datetime.now()
+
+    match = re.fullmatch(
+        r"\n\nŹródło: Channel-My Video https://www\.youtube\.com/watch\?v=abc123 "
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2})",
+        footer,
+    )
+    assert match is not None
+    timestamp = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M")
+    assert before.replace(second=0, microsecond=0) <= timestamp <= after.replace(microsecond=0)
+
+
+def test_build_transcript_footer_falls_back_to_unknown_uploader_and_title():
+    footer = engine_module._build_transcript_footer(None, None, "https://www.youtube.com/watch?v=x")
+    assert "Źródło: Unknown-download https://www.youtube.com/watch?v=x " in footer
+
+
+def test_submit_playlist_transcript_mode_appends_footer_to_each_item(monkeypatch, tmp_path):
+    """Stopka źródłowa dotyczy też każdej pozycji playlisty (Transkrypt) —
+    _finalize_transcript jest wołane z _download_one, wspólnego dla submit()
+    i submit_playlist(), więc obie ścieżki muszą dostać stopkę identycznie."""
+    flat_info = _fake_flat_entries(2)
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        vtt_path = tmp_path / f"Video{item_number}.en.vtt"
+        vtt_path.write_text(
+            f"WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nTreść {item_number}.\n", encoding="utf-8"
+        )
+        return _FakeYDL(
+            opts,
+            {
+                "webpage_url": f"https://www.youtube.com/watch?v=vid{item_number}",
+                "requested_subtitles": {"en": {"filepath": str(vtt_path)}},
+                "uploader": "Channel",
+                "title": f"Video {item_number}",
+            },
+        )
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="transcript",
+        output_format="txt",
+        session_id="test-session",
+        job_id="test-job-playlist-transcript-footer",
+        playlist_scope="all",
+        subtitle_lang="en",
+    )
+
+    result = engine.submit_playlist(job)
+
+    assert [item.status for item in result.items] == ["done", "done"]
+    with zipfile.ZipFile(result.zip_path) as zf:
+        # zf.read() zwraca surowe bajty (bez uniwersalnego tłumaczenia \r\n),
+        # w przeciwieństwie do Path.read_text() użytego w innych testach —
+        # write_text() na Windows zapisuje \n jako \r\n, więc normalizujemy
+        # tu ręcznie, żeby porównanie było niezależne od platformy.
+        contents = [
+            zf.read(name).decode("utf-8").replace("\r\n", "\n") for name in sorted(zf.namelist())
+        ]
+
+    assert contents[0].startswith("Treść 1.\n\nŹródło: Channel-Video 1 https://www.youtube.com/watch?v=vid1 ")
+    assert contents[1].startswith("Treść 2.\n\nŹródło: Channel-Video 2 https://www.youtube.com/watch?v=vid2 ")
 
 
 def test_engine_submit_passes_cookiefile_to_every_ydl_instance(monkeypatch, tmp_path):
@@ -770,6 +860,169 @@ def test_submit_playlist_resumes_from_start_index_with_absolute_numbering(monkey
     assert names[2].startswith("05 - ")
 
 
+def test_submit_playlist_selected_indices_downloads_only_those_positions_in_order(monkeypatch, tmp_path):
+    """Punkt 4 (brief 2026-09-20): selected_indices ściąga TYLKO wskazane,
+    bezwzględne numery pozycji — w rosnącej kolejności niezależnie od
+    kolejności podanej przez użytkownika, z zachowaniem oryginalnej
+    numeracji w nazwach plików ("02 - ...", nie "01 - ...")."""
+    flat_info = _fake_flat_entries(5)
+    call_count = 0
+    attempted_ids: list[str] = []
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        attempted_ids.append(item_number)
+        media_path = tmp_path / f"RawVideo{item_number}.mp4"
+        media_path.write_bytes(b"fake mp4 bytes")
+        return _FakeYDL(
+            opts,
+            {
+                "requested_downloads": [{"filepath": str(media_path)}],
+                "uploader": "Channel",
+                "title": f"Video {item_number}",
+            },
+        )
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-selected",
+        playlist_scope="selected",
+    )
+
+    # Podane w nieposortowanej kolejności — wynik i numeracja mają być rosnące.
+    result = engine.submit_playlist(job, selected_indices=[4, 2])
+
+    assert len(attempted_ids) == 2  # tylko pozycje 2 i 4 — nie 1, 3, 5
+    assert [item.index for item in result.items] == [2, 4]
+    assert [item.status for item in result.items] == ["done", "done"]
+    assert result.next_start_index is None  # brak mechanizmu wznowienia dla "selected"
+
+    with zipfile.ZipFile(result.zip_path) as zf:
+        names = sorted(zf.namelist())
+    assert len(names) == 2
+    assert names[0].startswith("02 - ")
+    assert names[1].startswith("04 - ")
+
+
+def test_submit_playlist_selected_indices_out_of_range_raises(monkeypatch, tmp_path):
+    """Backstop na poziomie silnika (niezależny od walidacji app.py) —
+    numer pozycji poza zakresem 1..total podnosi EngineError, nie ściąga
+    niczego ani nie tworzy ZIP-a."""
+    flat_info = _fake_flat_entries(3)
+
+    def _fake_ydl_factory(opts: dict):
+        return _FakeYDL(opts, flat_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-selected-invalid",
+        playlist_scope="selected",
+    )
+
+    with pytest.raises(EngineError):
+        engine.submit_playlist(job, selected_indices=[2, 99])
+
+
+def test_submit_playlist_selected_indices_ignores_max_playlist_items_on_full_length(
+    monkeypatch, tmp_path
+):
+    """Punkt 4: limit MAX_PLAYLIST_ITEMS dla "selected" jest sprawdzany na
+    LICZBIE WYBRANYCH pozycji, nie na długości całej playlisty — inaczej
+    ten tryb byłby bezużyteczny dla długich playlist (dokładnie to, do
+    czego jest pomyślany: obejście 403 na 1-2 pozycjach z playlisty >10)."""
+    monkeypatch.setattr(engine_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "10"}))
+    flat_info = _fake_flat_entries(32)
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        media_path = tmp_path / f"RawVideo{item_number}.mp4"
+        media_path.write_bytes(b"fake mp4 bytes")
+        return _FakeYDL(opts, {"requested_downloads": [{"filepath": str(media_path)}]})
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-selected-over-total-limit",
+        playlist_scope="selected",
+    )
+
+    # 32-pozycyjna playlista przekracza MAX_PLAYLIST_ITEMS=10, ale tylko
+    # 2 pozycje są wybrane — nie może rzucić PlaylistTooLargeError.
+    result = engine.submit_playlist(job, selected_indices=[15, 21])
+
+    assert [item.status for item in result.items] == ["done", "done"]
+
+
+def test_submit_playlist_selected_indices_stop_on_zip_limit_marks_rest_skipped_without_resume(
+    monkeypatch, tmp_path
+):
+    """Zatrzymanie limitem ZIP-a w trybie "selected" oznacza pozostałe
+    WYBRANE (nie wszystkie playlistowe) pozycje jako skipped, bez
+    next_start_index — kontynuacja nie ma sensu dla nieciągłego wyboru."""
+    monkeypatch.setattr(engine_module, "settings", Settings.from_env({"MAX_ZIP_SIZE_MB": "1"}))
+    flat_info = _fake_flat_entries(5)
+    call_count = 0
+
+    def _fake_ydl_factory(opts: dict):
+        nonlocal call_count
+        call_count += 1
+        if "extract_flat" in opts:
+            return _FakeYDL(opts, flat_info)
+        item_number = call_count - 1
+        media_path = tmp_path / f"RawVideo{item_number}.mp4"
+        media_path.write_bytes(b"0" * int(0.6 * 1024 * 1024))
+        return _FakeYDL(opts, {"requested_downloads": [{"filepath": str(media_path)}]})
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    engine = DownloadEngine()
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-selected-zip-limit",
+        playlist_scope="selected",
+    )
+
+    result = engine.submit_playlist(job, selected_indices=[1, 3, 5])
+
+    assert result.stopped_early_reason is not None
+    assert [item.index for item in result.items] == [1, 3, 5]
+    assert [item.status for item in result.items] == ["done", "done", "skipped"]
+    assert result.next_start_index is None
+
+
 def test_submit_playlist_stop_on_last_entry_leaves_next_start_index_none(monkeypatch, tmp_path):
     """Edge case (Faza 2c): zatrzymanie limitem ZIP-a dokładnie na OSTATNIEJ
     pozycji playlisty → next_start_index musi zostać None (nic do
@@ -1010,6 +1263,29 @@ def test_list_available_subtitles_passes_cookiefile_pointing_to_real_file_with_c
     # Sprzątnięty natychmiast po sondzie — ta funkcja nie ma job_dir do
     # późniejszego storage.cleanup(), więc musi posprzątać sama.
     assert not captured_cookiefile_path[0].exists()
+
+
+def test_list_available_subtitles_forces_noplaylist_for_mixed_video_and_list_url(monkeypatch):
+    """Regresja (2026-09-20): dla URL-a z v= i list= (typowy "wideo z
+    autoplaya playlisty"), bez noplaylist=True yt-dlp zwraca info_dict
+    PLAYLISTY (entries), nie wideo — 'subtitles'/'automatic_captions' nie
+    istnieją na tym poziomie, więc tryb "tylko to wideo" + Transkrypt/Napisy
+    fałszywie zgłaszał "nie znaleziono napisów", mimo że napisy istniały."""
+    fake_info = {"subtitles": {"en": {}}, "automatic_captions": {}}
+    captured_opts: list[dict] = []
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        captured_opts.append(opts)
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+
+    result = engine_module.list_available_subtitles(
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLsomeplaylist"
+    )
+
+    assert result == {"manual": ["en"], "automatic": []}
+    assert captured_opts[0]["noplaylist"] is True
 
 
 @pytest.mark.slow
