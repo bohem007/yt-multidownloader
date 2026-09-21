@@ -502,12 +502,12 @@ def test_engine_submit_skips_playlist_limit_probe_when_scope_is_single(monkeypat
     assert call_count == 1  # tylko główne pobranie, żadnej sondy
 
 
-def test_engine_submit_skips_playlist_limit_probe_for_subtitle_mode_even_with_all_scope(
+def test_engine_submit_runs_playlist_limit_probe_for_subtitle_mode_with_all_scope(
     monkeypatch, tmp_path
 ):
-    """Limit liczby pozycji nie dotyczy Subtitle/Transcript (app.py) — sonda
-    _check_playlist_limit musi być pominięta nawet gdy playlist_scope=="all",
-    jeśli mode nie jest video/audio."""
+    """Limit liczby pozycji obowiązuje we WSZYSTKICH trybach — sonda
+    _check_playlist_limit musi się wykonać także dla Subtitle/Transcript, gdy
+    playlist_scope=="all" (tak jak dla video/audio)."""
     vtt_path = tmp_path / "Video.en.vtt"
     vtt_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHi.\n", encoding="utf-8")
     fake_info = {"requested_subtitles": {"en": {"filepath": str(vtt_path)}}}
@@ -535,7 +535,42 @@ def test_engine_submit_skips_playlist_limit_probe_for_subtitle_mode_even_with_al
 
     engine.submit(job)
 
-    assert call_count == 1  # tylko główne pobranie, żadnej sondy limitu
+    assert call_count == 2  # sonda limitu + główne pobranie
+
+
+def test_engine_submit_rejects_over_limit_playlist_for_subtitle_mode_with_all_scope(
+    monkeypatch, tmp_path
+):
+    download_attempted = False
+    flat_info = {
+        "_type": "playlist",
+        "entries": [{"id": f"video{i}"} for i in range(settings.max_playlist_items + 5)],
+    }
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        nonlocal download_attempted
+        if "extract_flat" not in opts:
+            download_attempted = True
+        return _FakeYDL(opts, flat_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    job = DownloadJob(
+        url="https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq",
+        mode="transcript",
+        output_format="txt",
+        session_id="test-session",
+        job_id="test-job-transcript-all-scope-over-limit",
+        subtitle_lang="en",
+        playlist_scope="all",
+    )
+
+    with pytest.raises(EngineError) as exc_info:
+        DownloadEngine().submit(job)
+
+    assert isinstance(exc_info.value.original_exception, PlaylistTooLargeError)
+    assert download_attempted is False
 
 
 def test_check_playlist_limit_uses_in_playlist_flat_mode_not_bool(monkeypatch):
@@ -1043,8 +1078,8 @@ def test_submit_playlist_selected_indices_out_of_range_raises(monkeypatch, tmp_p
 def test_submit_playlist_selected_indices_ignores_max_playlist_items_on_full_length(
     monkeypatch, tmp_path
 ):
-    """Punkt 4: limit MAX_PLAYLIST_ITEMS dla "selected" jest sprawdzany na
-    LICZBIE WYBRANYCH pozycji, nie na długości całej playlisty — inaczej
+    """Punkt 4: limit MAX_PLAYLIST_ITEMS dla "selected" liczy się od
+    LICZBY WYBRANYCH pozycji, nie od długości całej playlisty — inaczej
     ten tryb byłby bezużyteczny dla długich playlist (dokładnie to, do
     czego jest pomyślany: obejście 403 na 1-2 pozycjach z playlisty >10)."""
     monkeypatch.setattr(engine_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "10"}))
@@ -1075,7 +1110,7 @@ def test_submit_playlist_selected_indices_ignores_max_playlist_items_on_full_len
     )
 
     # 32-pozycyjna playlista przekracza MAX_PLAYLIST_ITEMS=10, ale tylko
-    # 2 pozycje są wybrane — nie może rzucić PlaylistTooLargeError.
+    # 2 pozycje są wybrane — limit liczy się od wybranych, więc nic nie jest przycinane.
     result = engine.submit_playlist(job, selected_indices=[15, 21])
 
     assert [item.status for item in result.items] == ["done", "done"]
@@ -1168,125 +1203,6 @@ def test_submit_playlist_stop_on_last_entry_leaves_next_start_index_none(monkeyp
     assert result.next_start_index is None
 
 
-def test_submit_playlist_max_playlist_items_checked_on_full_length_not_remaining(
-    monkeypatch, tmp_path
-):
-    """Faza 2c: MAX_PLAYLIST_ITEMS jest sprawdzany na PEŁNEJ długości
-    playlisty, PRZED slice'em start_index — wznowienie nie omija tej
-    bramki (nawet gdy pozycje OD start_index są już pod limitem)."""
-    total = settings.max_playlist_items + 5
-    flat_info = _fake_flat_entries(total)
-    download_attempted = False
-
-    def _fake_ydl_factory(opts: dict):
-        nonlocal download_attempted
-        if "extract_flat" in opts:
-            return _FakeYDL(opts, flat_info)
-        download_attempted = True
-        return _FakeYDL(opts, {})
-
-    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
-    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
-
-    engine = DownloadEngine()
-    job = DownloadJob(
-        url=PLAYLIST_ONLY_URL,
-        mode="video",
-        output_format="mp4",
-        session_id="test-session",
-        job_id="test-job-playlist-resume-over-limit",
-        playlist_scope="all",
-    )
-
-    # start_index dostatecznie duży, żeby "pozycje od start_index" osobno
-    # zmieściłyby się pod limitem — bramka musi mimo to zadziałać, bo liczy
-    # PEŁNĄ długość (total), nie total - start_index + 1.
-    with pytest.raises(EngineError) as exc_info:
-        engine.submit_playlist(job, start_index=total - settings.max_playlist_items + 1)
-
-    assert isinstance(exc_info.value.original_exception, PlaylistTooLargeError)
-    assert download_attempted is False
-
-
-def test_submit_playlist_raises_before_downloading_when_over_limit_for_video_mode(
-    monkeypatch, tmp_path
-):
-    """Kryterium akceptacji 4: Tryb video/audio, liczba pozycji > MAX_PLAYLIST_ITEMS
-    → submit_playlist() rzuca PlaylistTooLargeError PRZED próbą pobrania
-    czegokolwiek (zabezpieczenie na poziomie silnika, nie tylko UI)."""
-    flat_info = _fake_flat_entries(settings.max_playlist_items + 5)
-    download_attempted = False
-
-    def _fake_ydl_factory(opts: dict):
-        nonlocal download_attempted
-        if "extract_flat" in opts:
-            return _FakeYDL(opts, flat_info)
-        download_attempted = True
-        return _FakeYDL(opts, {})
-
-    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
-    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
-
-    engine = DownloadEngine()
-    job = DownloadJob(
-        url=PLAYLIST_ONLY_URL,
-        mode="video",
-        output_format="mp4",
-        session_id="test-session",
-        job_id="test-job-playlist-over-limit",
-        playlist_scope="all",
-    )
-
-    with pytest.raises(EngineError) as exc_info:
-        engine.submit_playlist(job)
-
-    assert isinstance(exc_info.value.original_exception, PlaylistTooLargeError)
-    assert download_attempted is False
-
-
-def test_submit_playlist_allows_over_limit_for_subtitle_mode(monkeypatch, tmp_path):
-    """Kryterium akceptacji 5: Tryb subtitle/transcript, liczba pozycji >
-    MAX_PLAYLIST_ITEMS → brak błędu limitu, pętla rusza normalnie i
-    przetwarza WSZYSTKIE pozycje."""
-    entries_count = settings.max_playlist_items + 3
-    flat_info = _fake_flat_entries(entries_count)
-    call_count = 0
-
-    def _fake_ydl_factory(opts: dict):
-        nonlocal call_count
-        call_count += 1
-        if "extract_flat" in opts:
-            return _FakeYDL(opts, flat_info)
-        item_number = call_count - 1
-        vtt_path = tmp_path / f"RawVideo{item_number}.en.vtt"
-        vtt_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHi.\n", encoding="utf-8")
-        return _FakeYDL(
-            opts,
-            {
-                "requested_subtitles": {"en": {"filepath": str(vtt_path)}},
-                "uploader": "Channel",
-                "title": f"Video {item_number}",
-            },
-        )
-
-    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
-    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
-
-    engine = DownloadEngine()
-    job = DownloadJob(
-        url=PLAYLIST_ONLY_URL,
-        mode="subtitle",
-        output_format="srt",
-        session_id="test-session",
-        job_id="test-job-playlist-subtitle-over-limit",
-        subtitle_lang="en",
-        playlist_scope="all",
-    )
-
-    result = engine.submit_playlist(job)
-
-    assert len(result.items) == entries_count
-    assert all(item.status == "done" for item in result.items)
 
 
 @pytest.mark.slow

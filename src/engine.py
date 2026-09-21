@@ -389,12 +389,15 @@ class DownloadEngine:
             # wideo), więc bez cookiefile TUTAJ żądanie nigdy nie dociera do
             # dalszej części submit(), która cookies faktycznie miała.
             #
-            # Wołana TYLKO gdy playlist_scope=="all" i mode w (video, audio):
-            # dla "single" noplaylist=True i tak ściągnie jedno wideo
-            # niezależnie od tego, ile pozycji ma playlista w URL-u (sonda
-            # byłaby zbędnym zapytaniem do YouTube) — a limit liczby pozycji
-            # w ogóle nie dotyczy Subtitle/Transcript (patrz app.py).
-            if job.playlist_scope == "all" and job.mode in ("video", "audio"):
+            # Wołana TYLKO gdy playlist_scope=="all" (we wszystkich trybach —
+            # limit obowiązuje też dla Subtitle/Transcript): dla "single"
+            # noplaylist=True i tak ściągnie jedno wideo niezależnie od tego,
+            # ile pozycji ma playlista w URL-u (sonda byłaby zbędnym
+            # zapytaniem do YouTube). Ścieżka historyczna: JobRunner kieruje
+            # "all"/"selected" do submit_playlist(), które PRZYCINA do
+            # MAX_PLAYLIST_ITEMS — tu, przy bezpośrednim wywołaniu submit()
+            # z scope "all", zostaje twarde odrzucenie (jeden plik wynikowy).
+            if job.playlist_scope == "all":
                 self._check_playlist_limit(job.url, cookiefile_path)
 
             result = self._download_one(job.url, job, job_dir, cookiefile_path, on_event)
@@ -523,9 +526,15 @@ class DownloadEngine:
         """Pobiera pozycje playlisty (job.playlist_scope in ("all", "selected"))
         do jednego ZIP-a. Błąd pojedynczej pozycji NIE przerywa reszty
         (decyzja produktowa: pomiń, kontynuuj, zbierz raport w items) —
-        tylko błędy na poziomie CAŁEGO joba (walidacja URL, sonda, limit
-        MAX_PLAYLIST_ITEMS) trafiają do zewnętrznego except/EngineError,
-        tak jak w submit().
+        tylko błędy na poziomie CAŁEGO joba (walidacja URL, sonda)
+        trafiają do zewnętrznego except/EngineError, tak jak w submit().
+
+        MAX_PLAYLIST_ITEMS PRZYCINA zadanie (nie blokuje): "all" obejmuje
+        pozycje 1..N (bezwzględne), "selected" — pierwsze N z posortowanych
+        wybranych. Pozycje ponad limit nie trafiają do raportu (ani jako
+        "skipped" — mogłyby być setki wpisów); o przycięciu informuje UI
+        przed startem. Dotyczy wszystkich trybów; migawka Mix/Radio ma
+        własny limit (MAX_PLAYLIST_RD_ITEMS, wbudowany w jej rozmiar).
 
         `start_index` (Faza 2c) pozwala wznowić CIĄGŁE pobieranie
         ("all") po wcześniejszym zatrzymaniu z powodu MAX_ZIP_SIZE_MB —
@@ -536,10 +545,10 @@ class DownloadEngine:
         WYŁĄCZNIE wskazane, bezwzględne numery pozycji — obejście dla
         przejściowych błędów 403 na pojedynczych pozycjach bez ściągania
         całej playlisty od nowa. Wzajemnie wyłączne ze `start_index`
-        (ignorowany, gdy podane). Limit MAX_PLAYLIST_ITEMS jest wtedy
-        sprawdzany na LICZBIE WYBRANYCH pozycji, nie na długości całej
-        playlisty — inaczej ten tryb byłby bezużyteczny dla dokładnie tych
-        długich playlist, do których jest pomyślany. Mechanizm wznowienia
+        (ignorowany, gdy podane). Limit MAX_PLAYLIST_ITEMS liczy się wtedy
+        od LICZBY WYBRANYCH pozycji, nie od długości całej playlisty —
+        inaczej ten tryb byłby bezużyteczny dla dokładnie tych długich
+        playlist, do których jest pomyślany. Mechanizm wznowienia
         (next_start_index) NIE działa dla tego trybu — wybór jest z natury
         nieciągły, więc zatrzymanie limitem ZIP-a po prostu oznacza
         pozostałe wybrane pozycje jako "skipped", bez next_start_index."""
@@ -564,35 +573,30 @@ class DownloadEngine:
                 entries = entries or []
             total = len(entries)
 
+            # Niezależny od UI backstop PRZYCINAJĄCY (nie blokujący) — patrz
+            # docstring. Migawka Mix/Radio jest z konstrukcji ≤ MAX_PLAYLIST_RD_ITEMS
+            # (snapshot_playlist), a ten limit ZASTĘPUJE tu MAX_PLAYLIST_ITEMS.
+            item_limit = None if job.playlist_snapshot is not None else settings.max_playlist_items
+
             if selected_indices is not None:
                 ordered_indices = sorted(set(selected_indices))
+                # Walidacja zakresu PRZED przycięciem — numer spoza playlisty
+                # jest błędem niezależnie od tego, czy mieści się w limicie.
                 invalid = [i for i in ordered_indices if i < 1 or i > total]
                 if invalid:
                     raise InvalidPlaylistSelectionError(
                         f"nieprawidłowe numery pozycji {invalid} (playlista ma {total} pozycji)"
                     )
+                if item_limit is not None:
+                    ordered_indices = ordered_indices[:item_limit]
                 remaining_entries = [(idx, entries[idx - 1]) for idx in ordered_indices]
             else:
-                remaining_entries = list(enumerate(entries[start_index - 1 :], start=start_index))
-
-            # Zabezpieczenie na poziomie SILNIKA, nie tylko UI (Faza 2b) —
-            # limit liczby pozycji nie dotyczy Subtitle/Transcript (te same
-            # zasady co _check_playlist_limit w submit()). Dla "all"
-            # sprawdzany na PEŁNEJ długości playlisty (przed slice'em
-            # start_index) — wznowienie nie omija tej bramki ani jej nie
-            # duplikuje. Dla "selected" sprawdzany na LICZBIE WYBRANYCH
-            # pozycji (patrz docstring) — total playlisty jest tu celowo
-            # nieistotny.
-            limited_count = len(remaining_entries) if selected_indices is not None else total
-            # Migawka Mix/Radio jest z konstrukcji ≤ MAX_PLAYLIST_RD_ITEMS
-            # (snapshot_playlist), a ten limit ZASTĘPUJE tu MAX_PLAYLIST_ITEMS.
-            if (
-                job.playlist_snapshot is None
-                and job.mode in ("video", "audio")
-                and limited_count > settings.max_playlist_items
-            ):
-                raise PlaylistTooLargeError(
-                    f"{limited_count} pozycji do pobrania, limit to {settings.max_playlist_items}"
+                # Zakres to pozycje 1..range_total (bezwzględne); wznowienie
+                # (start_index) działa WEWNĄTRZ niego, więc next_start_index
+                # nigdy nie wychodzi poza limit.
+                range_total = total if item_limit is None else min(total, item_limit)
+                remaining_entries = list(
+                    enumerate(entries[start_index - 1 : range_total], start=start_index)
                 )
 
             items: list[PlaylistItemResult] = []
@@ -634,8 +638,8 @@ class DownloadEngine:
                     percent = processed_count / total_to_process * 100 if total_to_process else 100.0
                     progress_message = f"Pobrano {processed_count} z {total_to_process} wybranych pozycji"
                 else:
-                    percent = position / total * 100 if total else 100.0
-                    progress_message = f"Pobrano {position} z {total} pozycji"
+                    percent = position / range_total * 100 if range_total else 100.0
+                    progress_message = f"Pobrano {position} z {range_total} pozycji"
                 self._emit(on_event, "on_progress", percent, progress_message)
 
                 if size_limit_exceeded:
@@ -651,7 +655,7 @@ class DownloadEngine:
                     else:
                         stopped_early_reason = (
                             f"Przekroczono limit rozmiaru ZIP-a ({settings.max_zip_size_mb} MB) "
-                            f"po pozycji {position} z {total} — pominięto pozostałe."
+                            f"po pozycji {position} z {range_total} — pominięto pozostałe."
                         )
                         if remaining_after:
                             # Faza 2c — jest jeszcze co wznowić; None (domyślne)
