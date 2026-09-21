@@ -188,35 +188,13 @@ def test_playlist_only_url_shows_radio_with_no_single_video_option(monkeypatch):
     assert at.session_state["playlist_scope"] == "all"
 
 
-def test_playlist_scope_all_over_limit_blocks_download_for_video_mode(monkeypatch):
-    """N > MAX_PLAYLIST_ITEMS dla Video musi zablokować przycisk "Pobierz"
-    PRZED kliknięciem, z komunikatem podającym realny limit — nie zaszytą
-    liczbę. settings PINOWANE monkeypatchem (nie ambient .env developera) —
-    bez tego test byłby niedeterministyczny: przechodzi/pada zależnie od
-    tego, co akurat ma lokalny .env (patrz diagnoza "zaszyta wartość 10")."""
-    monkeypatch.setattr(config_module, "settings", Settings.from_env({}))
-    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 15)
 
-    at = _run_app(monkeypatch)
-    at.text_input(key="url_input").input(
-        "https://www.youtube.com/watch?v=mixedtest2&list=PLmixedtest2"
-    ).run()
-    at.radio(key="playlist_scope_radio").set_value("Cała playlista (15 pozycji)").run()
-
-    assert not at.exception
-    # Tryb domyślny (pierwsza opcja selectboxa) to Video — limit obowiązuje.
-    assert at.button(key="download_button").proto.disabled is True
-    warning_messages = [w.value for w in at.warning]
-    assert any("15" in message and "10" in message for message in warning_messages)
-
-
-def test_playlist_scope_all_gating_uses_configured_limit_not_hardcoded_default(monkeypatch):
-    """Regresja: dotychczasowe testy limitu playlisty zawsze porównywały
-    przeciw domyślnej wartości MAX_PLAYLIST_ITEMS=10 — literalna "10"
-    zaszyta w gatingu/komunikacie zamiast settings.max_playlist_items
-    przechodziłaby więc niezauważona. Tu limit jest jawnie skonfigurowany
-    na NIEDOMYŚLNĄ wartość (5) w obie strony sprawdzenia: liczba pozycji
-    (7) > 5 musi zablokować przycisk, a komunikat musi podawać "5", nie "10"."""
+def test_playlist_scope_all_trimming_uses_configured_limit_not_hardcoded_default(monkeypatch):
+    """Regresja: literalna "10" zaszyta w etykiecie/komunikacie zamiast
+    settings.max_playlist_items przechodziłaby niezauważona, gdyby testy
+    zawsze używały domyślnego limitu. Tu limit jest jawnie skonfigurowany na
+    NIEDOMYŚLNĄ wartość (5): etykieta i informacja muszą podawać "5" (z 7),
+    nie "10", a przycisk pozostaje aktywny (przycinanie, nie blokada)."""
     monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "5"}))
     monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 7)
 
@@ -224,13 +202,14 @@ def test_playlist_scope_all_gating_uses_configured_limit_not_hardcoded_default(m
     at.text_input(key="url_input").input(
         "https://www.youtube.com/watch?v=configtest1&list=PLconfigtest1"
     ).run()
-    at.radio(key="playlist_scope_radio").set_value("Cała playlista (7 pozycji)").run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (pierwsze 5 z 7)").run()
 
     assert not at.exception
-    assert at.button(key="download_button").proto.disabled is True
-    warning_messages = [w.value for w in at.warning]
-    assert any("7" in message and "5" in message for message in warning_messages)
-    assert not any("10" in message for message in warning_messages)
+    assert at.button(key="download_button").proto.disabled is False
+    info_messages = [i.value for i in at.info]
+    assert any("7" in message and "5" in message for message in info_messages)
+    assert not any("10" in message for message in info_messages)
+    assert not at.warning and not at.error
 
 
 def test_playlist_scope_all_allows_download_under_configured_higher_limit(monkeypatch):
@@ -251,27 +230,6 @@ def test_playlist_scope_all_allows_download_under_configured_higher_limit(monkey
     assert at.button(key="download_button").proto.disabled is False
     assert not any(w.value for w in at.warning)
 
-
-def test_playlist_scope_all_over_limit_does_not_block_download_for_subtitle_mode(monkeypatch):
-    """Limit liczby pozycji NIE dotyczy Subtitle/Transcript — przycisk
-    "Pobierz" nie może być blokowany przez playlist_limit_exceeded dla
-    tych trybów, niezależnie od N."""
-    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 15)
-    monkeypatch.setattr(
-        engine_module,
-        "list_available_subtitles",
-        lambda url, cookie_data=None: {"manual": ["en"], "automatic": []},
-    )
-
-    at = _run_app(monkeypatch)
-    at.text_input(key="url_input").input(
-        "https://www.youtube.com/watch?v=mixedtest3&list=PLmixedtest3"
-    ).run()
-    at.radio(key="playlist_scope_radio").set_value("Cała playlista (15 pozycji)").run()
-    at.selectbox(key="mode_select").select("Napisy (SRT / VTT)").run()
-
-    assert not at.exception
-    assert at.button(key="download_button").proto.disabled is False
 
 
 def test_clicking_download_with_playlist_scope_all_starts_real_job(monkeypatch, tmp_path):
@@ -372,25 +330,6 @@ def test_selected_scope_rejects_duplicates_and_out_of_range(monkeypatch):
     assert at.button(key="download_button").proto.disabled is True
     assert any("poza zakresem" in e.value and "21" in e.value for e in at.error)
 
-
-def test_selected_scope_over_max_playlist_items_blocks_video_mode(monkeypatch):
-    """Punkt 4: limit MAX_PLAYLIST_ITEMS dla "selected" dotyczy LICZBY
-    WYBRANYCH pozycji, nie długości całej playlisty (settings PINOWANE,
-    nie ambient .env — patrz test_playlist_scope_all_over_limit_...)."""
-    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "2"}))
-    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 32)
-
-    at = _run_app(monkeypatch)
-    at.text_input(key="url_input").input(
-        "https://www.youtube.com/watch?v=selectedtest4&list=PLselectedtest4"
-    ).run()
-    at.radio(key="playlist_scope_radio").set_value("Wybrane numery wideo z playlisty").run()
-    at.text_input(key="selected_indices_input").input("5, 10, 15").run()
-
-    assert not at.exception
-    assert at.button(key="download_button").proto.disabled is True
-    warning_messages = [w.value for w in at.warning]
-    assert any("Wybrano 3 pozycji" in m and "limit" in m for m in warning_messages)
 
 
 def test_clicking_download_with_selected_indices_passes_them_to_job(monkeypatch, tmp_path):
@@ -1589,6 +1528,7 @@ def test_mix_subtitle_probe_uses_first_snapshot_item_without_rereading_the_mix(m
 
 def test_regular_playlist_url_does_not_use_snapshot(monkeypatch):
     """Regresja: URL zwykłej playlisty (PL…) nadal idzie przez count_playlist_items."""
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "200"}))
     snapshot_calls, count_calls = _patch_mix_engine(monkeypatch)
     url = "https://www.youtube.com/watch?v=regplaylist1&list=PLregplaylist1"
 
@@ -1600,3 +1540,266 @@ def test_regular_playlist_url_does_not_use_snapshot(monkeypatch):
     assert count_calls == [url]
     assert at.radio(key="playlist_scope_radio").options[1] == "Cała playlista (99 pozycji)"
     assert at.session_state["playlist_snapshot"] is None
+
+
+# --- MAX_PLAYLIST_ITEMS przycina zadanie (nie blokuje) we WSZYSTKICH trybach --
+
+ALL_MODE_LABELS = ["Video (MP4)", "Audio (MP3 / FLAC)", "Napisy (SRT / VTT)", "Transkrypt (TXT)"]
+MODE_EXTENSIONS = {
+    "Video (MP4)": "mp4",
+    "Audio (MP3 / FLAC)": "mp3",
+    "Napisy (SRT / VTT)": "srt",
+    "Transkrypt (TXT)": "txt",
+}
+
+
+def _limit_test_url(kind: str, mode_label: str) -> str:
+    # unikalny URL na przypadek — sondy UI są cache'owane (st.cache_data) po URL-u
+    seed = f"{kind}{''.join(ch for ch in mode_label if ch.isalnum())}"
+    return f"https://www.youtube.com/watch?v={seed}&list=PL{seed}"
+
+
+def _open_playlist_in_mode(monkeypatch, url: str, scope_label: str, mode_label: str) -> AppTest:
+    # Hermetycznie: w trybie napisów UI woła obie sondy (język napisów oraz
+    # reprezentatywne wideo playlisty) — bez podstawienia poszłyby do sieci.
+    monkeypatch.setattr(engine_module, "resolve_representative_video_url", lambda url, cookie_data=None: None)
+    monkeypatch.setattr(
+        engine_module,
+        "list_available_subtitles",
+        lambda url, cookie_data=None: {"manual": ["en"], "automatic": []},
+    )
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(url).run()
+    at.radio(key="playlist_scope_radio").set_value(scope_label).run()
+    at.selectbox(key="mode_select").select(mode_label).run()
+    return at
+
+
+@pytest.mark.parametrize("mode_label", ALL_MODE_LABELS)
+def test_playlist_scope_all_over_limit_trims_with_info_and_keeps_download_enabled(
+    monkeypatch, mode_label
+):
+    """Playlista (15) dłuższa niż limit (10, PINOWANY): "Pobierz" zostaje
+    aktywny, etykieta zakresu pokazuje przycięcie, a użytkownik dostaje
+    spokojną informację (st.info — nie warning/error), bez nazwy trybu i bez
+    prośby o "krótszą playlistę"."""
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "10"}))
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 15)
+
+    at = _open_playlist_in_mode(
+        monkeypatch,
+        _limit_test_url("trimall", mode_label),
+        "Cała playlista (pierwsze 10 z 15)",
+        mode_label,
+    )
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+    info_messages = [i.value for i in at.info]
+    assert len(info_messages) == 1
+    assert "15" in info_messages[0] and "pierwsze 10" in info_messages[0]
+    assert "Wybrane numery" in info_messages[0]
+    assert mode_label not in info_messages[0] and "krótszą" not in info_messages[0]
+    assert not at.warning and not at.error
+    assert at.session_state["playlist_scope"] == "all"
+
+
+@pytest.mark.parametrize("mode_label", ALL_MODE_LABELS)
+def test_playlist_scope_all_at_limit_shows_no_info_in_every_mode(monkeypatch, mode_label):
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "10"}))
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 10)
+
+    at = _open_playlist_in_mode(
+        monkeypatch, _limit_test_url("trimok", mode_label), "Cała playlista (10 pozycji)", mode_label
+    )
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+    assert not at.info and not at.warning and not at.error
+
+
+@pytest.mark.parametrize("mode_label", ALL_MODE_LABELS)
+def test_selected_scope_over_limit_trims_with_info_and_keeps_download_enabled(monkeypatch, mode_label):
+    """Wybrano 3 pozycje przy limicie 2 — pobierzemy pierwsze 2 z wybranych."""
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "2"}))
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 32)
+
+    at = _open_playlist_in_mode(
+        monkeypatch,
+        _limit_test_url("trimsel", mode_label),
+        "Wybrane numery wideo z playlisty",
+        mode_label,
+    )
+    at.text_input(key="selected_indices_input").input("5, 10, 15").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+    info_messages = [i.value for i in at.info]
+    assert len(info_messages) == 1
+    assert "Wybrano 3 pozycji" in info_messages[0] and "pierwsze 2" in info_messages[0]
+    assert mode_label not in info_messages[0]
+    assert not at.warning and not at.error
+
+
+@pytest.mark.parametrize("mode_label", ALL_MODE_LABELS)
+def test_selected_scope_within_limit_of_a_long_playlist_shows_no_info(monkeypatch, mode_label):
+    """Playlista (32) dłuższa niż limit (10), ale wybrane 2 pozycje — bez zmian."""
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "10"}))
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 32)
+
+    at = _open_playlist_in_mode(
+        monkeypatch,
+        _limit_test_url("trimfew", mode_label),
+        "Wybrane numery wideo z playlisty",
+        mode_label,
+    )
+    at.text_input(key="selected_indices_input").input("5, 10").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+    assert not at.info and not at.warning and not at.error
+
+
+def test_mix_snapshot_in_subtitle_mode_ignores_max_playlist_items(monkeypatch):
+    """Mix/Radio (RD) w trybie napisów: limit to MAX_PLAYLIST_RD_ITEMS
+    (wbudowany w migawkę), nie MAX_PLAYLIST_ITEMS — 20 pozycji przy limicie
+    zwykłych playlist 10 nie jest przycinane ani komunikowane jako przycięcie."""
+    monkeypatch.setattr(
+        config_module,
+        "settings",
+        Settings.from_env({"MAX_PLAYLIST_ITEMS": "10", "MAX_PLAYLIST_RD_ITEMS": "20"}),
+    )
+    _patch_mix_engine(monkeypatch, count=20)
+    monkeypatch.setattr(
+        engine_module,
+        "list_available_subtitles",
+        lambda url, cookie_data=None: {"manual": ["en"], "automatic": []},
+    )
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(_mix_url("mixsublimit1")).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (do 20 pozycji)").run()
+    at.selectbox(key="mode_select").select("Napisy (SRT / VTT)").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+    assert not at.info
+
+
+# --- end-to-end: prawdziwy silnik, podstawiony yt_dlp -----------------------
+
+
+class _E2EYDL:
+    def __init__(self, opts: dict, on_extract) -> None:
+        self._on_extract = on_extract
+
+    def __enter__(self) -> "_E2EYDL":
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+    def extract_info(self, url: str, download: bool = True) -> dict:
+        return self._on_extract(url)
+
+
+def _install_e2e_engine(monkeypatch, tmp_path, mode_label: str, total: int, limit: int) -> list[str]:
+    """Prawdziwy DownloadEngine.submit_playlist z podstawionym YoutubeDL.
+    Zwraca listę id faktycznie pobranych wideo (kolejność pobrań)."""
+    pinned = Settings.from_env({"MAX_PLAYLIST_ITEMS": str(limit)})
+    monkeypatch.setattr(config_module, "settings", pinned)
+    monkeypatch.setattr(engine_module, "settings", pinned)
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: total)
+
+    job_dir = tmp_path / "job"
+    monkeypatch.setattr(
+        engine_module.storage, "create", lambda session_id, job_id: (job_dir.mkdir(exist_ok=True), job_dir)[1]
+    )
+    flat = {
+        "_type": "playlist",
+        "title": "Playlista testowa",
+        "entries": [{"id": f"e2e{i}", "title": f"Tytuł {i}"} for i in range(1, total + 1)],
+    }
+    downloaded: list[str] = []
+
+    def _download_info(url: str) -> dict:
+        video_id = url.split("v=")[1]
+        downloaded.append(video_id)
+        if mode_label in ("Napisy (SRT / VTT)", "Transkrypt (TXT)"):
+            vtt_path = job_dir / f"{video_id}.en.vtt"
+            vtt_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nTreść.\n", encoding="utf-8")
+            return {
+                "webpage_url": url,
+                "requested_subtitles": {"en": {"filepath": str(vtt_path)}},
+                "uploader": "Channel",
+                "title": f"Video {video_id}",
+            }
+        ext = "mp4" if mode_label == "Video (MP4)" else "mp3"
+        media_path = job_dir / f"{video_id}.{ext}"
+        media_path.write_bytes(b"fake media bytes")
+        return {
+            "requested_downloads": [{"filepath": str(media_path)}],
+            "uploader": "Channel",
+            "title": f"Video {video_id}",
+        }
+
+    def _factory(opts: dict) -> _E2EYDL:
+        if "extract_flat" in opts:
+            return _E2EYDL(opts, lambda url: flat)
+        return _E2EYDL(opts, _download_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _factory)
+    return downloaded
+
+
+def _click_download_and_wait(at: AppTest) -> None:
+    at.button(key="download_button").click().run()
+    for _ in range(40):
+        if at.session_state["status"] in ("done", "error"):
+            break
+        at.run()
+
+
+@pytest.mark.parametrize("mode_label", ALL_MODE_LABELS)
+def test_e2e_all_scope_downloads_first_n_and_names_zip_by_actual_range(
+    monkeypatch, tmp_path, mode_label
+):
+    """Playlista 5-pozycyjna, limit 3: prawdziwy silnik pobiera wideo 1..3, a
+    nazwa ZIP-a (sufiks + rozszerzenie formatu) odzwierciedla faktyczny zakres."""
+    downloaded = _install_e2e_engine(monkeypatch, tmp_path, mode_label, total=5, limit=3)
+
+    at = _open_playlist_in_mode(
+        monkeypatch,
+        _limit_test_url("e2eall", mode_label),
+        "Cała playlista (pierwsze 3 z 5)",
+        mode_label,
+    )
+    _click_download_and_wait(at)
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    assert downloaded == ["e2e1", "e2e2", "e2e3"]
+    assert [item.index for item in at.session_state["playlist_report"]] == [1, 2, 3]
+    assert at.session_state["playlist_next_start_index"] is None
+    ext = MODE_EXTENSIONS[mode_label]
+    assert at.session_state["result_file_name"] == f"Playlista-Playlista testowa-pozycje-01-03.{ext}.zip"
+    assert "continue_playlist_button" not in [b.key for b in at.button]
+
+
+def test_e2e_selected_scope_downloads_first_n_of_sorted_selection(monkeypatch, tmp_path):
+    downloaded = _install_e2e_engine(monkeypatch, tmp_path, "Video (MP4)", total=12, limit=3)
+
+    at = _open_playlist_in_mode(
+        monkeypatch,
+        _limit_test_url("e2esel", "Video (MP4)"),
+        "Wybrane numery wideo z playlisty",
+        "Video (MP4)",
+    )
+    at.text_input(key="selected_indices_input").input("9, 1, 5, 2").run()
+    _click_download_and_wait(at)
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    assert downloaded == ["e2e1", "e2e2", "e2e5"]
+    assert [item.index for item in at.session_state["playlist_report"]] == [1, 2, 5]
+    assert at.session_state["result_file_name"] == "Playlista-Playlista testowa-pozycje-1,2,5.mp4.zip"

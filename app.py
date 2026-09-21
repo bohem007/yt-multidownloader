@@ -59,10 +59,6 @@ READY_MODES = {"video", "audio", "subtitle", "transcript"}
 # (potrafi być >150 kodów) — dla auto-napisów pokazujemy tylko te języki,
 # niezależnie od tego, czy dla danego filmu istnieją też manualne napisy.
 AUTOMATIC_SUBTITLE_LANGS = ("pl", "de", "en")
-# Limit liczby pozycji (MAX_PLAYLIST_ITEMS) dotyczy TYLKO Video/Audio —
-# Subtitle/Transcript ściągają tekst, nie media, więc rozmiar/czas pobrania
-# per pozycja jest znikomy w porównaniu do limitu darmowego tieru.
-PLAYLIST_LIMITED_MODES = {"video", "audio"}
 
 
 @st.cache_resource
@@ -619,10 +615,20 @@ with tab_download:
             except Exception:
                 logger.exception("count_playlist_items failed for url=%s", url)
                 playlist_item_count = None
+        # MAX_PLAYLIST_ITEMS PRZYCINA zadanie do pierwszych N pozycji (nie
+        # blokuje) we wszystkich trybach — patrz engine.py::submit_playlist,
+        # który egzekwuje to niezależnie od UI. Mix/Radio ma własny limit
+        # (migawka), więc go tu nie dotyczy.
+        item_limit = settings.max_playlist_items
+        is_trimmed = (
+            not is_mix_url and playlist_item_count is not None and playlist_item_count > item_limit
+        )
         if playlist_item_count is None:
             count_label = "nieznana liczba pozycji"
         elif is_mix_url:
             count_label = f"do {playlist_item_count} pozycji"
+        elif is_trimmed:
+            count_label = f"pierwsze {item_limit} z {playlist_item_count}"
         else:
             count_label = f"{playlist_item_count} pozycji"
         scope_all_label = f"Cała playlista ({count_label})"
@@ -658,10 +664,20 @@ with tab_download:
                 )
                 if selected_indices_error:
                     st.error(selected_indices_error)
+                elif not is_mix_url and len(selected_indices) > item_limit:
+                    st.info(
+                        f"Wybrano {len(selected_indices)} pozycji — pobierzemy pierwsze "
+                        f"{item_limit} z wybranych (limit)."
+                    )
             else:
                 selected_indices_error = "Podaj co najmniej jeden numer pozycji."
         else:
             playlist_scope = "all"
+            if is_trimmed:
+                st.info(
+                    f"Playlista ma {playlist_item_count} pozycji — pobierzemy pierwsze "
+                    f"{item_limit} (limit). Inne pozycje możesz pobrać opcją „Wybrane numery”."
+                )
 
     # Zmiana URL-a (albo URL nie jest już odczytywalnym mixem) unieważnia
     # migawkę; "Nowy URL" robi to przez state.reset().
@@ -771,46 +787,12 @@ with tab_download:
 
     job_in_progress = state.status == "running"
     subtitle_blocked = mode in ("subtitle", "transcript") and subtitle_lang_missing
-    # Limit MAX_PLAYLIST_ITEMS dotyczy tylko Video/Audio (patrz
-    # PLAYLIST_LIMITED_MODES) — blokujemy PRZED kliknięciem "Pobierz", żeby
-    # user nie czekał na to samo odrzucenie dopiero w engine.py::submit().
-    # Dla "selected" (2026-09-20, punkt 4) limit dotyczy LICZBY WYBRANYCH
-    # pozycji, nie długości całej playlisty — inaczej tryb byłby bezużyteczny
-    # dla dokładnie tych długich playlist, do których jest pomyślany (patrz
-    # ten sam wybór w engine.py::submit_playlist).
-    if playlist_scope == "selected":
-        playlist_limit_exceeded = (
-            playlist_snapshot is None
-            and mode in PLAYLIST_LIMITED_MODES
-            and selected_indices is not None
-            and len(selected_indices) > settings.max_playlist_items
-        )
-        if playlist_limit_exceeded:
-            st.warning(
-                f"Wybrano {len(selected_indices)} pozycji — limit dla trybu "
-                f"{MODE_LABELS[mode]} to {settings.max_playlist_items}. Wybierz mniej pozycji."
-            )
-    else:
-        playlist_limit_exceeded = (
-            playlist_scope == "all"
-            and playlist_snapshot is None
-            and mode in PLAYLIST_LIMITED_MODES
-            and playlist_item_count is not None
-            and playlist_item_count > settings.max_playlist_items
-        )
-        if playlist_limit_exceeded:
-            st.warning(
-                f"Playlista ma {playlist_item_count} pozycji — limit dla trybu "
-                f"{MODE_LABELS[mode]} to {settings.max_playlist_items}. Wybierz "
-                'opcję "Tylko to wideo" albo krótszą playlistę.'
-            )
     selected_indices_blocked = playlist_scope == "selected" and selected_indices_error is not None
     download_disabled = (
         mode not in READY_MODES
         or not url
         or job_in_progress
         or subtitle_blocked
-        or playlist_limit_exceeded
         or selected_indices_blocked
         or mix_unreadable
     )
