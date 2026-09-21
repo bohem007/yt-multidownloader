@@ -6,7 +6,9 @@ monkeypatchować os.environ ani przeładowywać modułu.
 
 import pytest
 
-from src.config import Settings
+import logging
+
+from src.config import Settings, warn_if_insecure
 
 
 def test_defaults_match_claude_md():
@@ -25,6 +27,8 @@ def test_defaults_match_claude_md():
     assert s.rate_limit_per_ip == 10
     assert s.rate_limiting_enabled is True
     assert s.ip_hash_secret == ""
+    assert s.history_retention_days == 5
+    assert s.environment_explicit is False
 
 
 def test_env_vars_override_defaults():
@@ -42,6 +46,7 @@ def test_env_vars_override_defaults():
         "RATE_LIMIT_PER_IP": "20",
         "RATE_LIMITING_ENABLED": "false",
         "IP_HASH_SECRET": "super-secret",
+        "HISTORY_RETENTION_DAYS": "14",
     }
     s = Settings.from_env(env)
 
@@ -58,6 +63,8 @@ def test_env_vars_override_defaults():
     assert s.rate_limit_per_ip == 20
     assert s.rate_limiting_enabled is False
     assert s.ip_hash_secret == "super-secret"
+    assert s.history_retention_days == 14
+    assert s.environment_explicit is True
 
 
 def test_max_playlist_rd_items_is_independent_of_max_playlist_items():
@@ -126,3 +133,38 @@ def test_explicit_database_url_wins_over_pg_vars():
 
 def test_database_url_empty_when_neither_provided():
     assert Settings.from_env({}).database_url == ""
+
+
+@pytest.mark.parametrize("value", ["0", "-3"])
+def test_history_retention_days_rejects_values_below_one(value):
+    with pytest.raises(ValueError, match="HISTORY_RETENTION_DAYS"):
+        Settings.from_env({"HISTORY_RETENTION_DAYS": value})
+
+
+def test_history_retention_days_rejects_non_numeric_value():
+    with pytest.raises(ValueError):
+        Settings.from_env({"HISTORY_RETENTION_DAYS": "kilka"})
+
+
+def test_environment_is_not_explicit_when_missing_or_empty():
+    assert Settings.from_env({}).environment_explicit is False
+    assert Settings.from_env({"ENVIRONMENT": ""}).environment_explicit is False
+    assert Settings.from_env({"ENVIRONMENT": "local"}).environment_explicit is True
+
+
+def test_warn_if_insecure_warns_only_for_production_with_empty_secret(caplog):
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        warn_if_insecure(Settings.from_env({"ENVIRONMENT": "production"}))
+        assert "IP_HASH_SECRET" in caplog.text
+
+        caplog.clear()
+        warn_if_insecure(Settings.from_env({"ENVIRONMENT": "production", "IP_HASH_SECRET": "s3cret"}))
+        warn_if_insecure(Settings.from_env({"ENVIRONMENT": "local"}))
+        warn_if_insecure(Settings.from_env({}))
+        assert caplog.text == ""
+
+
+def test_warn_if_insecure_never_logs_the_secret_value(caplog):
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        warn_if_insecure(Settings.from_env({"ENVIRONMENT": "production", "IP_HASH_SECRET": ""}))
+    assert "s3cret" not in caplog.text

@@ -28,6 +28,8 @@ _PINNED_ENV = {
     "DOWNLOAD_LINK_TTL_MINUTES": "30",
     "RATE_LIMIT_PER_IP": "10",
     "RATE_LIMITING_ENABLED": "false",
+    "HISTORY_RETENTION_DAYS": "5",
+    "IP_HASH_SECRET": "test-secret",
 }
 os.environ.update(_PINNED_ENV)
 

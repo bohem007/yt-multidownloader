@@ -7,6 +7,7 @@ os.getenv/os.environ bezpośrednio. Patrz CLAUDE.md, sekcja
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -76,6 +77,11 @@ class Settings:
     rate_limit_per_ip: int = 10
     rate_limiting_enabled: bool = True
     ip_hash_secret: str = ""
+    # Retencja historii zadań (widok "Historia" + kasowanie starych wierszy).
+    history_retention_days: int = 5
+    # True tylko gdy ENVIRONMENT był jawnie ustawiony (nie wzięty z domyślnej
+    # wartości "local") — fail-closed dla historii sesji o nieznanym adresie.
+    environment_explicit: bool = False
     storage_base_dir: str = field(default_factory=tempfile.gettempdir)
 
     @classmethod
@@ -95,6 +101,13 @@ class Settings:
         storage_base_dir = env.get("STORAGE_BASE_DIR") or (
             tempfile.gettempdir() if environment == "local" else "/tmp"
         )
+        history_retention_days = int(
+            env.get("HISTORY_RETENTION_DAYS", defaults.history_retention_days)
+        )
+        if history_retention_days < 1:
+            raise ValueError(
+                f"HISTORY_RETENTION_DAYS musi być >= 1 (jest: {history_retention_days})"
+            )
         return cls(
             environment=environment,
             database_url=database_url,
@@ -117,8 +130,21 @@ class Settings:
                 env.get("RATE_LIMITING_ENABLED"), defaults.rate_limiting_enabled
             ),
             ip_hash_secret=env.get("IP_HASH_SECRET", defaults.ip_hash_secret),
+            history_retention_days=history_retention_days,
+            environment_explicit=bool(env.get("ENVIRONMENT")),
             storage_base_dir=storage_base_dir,
         )
 
 
+def warn_if_insecure(current: Settings) -> None:
+    """Ostrzega (bez logowania wartości) o pustym IP_HASH_SECRET w produkcji —
+    hash IP bez sekretu da się odwrócić przeszukaniem przestrzeni IPv4."""
+    if current.environment == "production" and not current.ip_hash_secret:
+        logging.getLogger(__name__).warning(
+            "IP_HASH_SECRET jest pusty w ENVIRONMENT=production — client_ip_hash "
+            "nie jest chroniony sekretem. Ustaw IP_HASH_SECRET w HF Secrets."
+        )
+
+
 settings = Settings.from_env(os.environ)
+warn_if_insecure(settings)
