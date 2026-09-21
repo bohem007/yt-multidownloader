@@ -102,7 +102,8 @@ Szybki zestaw nie dotyka bazy ani sieci i nie zależy od lokalnego `.env`: izola
 `tests/conftest.py` (autouse `database_calls` podmienia metody `Database` na atrapę i blokuje
 `psycopg.connect`; limity pinowane w `os.environ` przed importem `config`). Blokada dotyczy
 bazy — sieć YouTube nadal podstawiają same testy. Wyjątek: znacznik `db_integration`
-(`tests/test_db.py`, razem z `slow`) wyłącza izolację i łączy się z Neon.
+(`tests/test_db.py`, razem z `slow`) wyłącza izolację i łączy się z Neon; znacznik `db_sql`
+testuje prawdziwy SQL na fałszywym połączeniu (w szybkim zestawie, `psycopg.connect` nadal zablokowane).
 
 ## Oszczędność kontekstu
 
@@ -167,6 +168,11 @@ bazy — sieć YouTube nadal podstawiają same testy. Wyjątek: znacznik `db_int
   plików >200 MB w `static/`.
 - **Anonimowość.** Brak tabeli użytkowników/sesji. `client_ip_hash` — hash, nigdy
   surowy IP.
+- **Historia = własne pobrania z `HISTORY_RETENTION_DAYS` dni** (domyślnie 5). `client_ip_hash` =
+  HMAC-SHA256(`IP_HASH_SECRET`, pierwszy poprawny adres z `X-Forwarded-For`), 32 znaki hex
+  (`src/client_identity.py`); `st.context.ip_address` NIE służy do tego (za proxy HF wspólny dla
+  wszystkich). Brak adresu → `"unknown"`: historia takiej sesji tylko przy JAWNYM `ENVIRONMENT=local`.
+  Wiersze starsze niż retencja kasuje `Database.purge_old_jobs` (best effort, raz/h na proces).
 - **Współbieżność:** `threading.Semaphore(MAX_CONCURRENT_JOBS)`, domyślnie 2.
 - **Rate limiting per IP jest obowiązkowy** (Space jest Public) — Warstwa 11a,
   włącz/wyłącz przez `RATE_LIMITING_ENABLED`.
