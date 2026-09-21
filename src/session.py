@@ -15,7 +15,7 @@ import queue as queue_module
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, MutableMapping
+from typing import TYPE_CHECKING, Callable, Literal, MutableMapping
 
 if TYPE_CHECKING:
     # Tylko do podpowiedzi typów (patrz analogiczny import w progress.py) —
@@ -40,6 +40,7 @@ _DB_JOB_ID = "db_job_id"
 _STARTED_AT = "started_at"
 _QUEUE = "queue"
 _SESSION_ID = "session_id"
+_CLIENT_IP_HASH = "client_ip_hash"
 _URL_LOCKED = "url_locked"
 _LAST_MODE_FORMAT = "last_mode_format"
 _SUBTITLE_LANG = "subtitle_lang"
@@ -279,6 +280,13 @@ class SessionState:
             or self._store[_RESULT_DOWNLOAD_TOKEN] is not None
         )
         self._store[_STATUS] = "done" if has_result else "idle"
+
+    def client_ip_hash(self, resolve: Callable[[], str]) -> str:
+        """Hash klienta liczony RAZ na sesję (jak session_id — poza _DEFAULTS,
+        więc przeżywa reset())."""
+        if self._store.get(_CLIENT_IP_HASH) is None:
+            self._store[_CLIENT_IP_HASH] = resolve()
+        return self._store[_CLIENT_IP_HASH]
 
     def set_db_job_id(self, db_job_id: int) -> None:
         self._store[_DB_JOB_ID] = db_job_id

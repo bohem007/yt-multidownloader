@@ -292,3 +292,19 @@ def test_cancel_queued_job_restores_done_when_previous_result_is_a_download_toke
 
     assert state.status == "done"
     assert state.result_download_token == "tok-123"
+
+
+def test_client_ip_hash_is_resolved_once_and_survives_reset():
+    calls = []
+
+    def resolve() -> str:
+        calls.append(1)
+        return "hash-a"
+
+    state = SessionState({})
+
+    assert state.client_ip_hash(resolve) == "hash-a"
+    assert state.client_ip_hash(resolve) == "hash-a"
+    state.reset()
+    assert state.client_ip_hash(resolve) == "hash-a"
+    assert len(calls) == 1
