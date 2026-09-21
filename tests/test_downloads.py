@@ -178,7 +178,7 @@ def test_route_pattern_matches_generated_url():
 
 def test_endpoint_streams_file_as_attachment_with_unicode_filename(tmp_path):
     payload = os.urandom(300_000)
-    link = downloads.publish(_source(tmp_path, payload), "Playlista-Zażółć gęślą.zip")
+    link = downloads.publish(_source(tmp_path, payload), "Playlista-Zażółć gęślą-pozycje-01-07.mp4.zip")
 
     response = asyncio.run(download_endpoint(_request_for(link.token)))
     status, headers, body = _run_response(response)
@@ -189,7 +189,7 @@ def test_endpoint_streams_file_as_attachment_with_unicode_filename(tmp_path):
     assert headers["content-length"] == str(len(payload))
     disposition = headers["content-disposition"]
     assert disposition.startswith("attachment")
-    assert "Playlista-Zażółć gęślą.zip" in unquote(disposition)
+    assert "Playlista-Zażółć gęślą-pozycje-01-07.mp4.zip" in unquote(disposition)
     assert headers["cache-control"] == "no-store"
     assert headers["x-content-type-options"] == "nosniff"
 

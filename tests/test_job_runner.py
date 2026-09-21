@@ -132,6 +132,7 @@ def test_run_routes_playlist_scope_all_to_submit_playlist_and_carries_items():
     assert final.playlist_title == "Fake Playlist"
     assert final.result_title == "Fake Playlist"
     assert final.playlist_scope == "all"
+    assert final.output_format == "mp4"
     assert [item.status for item in final.playlist_items] == ["done", "error"]
 
 
@@ -168,6 +169,7 @@ def test_run_routes_playlist_scope_selected_to_submit_playlist_with_indices():
 
     final = [e for e in events if e.event_type == "on_finished"][-1]
     assert final.playlist_scope == "selected"
+    assert final.output_format == "mp4"
 
 
 def test_run_passes_job_start_index_to_submit_playlist_and_carries_next_start_index():

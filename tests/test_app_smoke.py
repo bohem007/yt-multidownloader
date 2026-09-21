@@ -436,7 +436,7 @@ def test_clicking_download_with_selected_indices_passes_them_to_job(monkeypatch,
     assert received["playlist_scope"] == "selected"
     assert received["selected_indices"] == [15, 21]  # posortowane, niezależnie od kolejności wejścia
     assert at.session_state["status"] == "done"
-    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-15,21.zip"
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-15,21.mp4.zip"
 
 
 def test_completed_playlist_job_shows_zip_download_link_with_report(monkeypatch, tmp_path):
@@ -466,6 +466,7 @@ def test_completed_playlist_job_shows_zip_download_link_with_report(monkeypatch,
             result_path=zip_file,
             playlist_items=items,
             playlist_title="Moja playlista",
+            output_format="mp4",
         )
     )
     _simulate_job_in_flight(at, finished_queue)
@@ -474,14 +475,14 @@ def test_completed_playlist_job_shows_zip_download_link_with_report(monkeypatch,
 
     assert not at.exception
     assert at.session_state["status"] == "done"
-    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-01-02.zip"
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-01-02.mp4.zip"
     # ZIP zostaje na dysku pod nieodgadywalnym tokenem — NIE w RAM/session_state.
     assert at.session_state["result_data"] is None
     token = at.session_state["result_download_token"]
     link = downloads.lookup(token)
     assert link is not None
     assert link.path.read_bytes() == b"fake zip bytes"
-    assert link.file_name == "Playlista-Moja playlista-pozycje-01-02.zip"
+    assert link.file_name == "Playlista-Moja playlista-pozycje-01-02.mp4.zip"
     assert _link_urls(at) == [downloads.download_url(token)]
     assert len(at.download_button) == 0
 
@@ -524,6 +525,7 @@ def test_completed_playlist_job_with_next_start_index_shows_continue_button_and_
             playlist_items=items,
             playlist_title="Moja playlista",
             next_start_index=3,
+            output_format="mp4",
         )
     )
     _simulate_job_in_flight(at, finished_queue)
@@ -534,7 +536,7 @@ def test_completed_playlist_job_with_next_start_index_shows_continue_button_and_
     assert at.session_state["status"] == "done"
     # Pierwsze wywołanie (start_index=1 domyślnie) dostaje sufiks zakresu
     # tak samo jak kontynuacje (fix regresji z 2026-09-20).
-    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-01-02.zip"
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-01-02.mp4.zip"
     assert at.session_state["playlist_next_start_index"] == 3
 
     info_messages = [i.value for i in at.info]
@@ -615,7 +617,7 @@ def test_clicking_continue_button_starts_continuation_and_replaces_result_on_com
 
     assert received["start_index"] == 3
     assert at.session_state["status"] == "done"
-    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-03-05.zip"
+    assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-03-05.mp4.zip"
     assert at.session_state["playlist_next_start_index"] is None
     assert "continue_playlist_button" not in [b.key for b in at.button]
 
@@ -752,6 +754,7 @@ def test_playlist_job_logs_error_status_only_when_all_items_failed(monkeypatch, 
             result_path=zip_file,
             playlist_items=items,
             playlist_title="Moja playlista",
+            output_format="mp4",
         )
     )
     _simulate_job_in_flight(at, finished_queue)
@@ -791,6 +794,7 @@ def test_playlist_job_logs_done_status_with_summary_when_some_items_succeed(monk
             result_path=zip_file,
             playlist_items=items,
             playlist_title="Moja playlista",
+            output_format="mp4",
         )
     )
     _simulate_job_in_flight(at, finished_queue)
@@ -1200,3 +1204,150 @@ def test_both_finished_events_in_same_queue_batch_resolve_to_done(monkeypatch, t
     assert at.session_state["error_message"] is None
     assert at.session_state["result_data"] is not None
     assert len(at.download_button) >= 1
+
+
+def _playlist_items(indices: list[int], status: str = "done") -> list[PlaylistItemResult]:
+    return [PlaylistItemResult(index=i, title=f"Wideo {i}", status=status) for i in indices]
+
+
+def _completed_playlist_file_name(
+    monkeypatch,
+    tmp_path,
+    *,
+    items: list[PlaylistItemResult],
+    output_format: str | None,
+    playlist_scope: str = "all",
+    title: str | None = "Moja playlista",
+) -> str:
+    """Wstrzykuje zakończony job playlisty (ProgressEvent, jak z job_runner.py)
+    i zwraca nazwę ZIP-a z session_state. Przy okazji sprawdza, że nazwa w UI
+    jest tą samą, z którą link do pobrania (downloads.py -> Content-Disposition
+    w download_routes.py) faktycznie serwuje plik."""
+    at = _run_app(monkeypatch)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=zip_file,
+            playlist_items=items,
+            playlist_title=title,
+            playlist_scope=playlist_scope,
+            output_format=output_format,
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    file_name = at.session_state["result_file_name"]
+    link = downloads.lookup(at.session_state["result_download_token"])
+    assert link is not None
+    assert link.file_name == file_name
+    return file_name
+
+
+@pytest.mark.parametrize(
+    "output_format",
+    ["mp4", "mp3", "flac", "srt", "vtt", "txt"],
+)
+def test_playlist_zip_filename_carries_format_extension_before_zip(
+    monkeypatch, tmp_path, output_format
+):
+    name = _completed_playlist_file_name(
+        monkeypatch, tmp_path, items=_playlist_items(list(range(1, 8))), output_format=output_format
+    )
+
+    assert name == f"Playlista-Moja playlista-pozycje-01-07.{output_format}.zip"
+
+
+def test_playlist_zip_filename_continuation_turn_carries_format_extension(monkeypatch, tmp_path):
+    name = _completed_playlist_file_name(
+        monkeypatch, tmp_path, items=_playlist_items(list(range(8, 15))), output_format="mp3"
+    )
+
+    assert name == "Playlista-Moja playlista-pozycje-08-14.mp3.zip"
+
+
+def test_playlist_zip_filename_selected_short_list_carries_format_extension(monkeypatch, tmp_path):
+    name = _completed_playlist_file_name(
+        monkeypatch,
+        tmp_path,
+        items=_playlist_items([15, 21]),
+        output_format="flac",
+        playlist_scope="selected",
+    )
+
+    assert name == "Playlista-Moja playlista-pozycje-15,21.flac.zip"
+
+
+def test_playlist_zip_filename_selected_long_list_carries_format_extension(monkeypatch, tmp_path):
+    name = _completed_playlist_file_name(
+        monkeypatch,
+        tmp_path,
+        items=_playlist_items([2, 4, 6, 8, 10, 12]),
+        output_format="txt",
+        playlist_scope="selected",
+    )
+
+    assert name == "Playlista-Moja playlista-pozycje-wybrane.txt.zip"
+
+
+def test_playlist_zip_filename_very_long_title_keeps_extension(monkeypatch, tmp_path):
+    """Tytuł playlisty nie jest dziś nigdzie skracany (app.py), więc
+    rozszerzenie z definicji zostaje na końcu — test przypina to zachowanie,
+    żeby ewentualne przyszłe skracanie nazwy bazowej nie ucięło ".mp4.zip"."""
+    long_title = "A" * 300
+
+    name = _completed_playlist_file_name(
+        monkeypatch,
+        tmp_path,
+        items=_playlist_items([1, 2]),
+        output_format="mp4",
+        title=long_title,
+    )
+
+    assert name == f"Playlista-{long_title}-pozycje-01-02.mp4.zip"
+    assert name.endswith(".mp4.zip")
+
+
+def test_playlist_zip_filename_sanitizes_illegal_chars_and_keeps_extension(monkeypatch, tmp_path):
+    name = _completed_playlist_file_name(
+        monkeypatch,
+        tmp_path,
+        items=_playlist_items([1, 2]),
+        output_format="mp3",
+        title='Rock: "hits" <2024>/live?',
+    )
+
+    assert name == "Playlista-Rock_ _hits_ _2024__live_-pozycje-01-02.mp3.zip"
+    assert not any(ch in name for ch in ':/\\*?"<>|')
+
+
+def test_playlist_zip_filename_without_processed_items_still_carries_extension(monkeypatch, tmp_path):
+    """Edge case: wszystkie pozycje "skipped" (brak zakresu) — sufiks
+    "-pozycje-..." się nie pojawia, ale rozszerzenie formatu tak."""
+    name = _completed_playlist_file_name(
+        monkeypatch,
+        tmp_path,
+        items=_playlist_items([3, 4], status="skipped"),
+        output_format="mp4",
+    )
+
+    assert name == "Playlista-Moja playlista.mp4.zip"
+
+
+def test_playlist_zip_filename_without_output_format_falls_back_to_plain_zip(monkeypatch, tmp_path):
+    """Zdarzenie bez output_format (None) nie może wywalić budowania nazwy —
+    wraca stara nazwa bez rozszerzenia formatu."""
+    name = _completed_playlist_file_name(
+        monkeypatch, tmp_path, items=_playlist_items([1, 2]), output_format=None
+    )
+
+    assert name == "Playlista-Moja playlista-pozycje-01-02.zip"
