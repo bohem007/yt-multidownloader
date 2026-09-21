@@ -17,6 +17,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 import src.config as config_module
+import src.client_identity as client_identity_module
 import src.downloads as downloads
 import src.engine as engine_module
 from src.config import Settings
@@ -1843,3 +1844,187 @@ def test_clicking_download_writes_job_history_to_fake_not_real_database(
     assert database_calls.starts[0]["client_ip_hash"] == "unknown"
     assert [call["job_id"] for call in database_calls.finishes] == [1]
     assert database_calls.finishes[0]["status"] == "done"
+
+
+# --- Historia pobrań: tylko własne pobrania, ostatnie N dni ------------------
+
+HISTORY_CAPTION_TITLE = "Historia pobrań (ostatnie 5 dni)"
+
+
+def _history_row(job_id: int, url: str) -> dict:
+    return {"id": job_id, "source_url": url, "mode": "video", "status": "done"}
+
+
+def _open_history_app(monkeypatch, client_hash, rows_by_hash=None, *, error=None, **settings_overrides):
+    """Uruchamia app z podstawioną tożsamością klienta i historią zależną od
+    hasha. Zwraca (AppTest, lista zapytań (client_ip_hash, days))."""
+    queries: list[tuple[str, int]] = []
+
+    def _get_recent_history(self, client_ip_hash, days, limit=20):
+        queries.append((client_ip_hash, days))
+        if error is not None:
+            raise error
+        return list((rows_by_hash or {}).get(client_ip_hash, []))
+
+    monkeypatch.setattr(client_identity_module, "current_client_ip_hash", lambda: client_hash)
+    monkeypatch.setattr(Database, "get_recent_history", _get_recent_history)
+    if settings_overrides:
+        monkeypatch.setattr(
+            config_module, "settings", dataclasses.replace(config_module.settings, **settings_overrides)
+        )
+    # Pierwszy st.dataframe w procesie importuje pandas/pyarrow — w świeżym
+    # środowisku (bez cache .pyc) to potrafi przekroczyć domyślne 3 s AppTest.
+    at = AppTest.from_file(APP_PATH, default_timeout=30)
+    at.run()
+    return at, queries
+
+
+def _all_text(at: AppTest) -> str:
+    parts = [element.value for element in at.caption] + [element.value for element in at.subheader]
+    parts += [element.value for element in at.warning] + [element.value for element in at.info]
+    return " | ".join(parts)
+
+
+def test_history_panel_shows_only_rows_returned_for_current_sessions_hash(monkeypatch):
+    rows = {
+        "hash-mine": [_history_row(1, "https://youtu.be/mine-1"), _history_row(2, "https://youtu.be/mine-2")],
+        "hash-other": [_history_row(9, "https://youtu.be/someone-elses-video")],
+    }
+
+    at, queries = _open_history_app(monkeypatch, "hash-mine", rows)
+
+    assert not at.exception
+    assert queries == [("hash-mine", 5)]
+    assert len(at.dataframe) == 1
+    frame = at.dataframe[0].value
+    assert list(frame["source_url"]) == ["https://youtu.be/mine-1", "https://youtu.be/mine-2"]
+    assert "client_ip_hash" not in frame.columns
+
+
+def test_history_panel_of_another_session_shows_that_sessions_rows(monkeypatch):
+    rows = {
+        "hash-mine": [_history_row(1, "https://youtu.be/mine-1")],
+        "hash-other": [_history_row(9, "https://youtu.be/someone-elses-video")],
+    }
+
+    at, queries = _open_history_app(monkeypatch, "hash-other", rows)
+
+    assert queries == [("hash-other", 5)]
+    assert list(at.dataframe[0].value["source_url"]) == ["https://youtu.be/someone-elses-video"]
+
+
+def test_history_panel_title_and_query_use_configured_retention_days(monkeypatch):
+    at, queries = _open_history_app(monkeypatch, "hash-mine", history_retention_days=3)
+
+    assert [s.value for s in at.subheader] == ["Historia pobrań (ostatnie 3 dni)"]
+    assert queries == [("hash-mine", 3)]
+    assert "Brak pobrań z ostatnich 3 dni." in _all_text(at)
+
+
+def test_history_panel_default_title_and_empty_state(monkeypatch):
+    at, _ = _open_history_app(monkeypatch, "hash-mine")
+
+    assert [s.value for s in at.subheader] == [HISTORY_CAPTION_TITLE]
+    assert "Brak pobrań z ostatnich 5 dni." in _all_text(at)
+    assert len(at.dataframe) == 0
+
+
+def test_history_panel_singular_day_wording(monkeypatch):
+    at, _ = _open_history_app(monkeypatch, "hash-mine", history_retention_days=1)
+
+    assert [s.value for s in at.subheader] == ["Historia pobrań (ostatni dzień)"]
+    assert "Brak pobrań z ostatniego dnia." in _all_text(at)
+
+
+def test_history_panel_shows_neutral_warning_when_database_fails(monkeypatch):
+    at, queries = _open_history_app(monkeypatch, "hash-mine", error=RuntimeError("db down"))
+
+    assert not at.exception
+    assert queries == [("hash-mine", 5)]
+    assert any("tymczasowo niedostępna" in w.value for w in at.warning)
+    assert "db down" not in _all_text(at)
+
+
+def test_history_is_hidden_for_unknown_client_when_environment_not_explicit(monkeypatch):
+    at, queries = _open_history_app(
+        monkeypatch, client_identity_module.UNKNOWN_CLIENT, {"unknown": [_history_row(1, "https://youtu.be/x")]},
+        environment_explicit=False,
+    )
+
+    assert not at.exception
+    assert queries == []  # nawet nie pytamy bazy
+    assert len(at.dataframe) == 0
+    assert "Historia niedostępna dla tej sesji." in _all_text(at)
+
+
+def test_history_is_hidden_for_unknown_client_in_production(monkeypatch):
+    at, queries = _open_history_app(
+        monkeypatch, client_identity_module.UNKNOWN_CLIENT, environment="production", environment_explicit=True
+    )
+
+    assert queries == []
+    assert "Historia niedostępna dla tej sesji." in _all_text(at)
+
+
+def test_history_is_shown_for_unknown_client_with_explicit_local_environment(monkeypatch):
+    at, queries = _open_history_app(
+        monkeypatch,
+        client_identity_module.UNKNOWN_CLIENT,
+        {"unknown": [_history_row(1, "https://youtu.be/local-dev-video")]},
+        environment="local",
+        environment_explicit=True,
+    )
+
+    assert queries == [("unknown", 5)]
+    assert list(at.dataframe[0].value["source_url"]) == ["https://youtu.be/local-dev-video"]
+
+
+def test_history_is_shown_for_known_client_in_production(monkeypatch):
+    at, queries = _open_history_app(
+        monkeypatch, "hash-mine", {"hash-mine": [_history_row(1, "https://youtu.be/m")]},
+        environment="production", environment_explicit=False,
+    )
+
+    assert queries == [("hash-mine", 5)]
+    assert len(at.dataframe) == 1
+
+
+def test_client_hash_is_resolved_once_per_session_across_reruns(monkeypatch):
+    resolved: list[int] = []
+
+    def _resolve():
+        resolved.append(1)
+        return "hash-mine"
+
+    monkeypatch.setattr(client_identity_module, "current_client_ip_hash", _resolve)
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    at.text_input(key="url_input").input("https://youtu.be/dQw4w9WgXcQ").run()
+    at.run()
+
+    assert not at.exception
+    assert len(resolved) == 1
+
+
+def test_clicking_download_stores_the_session_client_hash_not_a_constant(
+    monkeypatch, tmp_path, database_calls
+):
+    monkeypatch.setattr(client_identity_module, "current_client_ip_hash", lambda: "feedface" * 4)
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 3)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1, selected_indices=None):
+        items = [PlaylistItemResult(index=1, title="Wideo 1", status="done")]
+        return PlaylistDownloadResult(zip_path=zip_file, items=items, playlist_title="Fake")
+
+    monkeypatch.setattr(engine_module.DownloadEngine, "submit_playlist", _fake_submit_playlist)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input("https://www.youtube.com/watch?v=hashflow1&list=PLhashflow1").run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (3 pozycji)").run()
+    at.button(key="download_button").click().run()
+
+    assert not at.exception
+    assert [call["client_ip_hash"] for call in database_calls.starts] == ["feedface" * 4]

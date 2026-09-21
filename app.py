@@ -30,7 +30,7 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from src import downloads, storage
-from src.client_identity import current_client_ip_hash
+from src.client_identity import current_client_ip_hash, history_visible_for
 from src.config import settings
 from src.db import Database
 from src.engine import (
@@ -66,6 +66,16 @@ AUTOMATIC_SUBTITLE_LANGS = ("pl", "de", "en")
 def get_database() -> Database:
     """Jedna, współdzielona instancja Database per proces (pooled connection)."""
     return Database()
+
+
+def _history_title(days: int) -> str:
+    period = "ostatni dzień" if days == 1 else f"ostatnie {days} dni"
+    return f"Historia pobrań ({period})"
+
+
+def _history_empty_text(days: int) -> str:
+    period = "ostatniego dnia" if days == 1 else f"ostatnich {days} dni"
+    return f"Brak pobrań z {period}."
 
 
 @st.cache_data(ttl=300, show_spinner="Sprawdzanie dostępnych napisów...")
@@ -948,12 +958,19 @@ with tab_download:
             _render_terminal_result_area()
 
 with tab_history:
-    try:
-        history = get_database().get_recent_history(client_ip_hash, settings.history_retention_days)
-    except Exception:
-        st.warning("Historia zadań jest tymczasowo niedostępna (baza może się właśnie wybudzać z uśpienia).")
+    history_days = settings.history_retention_days
+    st.subheader(_history_title(history_days))
+    if not history_visible_for(client_ip_hash, settings):
+        # Fail-closed: bez rozpoznanego adresu klienta wszyscy dzieliliby hash
+        # "unknown", więc nie pokazujemy (ani nie pytamy o) żadnej historii.
+        st.caption("Historia niedostępna dla tej sesji.")
     else:
-        if not history:
-            st.caption("Brak zapisanych zadań.")
+        try:
+            history = get_database().get_recent_history(client_ip_hash, history_days)
+        except Exception:
+            st.warning("Historia zadań jest tymczasowo niedostępna (baza może się właśnie wybudzać z uśpienia).")
         else:
-            st.dataframe(history)
+            if not history:
+                st.caption(_history_empty_text(history_days))
+            else:
+                st.dataframe(history)
