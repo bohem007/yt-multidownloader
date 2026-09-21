@@ -6,9 +6,9 @@ przy sprzeczności między kodem a tym plikiem, zgłoś rozbieżność zamiast z
 ## Cel projektu
 
 Aplikacja webowa (Streamlit) do pobierania treści z YouTube przez `yt-dlp`:
-wideo (MP4), audio (MP3/FLAC), playlisty (limit `MAX_PLAYLIST_ITEMS` pozycji na
-turę, z kontynuacją kolejnych tur do limitu `MAX_ZIP_SIZE_MB` oraz trybem
-pobierania wybranych numerów pozycji), napisy (SRT/VTT), transkrypt bez
+wideo (MP4), audio (MP3/FLAC), playlisty (przycinane do pierwszych
+`MAX_PLAYLIST_ITEMS` pozycji, z turami wg `MAX_ZIP_SIZE_MB` wewnątrz tego zakresu
+oraz trybem pobierania wybranych numerów pozycji), napisy (SRT/VTT), transkrypt bez
 timestampów (TXT). Docelowy hosting: Hugging Face Spaces
 (Docker SDK, widoczność **Public**, darmowy tier). Baza: Neon Postgres
 (darmowy tier), tylko anonimowa historia zadań.
@@ -204,6 +204,12 @@ uv run pytest
 
 ## Kontrakty playlisty i pobierania
 
+- **Limit liczby pozycji:** `MAX_PLAYLIST_ITEMS` PRZYCINA zadanie do pierwszych N
+  pozycji (nie blokuje) we WSZYSTKICH trybach: „Cała playlista" = pozycje 1..N,
+  „Wybrane numery" = pierwsze N z posortowanych wybranych. UI (`app.py`) tylko
+  informuje (`st.info`, etykieta „pierwsze N z M"); przycina niezależnie
+  `engine.py::submit_playlist`. Tury (`MAX_ZIP_SIZE_MB`) działają wewnątrz zakresu —
+  `next_start_index` nie wychodzi poza N. Mix `RD` ma osobny limit (migawka).
 - **Tury:** `start_index`/`next_start_index` (pozycje absolutne, 1-based) wznawiają
   ciągłe pobieranie (przycisk „Pobierz kolejne pozycje"). Twardy stop przy
   przekroczeniu `MAX_ZIP_SIZE_MB`; pozycje spoza aktualnej tury dostają
@@ -211,7 +217,7 @@ uv run pytest
 - **Wybrane numery (`playlist_scope="selected"`):** `selected_indices` waliduje
   UI (`app.py::_parse_selected_indices`) i niezależnie silnik
   (`InvalidPlaylistSelectionError` w `errors.py`) — backstop, nie duplikat.
-  `MAX_PLAYLIST_ITEMS` liczy się od liczby WYBRANYCH pozycji. Brak kontynuacji
+  Limit `MAX_PLAYLIST_ITEMS` liczy się od liczby WYBRANYCH pozycji. Brak kontynuacji
   tur w tym trybie (`next_start_index` zawsze `None`); `ProgressEvent.playlist_scope`
   niesie oryginalny scope joba do UI.
 - **Nazwa ZIP-a tury** (`app.py::_build_playlist_zip_filename`): sufiks
