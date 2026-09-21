@@ -34,16 +34,18 @@ from src.config import settings
 from src.db import Database
 from src.engine import (
     DownloadJob,
+    PlaylistSnapshot,
     count_playlist_items,
     list_available_subtitles,
     resolve_representative_video_url,
+    snapshot_playlist,
 )
 from src.errors import InvalidUrlError, map_download_error
 from src.job_runner import JobRunner
 from src.naming import build_display_filename
 from src.progress import ProgressEvent
 from src.session import SessionState
-from src.validators import classify_url, validate_url
+from src.validators import classify_url, is_mix_playlist_url, validate_url
 
 MODE_LABELS = {
     "video": "Video (MP4)",
@@ -95,6 +97,24 @@ def _cached_resolve_representative_video_url(url: str, cookie_data: bytes | None
     show_spinner=False: to wewnętrzny krok tej samej operacji, spinner
     sondy napisów niżej już informuje użytkownika o oczekiwaniu."""
     return resolve_representative_video_url(url, cookie_data=cookie_data)
+
+
+def _get_or_create_mix_snapshot(
+    state: SessionState, url: str, cookie_data: bytes | None
+) -> PlaylistSnapshot:
+    """Migawka listy Mix/Radio dla `url` — z st.session_state (przez
+    SessionState), NIE z st.cache_data: cache_data jest współdzielony między
+    sesjami i kluczowany po TTL, a migawka ma być prywatna dla użytkownika i
+    stała do zmiany URL-a. Istniejąca migawka dla TEGO SAMEGO URL-a jest
+    zwracana bez żadnego odczytu — kolejne tury i wznowienia nigdy nie
+    odpytują listy ponownie (lista mixa zmienia się między odczytami)."""
+    existing = state.playlist_snapshot
+    if existing is not None and existing.url == url:
+        return existing
+    with st.spinner("Odczytywanie listy Mix/Radio..."):
+        snapshot = snapshot_playlist(url, cookie_data=cookie_data)
+    state.set_playlist_snapshot(snapshot)
+    return snapshot
 
 
 def _guess_mime(file_name: str | None) -> str:
@@ -557,6 +577,13 @@ with tab_download:
     # zamiast polegania na tym domyślnym zachowaniu; renderowany PRZED
     # selectboxem Tryb, bo dotyczy każdego trybu jednakowo.
     url_classification = classify_url(url) if url else "single"
+    # Mix/Radio (list=RD…) — lista generowana dynamicznie przez YouTube, więc
+    # pracujemy na JEDNEJ migawce (patrz _get_or_create_mix_snapshot), nie na
+    # ponownych odczytach. Bez `v=` (playlist_only) YouTube zwraca "This
+    # playlist type is unviewable" — takiego linku nie da się pobrać.
+    is_mix_url = url_classification != "single" and is_mix_playlist_url(url)
+    playlist_snapshot: PlaylistSnapshot | None = None
+    mix_unreadable = False
     playlist_item_count: int | None = None
     playlist_scope = "single"
     selected_indices: list[int] | None = None
@@ -565,18 +592,46 @@ with tab_download:
     _SCOPE_SINGLE_LABEL = "Tylko to wideo"
     _SCOPE_SELECTED_LABEL = "Wybrane numery wideo z playlisty"
 
-    if url_classification != "single":
-        try:
-            playlist_item_count = _cached_count_playlist_items(url, cookie_data)
-        except Exception:
-            logger.exception("count_playlist_items failed for url=%s", url)
-            playlist_item_count = None
-        count_label = (
-            f"{playlist_item_count} pozycji" if playlist_item_count is not None else "nieznana liczba pozycji"
+    if is_mix_url and url_classification == "playlist_only":
+        mix_unreadable = True
+        st.error(
+            "Ten link do Mix/Radio nie zawiera parametru v= — YouTube nie pozwala "
+            "odczytać takiej listy. Otwórz mix w YouTube i wklej link z paska "
+            "przeglądarki (zawiera v=)."
         )
+    elif url_classification != "single":
+        if is_mix_url:
+            try:
+                playlist_snapshot = _get_or_create_mix_snapshot(state, url, cookie_data)
+            except Exception as exc:
+                logger.exception("snapshot_playlist failed for url=%s", url)
+                st.error(map_download_error(exc))
+            else:
+                playlist_item_count = len(playlist_snapshot.entries)
+                st.warning(
+                    "Mix/Radio jest generowany dynamicznie przez YouTube; pobieramy "
+                    f"pierwsze {playlist_item_count} pozycji ze zrobionej teraz migawki — "
+                    "ponowne uruchomienie może dać inną listę."
+                )
+        else:
+            try:
+                playlist_item_count = _cached_count_playlist_items(url, cookie_data)
+            except Exception:
+                logger.exception("count_playlist_items failed for url=%s", url)
+                playlist_item_count = None
+        if playlist_item_count is None:
+            count_label = "nieznana liczba pozycji"
+        elif is_mix_url:
+            count_label = f"do {playlist_item_count} pozycji"
+        else:
+            count_label = f"{playlist_item_count} pozycji"
         scope_all_label = f"Cała playlista ({count_label})"
 
-        if url_classification == "mixed":
+        if is_mix_url and playlist_snapshot is None:
+            # Migawka się nie udała — bez niej "cała playlista"/wybrane numery
+            # wymagałyby ponownego odczytu mixa, więc zostaje tylko pojedyncze wideo.
+            scope_options = [_SCOPE_SINGLE_LABEL]
+        elif url_classification == "mixed":
             scope_options = [_SCOPE_SINGLE_LABEL, scope_all_label, _SCOPE_SELECTED_LABEL]
         else:
             # "playlist_only" (np. /playlist?list=...) — nie ma pojedynczego
@@ -607,6 +662,11 @@ with tab_download:
                 selected_indices_error = "Podaj co najmniej jeden numer pozycji."
         else:
             playlist_scope = "all"
+
+    # Zmiana URL-a (albo URL nie jest już odczytywalnym mixem) unieważnia
+    # migawkę; "Nowy URL" robi to przez state.reset().
+    if playlist_snapshot is None and state.playlist_snapshot is not None:
+        state.set_playlist_snapshot(None)
 
     state.set_playlist_scope(playlist_scope)
 
@@ -661,7 +721,13 @@ with tab_download:
             subtitle_probe_url = url
             if playlist_scope in ("all", "selected"):
                 try:
-                    representative_url = _cached_resolve_representative_video_url(url, cookie_data)
+                    # Mix/Radio: pierwsza pozycja MIGAWKI — bez tego sonda
+                    # odczytałaby cały mix od nowa (13-27 s, inna lista).
+                    representative_url = (
+                        playlist_snapshot.entries[0]["url"]
+                        if playlist_snapshot is not None
+                        else _cached_resolve_representative_video_url(url, cookie_data)
+                    )
                 except Exception:
                     logger.exception("resolve_representative_video_url failed for url=%s", url)
                     representative_url = None
@@ -714,7 +780,8 @@ with tab_download:
     # ten sam wybór w engine.py::submit_playlist).
     if playlist_scope == "selected":
         playlist_limit_exceeded = (
-            mode in PLAYLIST_LIMITED_MODES
+            playlist_snapshot is None
+            and mode in PLAYLIST_LIMITED_MODES
             and selected_indices is not None
             and len(selected_indices) > settings.max_playlist_items
         )
@@ -726,6 +793,7 @@ with tab_download:
     else:
         playlist_limit_exceeded = (
             playlist_scope == "all"
+            and playlist_snapshot is None
             and mode in PLAYLIST_LIMITED_MODES
             and playlist_item_count is not None
             and playlist_item_count > settings.max_playlist_items
@@ -744,6 +812,7 @@ with tab_download:
         or subtitle_blocked
         or playlist_limit_exceeded
         or selected_indices_blocked
+        or mix_unreadable
     )
     # "Nowy URL" nie może przerwać aktywnego pobierania — zerwałoby to
     # wątek w tle i zostawiłoby niezwolniony permit semafora współbieżności.
@@ -816,6 +885,9 @@ with tab_download:
             playlist_scope=playlist_scope,
             start_index=start_index,
             selected_indices=selected_indices if playlist_scope == "selected" else None,
+            playlist_snapshot=(
+                playlist_snapshot if playlist_scope in ("all", "selected") else None
+            ),
         )
 
         def on_state(event: ProgressEvent, _queue: "queue_module.Queue" = job_queue) -> None:
