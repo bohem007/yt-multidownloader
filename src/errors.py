@@ -43,6 +43,12 @@ class InvalidPlaylistSelectionError(Exception):
     playlista zmieniła długość między sondą app.py a właściwym pobraniem)."""
 
 
+class EmptyPlaylistSnapshotError(Exception):
+    """Migawka listy Mix/Radio (engine.py::snapshot_playlist) jest pusta —
+    YouTube nie zwrócił żadnej użytecznej pozycji. Zamiast cichego, pustego
+    ZIP-a job kończy się czytelnym błędem."""
+
+
 _BOT_CHECK_MARKERS = ("confirm you're not a bot", "sign in to confirm", "not a bot")
 # Osobny, jednoznaczny przypadek od _BOT_CHECK_MARKERS: "Sign in to confirm
 # your age" (brak/nieważne cookies — problem DO ROZWIĄZANIA przez wgranie
@@ -87,6 +93,12 @@ def map_download_error(exc: Exception) -> str:
             f"Przekroczono limit czasu ({settings.item_download_timeout_seconds}s) "
             "pobierania tego materiału — YouTube mógł tymczasowo ograniczać "
             "przepustowość dla tego strumienia. Spróbuj ponownie później."
+        )
+
+    if isinstance(exc, EmptyPlaylistSnapshotError):
+        return (
+            "Nie udało się odczytać żadnych pozycji z tego Mixa/Radia. "
+            "Spróbuj ponownie albo wklej link z paska przeglądarki (z parametrem v=)."
         )
 
     if isinstance(exc, InvalidPlaylistSelectionError):

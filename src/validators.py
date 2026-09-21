@@ -18,6 +18,20 @@ def validate_url(url: str) -> bool:
     return parsed.scheme == "https" and parsed.netloc in ALLOWED_HOSTS
 
 
+_MIX_LIST_ID_PREFIX = "RD"
+
+
+def is_mix_playlist_url(url: str) -> bool:
+    """True dla playlist Mix/Radio generowanych dynamicznie przez YouTube —
+    id listy zaczyna się od "RD" (RD<id wideo>, RDAMVM…, RDCLAK…, RDMM…).
+    Zwykłe playlisty mają inne prefiksy (PL…, OLAK5uy…, UU…, FL…), więc ich
+    to nie łapie. Czysto stringowe, bez zapytania sieciowego. Sama obecność
+    RD niczego nie mówi o odczytywalności — patrz classify_url: bez `v=`
+    YouTube zwraca "This playlist type is unviewable"."""
+    list_id = parse_qs(urlparse(url).query).get("list", [""])[0]
+    return list_id.startswith(_MIX_LIST_ID_PREFIX)
+
+
 def classify_url(url: str) -> Literal["single", "mixed", "playlist_only"]:
     """Klasyfikuje URL po obecności parametrów `v`/`list` w query — czysto
     stringowo, bez żadnego zapytania sieciowego (to robi count_playlist_items
