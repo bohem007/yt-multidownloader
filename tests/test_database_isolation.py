@@ -25,8 +25,10 @@ def test_database_methods_are_replaced_by_recording_fake(database_calls):
             "error_message": None,
         }
     ]
-    assert db.get_recent_history() == []
-    assert database_calls.history_reads == 1
+    assert db.get_recent_history("abc", 5) == []
+    assert database_calls.history_queries == [{"client_ip_hash": "abc", "days": 5, "limit": 20}]
+    assert db.purge_old_jobs(5) == 0
+    assert database_calls.purges == [5]
 
 
 def test_psycopg_connect_is_blocked_without_retry_delay():

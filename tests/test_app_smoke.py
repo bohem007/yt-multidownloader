@@ -56,7 +56,6 @@ def _link_urls(at: AppTest) -> list[str]:
 
 
 def _run_app(monkeypatch) -> AppTest:
-    monkeypatch.setattr(Database, "get_recent_history", lambda self, limit=20: [])
     at = AppTest.from_file(APP_PATH)
     at.run()
     return at
@@ -1840,6 +1839,7 @@ def test_clicking_download_writes_job_history_to_fake_not_real_database(
 
     assert not at.exception
     assert [call["url"] for call in database_calls.starts] == [url]
-    assert database_calls.starts[0]["client_ip_hash"] == "local-dev"
+    # AppTest nie ma nagłówka X-Forwarded-For → hash "unknown" (nie stała "local-dev").
+    assert database_calls.starts[0]["client_ip_hash"] == "unknown"
     assert [call["job_id"] for call in database_calls.finishes] == [1]
     assert database_calls.finishes[0]["status"] == "done"

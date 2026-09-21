@@ -6,12 +6,13 @@ Brak plików multimedialnych w bazie — patrz CLAUDE.md.
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import psycopg
 from psycopg import sql
@@ -30,6 +31,13 @@ _COLD_START_BACKOFF_SECONDS = 1.0
 # jednocześnie wołających Database.
 _CONNECTION_LIMIT = threading.Semaphore(2)
 
+logger = logging.getLogger(__name__)
+
+# Kasowanie starych wierszy (retencja) najwyżej raz na tyle sekund na proces:
+# DELETE po indeksowanym created_at jest tani, ale każde wywołanie to osobne
+# połączenie z Neon (cold start do kilku sekund) — nie robimy tego per zapis.
+_PURGE_INTERVAL_SECONDS = 3600.0
+
 
 def _validate_schema_name(name: str) -> str:
     if not _SCHEMA_NAME_RE.match(name):
@@ -37,13 +45,29 @@ def _validate_schema_name(name: str) -> str:
     return name
 
 
-class Database:
-    """Dostęp do tabeli `jobs` w schemacie wskazanym przez settings.db_schema."""
+def _spawn_daemon(fn: Callable[[], None]) -> None:
+    threading.Thread(target=fn, name="jobs-purge", daemon=True).start()
 
-    def __init__(self) -> None:
+
+class Database:
+    """Dostęp do tabeli `jobs` w schemacie wskazanym przez settings.db_schema.
+
+    `clock` i `spawn` są wstrzykiwane wyłącznie dla testów (deterministyczny
+    throttling purge bez sleep i bez prawdziwych wątków).
+    """
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        spawn: Callable[[Callable[[], None]], None] = _spawn_daemon,
+    ) -> None:
         self._schema = _validate_schema_name(settings.db_schema)
         self._table = sql.Identifier(self._schema, "jobs")
         self._schema_ready = False
+        self._clock = clock
+        self._spawn = spawn
+        self._purge_lock = threading.Lock()
+        self._last_purge_at: float | None = None
 
     @contextmanager
     def _connect(self) -> Iterator[psycopg.Connection]:
@@ -108,6 +132,12 @@ class Database:
                 cur.execute(query, (url, mode, output_format, client_ip_hash))
                 row = cur.fetchone()
 
+        try:
+            self._schedule_purge()
+        except Exception as exc:
+            # Retencja jest best effort — nigdy nie może zepsuć startu pobierania.
+            logger.warning("scheduling purge_old_jobs failed: %s", type(exc).__name__)
+
         return row["id"]
 
     def log_job_finish(
@@ -128,15 +158,53 @@ class Database:
             with conn.cursor() as cur:
                 cur.execute(query, (status, duration_ms, file_size_bytes, error_message, job_id))
 
-    def get_recent_history(self, limit: int = 20) -> list[dict[str, Any]]:
+    def get_recent_history(
+        self, client_ip_hash: str, days: int, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Zadania WYŁĄCZNIE danego klienta z ostatnich `days` dni. Kolumna
+        client_ip_hash nie jest zwracana (UI jej nie potrzebuje)."""
         self.init_schema()
         query = sql.SQL(
             "SELECT id, created_at, finished_at, source_url, mode, output_format, "
-            "status, duration_ms, file_size_bytes, error_message, client_ip_hash "
-            "FROM {table} ORDER BY created_at DESC LIMIT %s"
+            "status, duration_ms, file_size_bytes, error_message "
+            "FROM {table} "
+            "WHERE client_ip_hash = %s AND created_at >= now() - make_interval(days => %s) "
+            "ORDER BY created_at DESC LIMIT %s"
         ).format(table=self._table)
 
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (limit,))
+                cur.execute(query, (client_ip_hash, days, limit))
                 return cur.fetchall()
+
+    def purge_old_jobs(self, days: int) -> int:
+        """Kasuje wiersze starsze niż `days` dni. Best effort: wyjątki są
+        łapane i logowane (tylko nazwa klasy — bez danych użytkownika), zwraca
+        liczbę skasowanych wierszy albo 0."""
+        try:
+            self.init_schema()
+            query = sql.SQL(
+                "DELETE FROM {table} WHERE created_at < now() - make_interval(days => %s)"
+            ).format(table=self._table)
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, (days,))
+                    deleted = cur.rowcount
+        except Exception as exc:
+            logger.warning("purge_old_jobs failed: %s", type(exc).__name__)
+            return 0
+        logger.info("purge_old_jobs: deleted %s rows older than %s days", deleted, days)
+        return deleted
+
+    def _schedule_purge(self) -> bool:
+        """Uruchamia purge w tle, najwyżej raz na _PURGE_INTERVAL_SECONDS na
+        proces. Okno jest rezerwowane PRZED startem (nieudany purge też czeka
+        do następnego okna — nie ponawiamy w pętli przy niedostępnej bazie)."""
+        now = self._clock()
+        with self._purge_lock:
+            if self._last_purge_at is not None and now - self._last_purge_at < _PURGE_INTERVAL_SECONDS:
+                return False
+            self._last_purge_at = now
+        days = settings.history_retention_days
+        self._spawn(lambda: self.purge_old_jobs(days))
+        return True

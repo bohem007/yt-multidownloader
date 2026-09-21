@@ -30,6 +30,7 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from src import downloads, storage
+from src.client_identity import current_client_ip_hash
 from src.config import settings
 from src.db import Database
 from src.engine import (
@@ -522,6 +523,7 @@ st.set_page_config(page_title="YT MultiDownloader", page_icon="📥")
 
 state = SessionState(st.session_state)
 runner = JobRunner()
+client_ip_hash = state.client_ip_hash(current_client_ip_hash)
 
 st.title("YT MultiDownloader")
 
@@ -839,10 +841,9 @@ with tab_download:
                 url,
                 mode,
                 output_format,
-                # TODO(Warstwa 11a): realny hash IP wymaga nagłówka z
-                # proxy HF Spaces, którego jeszcze nie odczytujemy —
-                # placeholder do czasu implementacji rate limitingu.
-                client_ip_hash="local-dev",
+                # HMAC z X-Forwarded-For (src/client_identity.py). TODO(Warstwa 11a):
+                # rate limiting per IP korzysta z tego samego hasha (pozycja 10).
+                client_ip_hash=client_ip_hash,
             )
         except Exception:
             db_job_id = None
@@ -948,7 +949,7 @@ with tab_download:
 
 with tab_history:
     try:
-        history = get_database().get_recent_history(limit=20)
+        history = get_database().get_recent_history(client_ip_hash, settings.history_retention_days)
     except Exception:
         st.warning("Historia zadań jest tymczasowo niedostępna (baza może się właśnie wybudzać z uśpienia).")
     else:

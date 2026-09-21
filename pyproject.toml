@@ -21,4 +21,5 @@ dev = [
 markers = [
     "slow: testy integracyjne z realnym pobraniem/siecią — pomijane przez `-m \"not slow\"`",
     "db_integration: test łączy się z realną bazą — wyłącza izolację `database_calls` z tests/conftest.py (zawsze razem z `slow`)",
+    "db_sql: test PRAWDZIWEGO SQL warstwy bazy na fałszywym połączeniu (bez sieci) — fixture `database_calls` nie podmienia metod Database, ale nadal blokuje psycopg.connect; w szybkim zestawie",
 ]

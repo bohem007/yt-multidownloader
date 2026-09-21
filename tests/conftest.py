@@ -6,7 +6,10 @@
    Dzięki temu testy dają ten sam wynik z `.env` dowolnej treści i bez niego.
 2. Autouse `database_calls` podmienia warstwę bazy (`src.db.Database`) na
    atrapę zapisującą wywołania i blokuje `psycopg.connect` — żaden test poza
-   oznaczonymi `@pytest.mark.db_integration` nie łączy się z bazą (wcześniej
+   oznaczonymi `@pytest.mark.db_integration` nie łączy się z bazą. Testy
+   `@pytest.mark.db_sql` sprawdzają PRAWDZIWY kod SQL warstwy bazy na
+   fałszywym połączeniu (wstrzykniętym do `Database._connect`): metody nie
+   są wtedy podmieniane, ale `psycopg.connect` nadal jest zablokowane (wcześniej
    kliknięcie „Pobierz" w AppTest robiło realny INSERT do Neon, a bez
    `DATABASE_URL` wisiało w `psycopg.connect`).
 """
@@ -47,7 +50,8 @@ class DatabaseCalls:
 
     starts: list[dict] = field(default_factory=list)
     finishes: list[dict] = field(default_factory=list)
-    history_reads: int = 0
+    history_queries: list[dict] = field(default_factory=list)
+    purges: list[int] = field(default_factory=list)
 
 
 def _refuse_connect(*args, **kwargs):
@@ -59,6 +63,11 @@ def _refuse_connect(*args, **kwargs):
 @pytest.fixture(autouse=True)
 def database_calls(request, monkeypatch):
     if request.node.get_closest_marker("db_integration"):
+        yield None
+        return
+
+    monkeypatch.setattr(psycopg, "connect", _refuse_connect)
+    if request.node.get_closest_marker("db_sql"):
         yield None
         return
 
@@ -83,12 +92,18 @@ def database_calls(request, monkeypatch):
             }
         )
 
-    def _get_recent_history(self, limit=20):
-        calls.history_reads += 1
+    def _get_recent_history(self, client_ip_hash, days, limit=20):
+        calls.history_queries.append(
+            {"client_ip_hash": client_ip_hash, "days": days, "limit": limit}
+        )
         return []
+
+    def _purge_old_jobs(self, days):
+        calls.purges.append(days)
+        return 0
 
     monkeypatch.setattr(Database, "log_job_start", _log_job_start)
     monkeypatch.setattr(Database, "log_job_finish", _log_job_finish)
     monkeypatch.setattr(Database, "get_recent_history", _get_recent_history)
-    monkeypatch.setattr(psycopg, "connect", _refuse_connect)
+    monkeypatch.setattr(Database, "purge_old_jobs", _purge_old_jobs)
     yield calls
