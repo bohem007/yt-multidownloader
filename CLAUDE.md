@@ -215,7 +215,8 @@ uv run pytest
 - **Nazwa ZIP-a tury** (`app.py::_build_playlist_zip_filename`): sufiks
   `-pozycje-{start}-{end}` zawsze, zero-padded do szerokości większej liczby;
   dla `selected` — lista numerów (`-pozycje-15,21`, ≤5 pozycji) albo fallback
-  `-pozycje-wybrane` dla dłuższych.
+  `-pozycje-wybrane` dla dłuższych; na końcu rozszerzenie formatu joba tuż
+  przed `.zip` (`...-pozycje-01-07.mp4.zip`, z `ProgressEvent.output_format`).
 - **Stopka źródłowa w TXT:** `_finalize_transcript` dopisuje po
   `format_paragraphs` linię `Źródło: {Autor}-{Tytuł} {webpage_url} {data}` —
   dla pojedynczego wideo i każdej pozycji playlisty.
