@@ -27,7 +27,6 @@ from src.errors import (
     InvalidPlaylistSelectionError,
     InvalidUrlError,
     ItemDownloadTimeoutError,
-    PlaylistTooLargeError,
     map_download_error,
 )
 from src.naming import build_display_filename
@@ -154,7 +153,7 @@ class EngineError(Exception):
     """Czytelny błąd silnika — komunikat już przetworzony przez errors.map_download_error.
 
     `original_exception` niesie jawnie oryginalny przechwycony wyjątek
-    (InvalidUrlError, PlaylistTooLargeError, yt_dlp.utils.DownloadError...),
+    (InvalidUrlError, FileTooLargeError, yt_dlp.utils.DownloadError...),
     żeby wołający mógł po typie rozróżnić przyczynę bez zaglądania w
     __cause__ (który wciąż jest ustawiany przez `raise ... from exc`).
     """
@@ -173,17 +172,16 @@ OnEventCallback = Callable[[ProgressEvent], None]
 # w samym yt-dlp między kształtami URL-i, nie w naszym kodzie). "in_playlist"
 # to wartość, której yt-dlp używa wewnętrznie pod --flat-playlist — poprawnie
 # rozwiązuje entries dla OBU kształtów URL-a. Jedna stała, używana przez
-# count_playlist_items i _check_playlist_limit — bez duplikowania.
+# _probe_playlist_entries — bez duplikowania.
 _PLAYLIST_FLAT_MODE = "in_playlist"
 
 
 def _base_ydl_opts(cookiefile: str | None = None) -> dict:
     """Opcje wspólne dla KAŻDEJ instancji YoutubeDL w tym module — sond
-    (list_available_subtitles, _check_playlist_limit) i głównego pobrania
+    (list_available_subtitles, _probe_playlist_entries) i głównego pobrania
     (_build_ydl_opts). cookiefile musi trafiać do WSZYSTKICH, w jednym
     miejscu, bez duplikowania logiki — inaczej materiał z ograniczeniem
-    wiekowym pada już na sondzie, która go nie miała (dokładnie to był bug
-    w _check_playlist_limit przed naprawą).
+    wiekowym pada już na sondzie, która go nie miała.
 
     Próba obejścia github.com/yt-dlp/yt-dlp/issues/17619 przez wymuszenie
     extractor_args player_client=["mweb"] tutaj została WYCOFANA — łamała
@@ -239,8 +237,7 @@ def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict
     Bez tego wiele filmów (zwłaszcza nieanglojęzycznych) nie ma ŻADNYCH
     napisów w domyślnym języku yt-dlp (subtitleslangs=["en"]).
 
-    Ta sonda ma ten sam problem, jaki miał _check_playlist_limit przed
-    naprawą: dla materiału z ograniczeniem wiekowym YouTube wymaga cookies
+    Dla materiału z ograniczeniem wiekowym YouTube wymaga cookies
     już na etapie SAMEJ próby odczytu metadanych (nie tylko pobrania) — bez
     cookiefile tutaj UI nigdy nie pokaże listy języków, niezależnie od tego,
     czy użytkownik wgrał cookies.txt do właściwego pobrania.
@@ -275,7 +272,7 @@ def _probe_playlist_entries(
     url: str, cookiefile: str | None = None, limit: int | None = None
 ) -> tuple[list[dict] | None, str | None]:
     """Sonda extract_flat=_PLAYLIST_FLAT_MODE współdzielona przez
-    count_playlist_items, _check_playlist_limit i submit_playlist — JEDNA
+    count_playlist_items i submit_playlist — JEDNA
     droga odpytania YouTube o pozycje playlisty, bez duplikowania logiki
     (patrz komentarz przy _PLAYLIST_FLAT_MODE o tym, czemu nie extract_flat=True).
 
@@ -330,8 +327,7 @@ def count_playlist_items(url: str, cookie_data: bytes | None = None) -> int | No
     """Liczy pozycje playlisty (bez rozwiązywania pełnych metadanych każdego
     wideo) — używane przez UI (app.py) do pokazania realnej liczby pozycji
     w radiu wyboru zakresu ORAZ do prewencyjnego zablokowania przycisku
-    "Pobierz" PRZED kliknięciem, zamiast czekać, aż _check_playlist_limit
-    zrobi to samo dopiero w submit().
+    "Pobierz" PRZED kliknięciem.
 
     Zwraca None, jeśli URL w ogóle nie jest playlistą — wołający (app.py)
     pokazuje w takim wypadku nieznaną liczbę, nie zero."""
@@ -381,24 +377,6 @@ class DownloadEngine:
 
             job_dir = storage.create(job.session_id, job.job_id)
             cookiefile_path = self._write_cookiefile(job.cookie_data, job_dir)
-
-            # Sonda limitu playlisty MUSI dostać te same cookies co główne
-            # pobranie — dla materiału z ograniczeniem wiekowym błąd "Sign in
-            # to confirm your age" pojawia się już na etapie tej sondy
-            # (extract_flat=True nie omija weryfikacji wieku dla pojedynczego
-            # wideo), więc bez cookiefile TUTAJ żądanie nigdy nie dociera do
-            # dalszej części submit(), która cookies faktycznie miała.
-            #
-            # Wołana TYLKO gdy playlist_scope=="all" (we wszystkich trybach —
-            # limit obowiązuje też dla Subtitle/Transcript): dla "single"
-            # noplaylist=True i tak ściągnie jedno wideo niezależnie od tego,
-            # ile pozycji ma playlista w URL-u (sonda byłaby zbędnym
-            # zapytaniem do YouTube). Ścieżka historyczna: JobRunner kieruje
-            # "all"/"selected" do submit_playlist(), które PRZYCINA do
-            # MAX_PLAYLIST_ITEMS — tu, przy bezpośrednim wywołaniu submit()
-            # z scope "all", zostaje twarde odrzucenie (jeden plik wynikowy).
-            if job.playlist_scope == "all":
-                self._check_playlist_limit(job.url, cookiefile_path)
 
             result = self._download_one(job.url, job, job_dir, cookiefile_path, on_event)
 
@@ -804,17 +782,6 @@ class DownloadEngine:
         cookiefile_path = job_dir / "cookies.txt"
         cookiefile_path.write_bytes(cookie_data)
         return str(cookiefile_path)
-
-    def _check_playlist_limit(self, url: str, cookiefile: str | None = None) -> None:
-        entries, _ = _probe_playlist_entries(url, cookiefile)
-        if entries is None:
-            return
-
-        item_count = len(entries)
-        if item_count > settings.max_playlist_items:
-            raise PlaylistTooLargeError(
-                f"playlist ma {item_count} pozycji, limit to {settings.max_playlist_items}"
-            )
 
     def _build_ydl_opts(
         self,

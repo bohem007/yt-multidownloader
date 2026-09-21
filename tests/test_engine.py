@@ -17,10 +17,10 @@ from yt_dlp.utils import DownloadError
 
 import src.engine as engine_module
 from src import storage
-from src.config import Settings, settings
+from src.config import Settings
 from src.errors import ItemDownloadTimeoutError
 from src.engine import DownloadEngine, DownloadJob, EngineError, list_available_subtitles
-from src.errors import InvalidUrlError, PlaylistTooLargeError
+from src.errors import InvalidUrlError
 from src.progress import ProgressEvent
 
 # "Me at the zoo" — pierwsze wideo wgrane na YouTube, ~19s, publiczne,
@@ -379,10 +379,8 @@ def test_engine_submit_passes_cookiefile_to_every_ydl_instance(monkeypatch, tmp_
     """Regresja: cookies.txt wgrany przez użytkownika (app.py przekazuje
     surowe bajty jako job.cookie_data, NIE ścieżkę) musi trafić do yt_dlp
     jako 'cookiefile' wskazujący na ISTNIEJĄCY plik na dysku z tą samą
-    zawartością — w KAŻDYM wywołaniu YoutubeDL, w tym w sondzie
-    _check_playlist_limit (bez cookiefile tam materiał z ograniczeniem
-    wiekowym nigdy nie dociera do głównego pobrania, które cookies miało).
-    Sprawdzamy realne opcje przekazane do YoutubeDL, nie tylko brak wyjątku."""
+    zawartością — w KAŻDYM wywołaniu YoutubeDL. Sprawdzamy realne opcje
+    przekazane do YoutubeDL, nie tylko brak wyjątku."""
     media_path = tmp_path / "Video.mp4"
     media_path.write_bytes(b"fake mp4 bytes")
 
@@ -411,18 +409,12 @@ def test_engine_submit_passes_cookiefile_to_every_ydl_instance(monkeypatch, tmp_
         session_id="test-session",
         job_id="test-job-cookies",
         cookie_data=cookie_bytes,
-        # playlist_scope="all" wymusza wywołanie _check_playlist_limit (patrz
-        # test_engine_submit_skips_playlist_limit_probe_when_scope_is_single)
-        # — bez tego byłoby tylko jedno wywołanie YoutubeDL, nie dwa.
-        playlist_scope="all",
     )
 
     result = engine.submit(job)
 
     assert result.path == media_path
-    # Dwa wywołania YoutubeDL: sonda _check_playlist_limit + główne pobranie —
-    # OBA muszą dostać cookiefile, nie tylko drugie.
-    assert len(captured_opts) == 2
+    assert len(captured_opts) == 1
     for opts in captured_opts:
         assert "cookiefile" in opts
         cookiefile_path = Path(opts["cookiefile"])
@@ -463,16 +455,13 @@ def test_engine_submit_sets_noplaylist_true_for_single_scope(monkeypatch, tmp_pa
 
     engine.submit(job)
 
-    # Główne pobranie jest zawsze OSTATNIM wywołaniem YoutubeDL (niezależnie
-    # od tego, czy poprzedziła je sonda _check_playlist_limit — to osobna
-    # sprawa, pokryta testem niżej) — sprawdzamy właśnie to wywołanie.
     assert captured_opts[-1]["noplaylist"] is True
 
 
-def test_engine_submit_skips_playlist_limit_probe_when_scope_is_single(monkeypatch, tmp_path):
-    """Sonda _check_playlist_limit jest zbędnym zapytaniem do YouTube, gdy
-    playlist_scope=="single" — noplaylist=True i tak ściągnie jedno wideo
-    niezależnie od liczby pozycji w URL-u."""
+def test_engine_submit_makes_single_ydl_call_when_scope_is_single(monkeypatch, tmp_path):
+    """submit() dla pojedynczego pobrania robi dokładnie jedno wywołanie
+    YoutubeDL (główne pobranie) — noplaylist=True ściąga jedno wideo
+    niezależnie od liczby pozycji w URL-u, bez żadnej sondy playlisty."""
     media_path = tmp_path / "Video.mp4"
     media_path.write_bytes(b"fake mp4 bytes")
     fake_info = {"requested_downloads": [{"filepath": str(media_path)}]}
@@ -500,120 +489,6 @@ def test_engine_submit_skips_playlist_limit_probe_when_scope_is_single(monkeypat
     engine.submit(job)
 
     assert call_count == 1  # tylko główne pobranie, żadnej sondy
-
-
-def test_engine_submit_runs_playlist_limit_probe_for_subtitle_mode_with_all_scope(
-    monkeypatch, tmp_path
-):
-    """Limit liczby pozycji obowiązuje we WSZYSTKICH trybach — sonda
-    _check_playlist_limit musi się wykonać także dla Subtitle/Transcript, gdy
-    playlist_scope=="all" (tak jak dla video/audio)."""
-    vtt_path = tmp_path / "Video.en.vtt"
-    vtt_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHi.\n", encoding="utf-8")
-    fake_info = {"requested_subtitles": {"en": {"filepath": str(vtt_path)}}}
-
-    call_count = 0
-
-    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
-        nonlocal call_count
-        call_count += 1
-        return _FakeYDL(opts, fake_info)
-
-    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
-    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
-
-    engine = DownloadEngine()
-    job = DownloadJob(
-        url="https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq",
-        mode="subtitle",
-        output_format="srt",
-        session_id="test-session",
-        job_id="test-job-subtitle-all-scope",
-        subtitle_lang="en",
-        playlist_scope="all",
-    )
-
-    engine.submit(job)
-
-    assert call_count == 2  # sonda limitu + główne pobranie
-
-
-def test_engine_submit_rejects_over_limit_playlist_for_subtitle_mode_with_all_scope(
-    monkeypatch, tmp_path
-):
-    download_attempted = False
-    flat_info = {
-        "_type": "playlist",
-        "entries": [{"id": f"video{i}"} for i in range(settings.max_playlist_items + 5)],
-    }
-
-    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
-        nonlocal download_attempted
-        if "extract_flat" not in opts:
-            download_attempted = True
-        return _FakeYDL(opts, flat_info)
-
-    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
-    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
-
-    job = DownloadJob(
-        url="https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq",
-        mode="transcript",
-        output_format="txt",
-        session_id="test-session",
-        job_id="test-job-transcript-all-scope-over-limit",
-        subtitle_lang="en",
-        playlist_scope="all",
-    )
-
-    with pytest.raises(EngineError) as exc_info:
-        DownloadEngine().submit(job)
-
-    assert isinstance(exc_info.value.original_exception, PlaylistTooLargeError)
-    assert download_attempted is False
-
-
-def test_check_playlist_limit_uses_in_playlist_flat_mode_not_bool(monkeypatch):
-    """Regresja: extract_flat=True (bool) dla URL-i "mixed" cicho WYŁĄCZAŁ
-    ochronę limitu (info bez 'entries' => _check_playlist_limit po prostu
-    wracał, nigdy nie podnosząc PlaylistTooLargeError, bez żadnego błędu).
-    Weryfikujemy realną opcję przekazaną do YoutubeDL."""
-    fake_info = {"entries": [{"id": "a"}, {"id": "b"}]}
-    captured_opts: list[dict] = []
-
-    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
-        captured_opts.append(opts)
-        return _FakeYDL(opts, fake_info)
-
-    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
-
-    DownloadEngine()._check_playlist_limit(
-        "https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
-    )
-
-    assert captured_opts[0]["extract_flat"] == "in_playlist"
-
-
-def test_check_playlist_limit_raises_for_mixed_url_shaped_response_over_limit(monkeypatch):
-    """End-to-end regresja dla drugiej konsekwencji tego samego buga: dla
-    URL-a "mixed" z liczbą pozycji przekraczającą MAX_PLAYLIST_ITEMS,
-    _check_playlist_limit MUSI faktycznie podnieść PlaylistTooLargeError —
-    z extract_flat=True (bool) tego nigdy nie robił (cicho wracał, myśląc,
-    że to nie playlista)."""
-    fake_info = {
-        "_type": "playlist",
-        "entries": [{"id": f"video{i}"} for i in range(settings.max_playlist_items + 5)],
-    }
-
-    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
-        return _FakeYDL(opts, fake_info)
-
-    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
-
-    with pytest.raises(PlaylistTooLargeError):
-        DownloadEngine()._check_playlist_limit(
-            "https://www.youtube.com/watch?v=uXlzoi70qUY&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq"
-        )
 
 
 def test_count_playlist_items_returns_entry_count_for_real_playlist(monkeypatch):
@@ -1239,10 +1114,9 @@ def test_submit_playlist_real_small_playlist_produces_zip_with_expected_file_cou
 
 
 def test_list_available_subtitles_passes_cookiefile_pointing_to_real_file_with_content(monkeypatch):
-    """Regresja: list_available_subtitles() ma tę samą sondę YoutubeDL co
-    _check_playlist_limit miał przed naprawą — bez cookiefile materiał z
-    ograniczeniem wiekowym nigdy nie zwróci listy języków, niezależnie od
-    tego, czy użytkownik wgrał cookies.txt (UI pokazywałby "nie znaleziono
+    """Regresja: bez cookiefile w sondzie list_available_subtitles()
+    materiał z ograniczeniem wiekowym nigdy nie zwróci listy języków,
+    niezależnie od tego, czy użytkownik wgrał cookies.txt (UI pokazywałby "nie znaleziono
     napisów" mimo poprawnych cookies do właściwego pobrania). Sprawdzamy
     realne opcje przekazane do YoutubeDL, nie tylko brak wyjątku — i że
     tymczasowy plik cookie jest usuwany zaraz po sondzie (nie żyje w job_dir,
@@ -1278,6 +1152,80 @@ def test_list_available_subtitles_passes_cookiefile_pointing_to_real_file_with_c
     # Sprzątnięty natychmiast po sondzie — ta funkcja nie ma job_dir do
     # późniejszego storage.cleanup(), więc musi posprzątać sama.
     assert not captured_cookiefile_path[0].exists()
+
+
+_COOKIE_BYTES = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tfoo\tbar\n"
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        engine_module.count_playlist_items,
+        engine_module.resolve_representative_video_url,
+        engine_module.snapshot_playlist,
+    ],
+    ids=["count_playlist_items", "resolve_representative_video_url", "snapshot_playlist"],
+)
+def test_playlist_probes_pass_cookiefile_with_content_and_clean_it_up(monkeypatch, probe):
+    """Sondy playlisty poza jobem (UI woła je PRZED pobraniem) idą przez
+    _temp_cookiefile → _probe_playlist_entries. Bez cookiefile w opcjach
+    YoutubeDL materiał z ograniczeniem wiekowym pada już na sondzie."""
+    fake_info = {"title": "Playlist", "entries": [{"id": "a", "title": "A"}]}
+    seen: list[tuple[Path, bytes]] = []
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        path = Path(opts["cookiefile"])  # KeyError => brak cookiefile w sondzie
+        seen.append((path, path.read_bytes()))  # musi istnieć w trakcie sondy
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+
+    probe(PLAYLIST_ONLY_URL, cookie_data=_COOKIE_BYTES)
+
+    assert [content for _, content in seen] == [_COOKIE_BYTES]
+    assert not seen[0][0].exists()  # tymczasowy plik sprzątnięty po sondzie
+
+
+def test_submit_playlist_probe_and_downloads_receive_cookiefile(monkeypatch, tmp_path):
+    """submit_playlist() pisze cookies.txt do job_dir i przekazuje go zarówno
+    do sondy listy pozycji, jak i do pobrania każdej pozycji."""
+    media_path = tmp_path / "Video.mp4"
+    media_path.write_bytes(b"fake mp4 bytes")
+    fake_info = {
+        "title": "Playlist",
+        "entries": [{"id": "a", "title": "A"}],
+        "requested_downloads": [{"filepath": str(media_path)}],
+        "uploader": "Channel",
+    }
+    captured_opts: list[dict] = []
+
+    def _fake_ydl_factory(opts: dict) -> _FakeYDL:
+        captured_opts.append(opts)
+        return _FakeYDL(opts, fake_info)
+
+    monkeypatch.setattr(engine_module, "YoutubeDL", _fake_ydl_factory)
+    monkeypatch.setattr(engine_module.storage, "create", lambda session_id, job_id: tmp_path)
+
+    job = DownloadJob(
+        url=PLAYLIST_ONLY_URL,
+        mode="video",
+        output_format="mp4",
+        session_id="test-session",
+        job_id="test-job-playlist-cookies",
+        playlist_scope="all",
+        cookie_data=_COOKIE_BYTES,
+    )
+
+    result = DownloadEngine().submit_playlist(job)
+
+    try:
+        # Sonda (extract_flat) + pobranie jednej pozycji — OBA z cookiefile.
+        assert len(captured_opts) == 2
+        assert "extract_flat" in captured_opts[0]
+        for opts in captured_opts:
+            assert Path(opts["cookiefile"]) == tmp_path / "cookies.txt"
+    finally:
+        storage.cleanup(result.zip_path.parent)
 
 
 def test_list_available_subtitles_forces_noplaylist_for_mixed_video_and_list_url(monkeypatch):

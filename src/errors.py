@@ -1,6 +1,6 @@
 """Mapowanie wyjątków pobierania na czytelne komunikaty. Patrz Warstwa 9 spec.
 
-Wyjątki domenowe (InvalidUrlError, PlaylistTooLargeError, FileTooLargeError)
+Wyjątki domenowe (InvalidUrlError, FileTooLargeError)
 są podnoszone przez validators/storage/engine, a `map_download_error`
 tłumaczy je — razem z surowym `yt_dlp.utils.DownloadError` — na komunikat
 w języku polskim, nigdy na surowy traceback.
@@ -15,10 +15,6 @@ from src.config import settings
 
 class InvalidUrlError(Exception):
     """URL nie przeszedł walidacji (validators.validate_url)."""
-
-
-class PlaylistTooLargeError(Exception):
-    """Playlista przekracza MAX_PLAYLIST_ITEMS — podnoszone przez engine.py."""
 
 
 class FileTooLargeError(Exception):
@@ -74,12 +70,6 @@ def map_download_error(exc: Exception) -> str:
         return (
             "Niepoprawny adres URL — akceptowane są tylko linki YouTube "
             "(youtube.com, youtu.be, music.youtube.com) po HTTPS."
-        )
-
-    if isinstance(exc, PlaylistTooLargeError):
-        return (
-            f"Playlista zawiera więcej pozycji niż dopuszczalny limit "
-            f"({settings.max_playlist_items}). Wybierz krótszą playlistę."
         )
 
     if isinstance(exc, FileTooLargeError):
