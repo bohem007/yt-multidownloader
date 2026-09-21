@@ -583,6 +583,9 @@ def test_download_link_stays_unique_across_full_continuation_chain_including_las
     pary renderów — w tym pary (przedostatnia tura → ostatnia), która
     poprzednio przeszła niezauważona, bo poprzedni test kończył się na
     JEDNYM przejściu z next_start_index wciąż ustawionym po obu stronach."""
+    # 12 pozycji musi mieścić się w limicie — bez tego etykieta radia to
+    # "pierwsze N z 12" (test przechodził tylko przy lokalnym .env z limitem ≥12).
+    monkeypatch.setattr(config_module, "settings", Settings.from_env({"MAX_PLAYLIST_ITEMS": "12"}))
     monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 12)
 
     calls: list[int] = []
