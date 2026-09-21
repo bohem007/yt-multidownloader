@@ -168,7 +168,10 @@ _MAX_SELECTED_INDICES_IN_FILENAME = 5
 
 
 def _build_playlist_zip_filename(
-    playlist_title: str | None, items: list, playlist_scope: str = "all"
+    playlist_title: str | None,
+    items: list,
+    playlist_scope: str = "all",
+    output_format: str | None = None,
 ) -> str:
     """Nazwa ZIP-a widoczna dla użytkownika — celowo NIE przez
     build_display_filename() (ta jest dla pojedynczych materiałów, format
@@ -187,7 +190,12 @@ def _build_playlist_zip_filename(
     jest z natury nieciągły, więc "-pozycje-{start}-{end}" sugerowałby
     błędnie, że pobrano WSZYSTKO między start a end. Krótka lista (≤5
     pozycji) trafia do nazwy wprost ("-pozycje-15,21,28"), dłuższa dostaje
-    fallback "-pozycje-wybrane", żeby nazwa pliku nie urosła bez ograniczeń."""
+    fallback "-pozycje-wybrane", żeby nazwa pliku nie urosła bez ograniczeń.
+
+    `output_format` (job.output_format: mp4/mp3/flac/srt/vtt/txt) trafia
+    tuż przed ".zip", PO całej nazwie z sufiksem pozycji ("...-pozycje-01-07.mp4.zip"),
+    żeby z samej nazwy było widać, jakie pliki są w środku. None (zdarzenie
+    bez tego pola) = stara nazwa bez rozszerzenia formatu."""
     if not playlist_title:
         base = "playlista"
     else:
@@ -198,18 +206,22 @@ def _build_playlist_zip_filename(
     if playlist_scope == "selected":
         indices = sorted({item.index for item in items if item.status != "skipped"})
         if not indices:
-            return f"{base}.zip"
-        if len(indices) <= _MAX_SELECTED_INDICES_IN_FILENAME:
-            suffix = ",".join(str(i) for i in indices)
-            return f"{base}-pozycje-{suffix}.zip"
-        return f"{base}-pozycje-wybrane.zip"
+            stem = base
+        elif len(indices) <= _MAX_SELECTED_INDICES_IN_FILENAME:
+            stem = f"{base}-pozycje-{','.join(str(i) for i in indices)}"
+        else:
+            stem = f"{base}-pozycje-wybrane"
+    else:
+        processed_range = _playlist_processed_range(items)
+        if processed_range is None:
+            stem = base
+        else:
+            start, end = processed_range
+            width = max(2, len(str(end)))
+            stem = f"{base}-pozycje-{start:0{width}d}-{end:0{width}d}"
 
-    processed_range = _playlist_processed_range(items)
-    if processed_range is None:
-        return f"{base}.zip"
-    start, end = processed_range
-    width = max(2, len(str(end)))
-    return f"{base}-pozycje-{start:0{width}d}-{end:0{width}d}.zip"
+    format_ext = f".{output_format}" if output_format else ""
+    return f"{stem}{format_ext}.zip"
 
 
 def _playlist_report_summary(items: list) -> tuple[int, int, str]:
@@ -327,7 +339,10 @@ def _render_progress(state: SessionState) -> None:
                 # i serwujemy jako zwykły link HTTP z dysku.
                 items = terminal_event.playlist_items
                 zip_name = _build_playlist_zip_filename(
-                    terminal_event.playlist_title, items, terminal_event.playlist_scope or "all"
+                    terminal_event.playlist_title,
+                    items,
+                    terminal_event.playlist_scope or "all",
+                    terminal_event.output_format,
                 )
                 previous_token = state.result_download_token
                 try:

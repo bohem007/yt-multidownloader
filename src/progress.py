@@ -51,3 +51,8 @@ class ProgressEvent:
     # polegania na aktualnym stanie widgetów UI w chwili renderowania
     # wyniku (który mógł się już zmienić od chwili zlecenia joba).
     playlist_scope: str | None = None
+    # job.output_format oryginalnego zadania (mp4/mp3/flac/srt/vtt/txt),
+    # niesiony na finalnym "on_finished" dla joba playlisty z tego samego
+    # powodu co playlist_scope — app.py dopisuje go do nazwy ZIP-a
+    # ("....mp4.zip") bez polegania na stanie widgetów z chwili renderowania.
+    output_format: str | None = None

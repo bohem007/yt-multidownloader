@@ -132,6 +132,7 @@ class JobRunner:
                         playlist_title=result.playlist_title,
                         next_start_index=result.next_start_index,
                         playlist_scope=job.playlist_scope,
+                        output_format=job.output_format,
                     )
                 )
             else:
