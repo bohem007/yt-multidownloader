@@ -1,6 +1,6 @@
 import pytest
 
-from src.validators import classify_url, validate_url
+from src.validators import classify_url, is_mix_playlist_url, validate_url
 
 
 @pytest.mark.parametrize(
@@ -58,3 +58,37 @@ def test_classify_url_youtu_be_without_list_is_single():
 
 def test_classify_url_empty_list_param_is_treated_as_single():
     assert classify_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=") == "single"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ",  # mix z wideo
+        "https://www.youtube.com/playlist?list=RDdQw4w9WgXcQ",
+        "https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RDAMVMdQw4w9WgXcQ",  # radio YT Music
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDMM",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDEMabcdef",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDCLAK5uy_abcdef",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDGMEMabcdef",
+        "https://youtu.be/dQw4w9WgXcQ?list=RDdQw4w9WgXcQ",
+    ],
+)
+def test_is_mix_playlist_url_true_for_rd_list_ids(url):
+    assert is_mix_playlist_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  # zwykłe wideo
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL3jltwT7zlHiI4lHQh8fdlHGhw4Lfp5Aq",
+        "https://www.youtube.com/playlist?list=OLAK5uy_abcdef",  # album YT Music
+        "https://www.youtube.com/playlist?list=UUabcdef",
+        "https://www.youtube.com/playlist?list=FLabcdef",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=",
+        "https://www.youtube.com/watch?v=RDdQw4w9WgXc",  # RD tylko w id wideo, nie listy
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=rdlowercase",  # prefiks jest wielkoliterowy
+    ],
+)
+def test_is_mix_playlist_url_false_for_other_urls(url):
+    assert is_mix_playlist_url(url) is False

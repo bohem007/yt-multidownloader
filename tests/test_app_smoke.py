@@ -22,7 +22,8 @@ import src.downloads as downloads
 import src.engine as engine_module
 from src.config import Settings
 from src.db import Database
-from src.engine import PlaylistDownloadResult, PlaylistItemResult
+from src.engine import PlaylistDownloadResult, PlaylistItemResult, PlaylistSnapshot
+from src.errors import EmptyPlaylistSnapshotError
 from src.progress import ProgressEvent
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
@@ -1351,3 +1352,251 @@ def test_playlist_zip_filename_without_output_format_falls_back_to_plain_zip(mon
     )
 
     assert name == "Playlista-Moja playlista-pozycje-01-02.zip"
+
+
+# --- Mix/Radio (list=RD…): migawka listy ------------------------------------
+
+
+def _mix_url(seed: str) -> str:
+    return f"https://www.youtube.com/watch?v={seed}&list=RD{seed}"
+
+
+def _mix_snapshot(url: str, count: int = 20, title: str = "Mix - Test") -> PlaylistSnapshot:
+    seed = url.split("v=")[1].split("&")[0]
+    entries = tuple(
+        {
+            "id": f"{seed}-{i}",
+            "url": f"https://www.youtube.com/watch?v={seed}-{i}",
+            "title": f"Tytuł {i}",
+        }
+        for i in range(1, count + 1)
+    )
+    return PlaylistSnapshot(url=url, title=title, entries=entries)
+
+
+def _patch_mix_engine(monkeypatch, count: int = 20, exc: Exception | None = None):
+    """Podstawia snapshot_playlist (zlicza wywołania) i count_playlist_items
+    (zlicza — dla mixa NIE może być wołany). Zwraca (snapshot_calls, count_calls)."""
+    snapshot_calls: list[str] = []
+    count_calls: list[str] = []
+
+    def _fake_snapshot(url, cookie_data=None):
+        snapshot_calls.append(url)
+        if exc is not None:
+            raise exc
+        return _mix_snapshot(url, count)
+
+    def _fake_count(url, cookie_data=None):
+        count_calls.append(url)
+        return 99
+
+    monkeypatch.setattr(engine_module, "snapshot_playlist", _fake_snapshot)
+    monkeypatch.setattr(engine_module, "count_playlist_items", _fake_count)
+    return snapshot_calls, count_calls
+
+
+def test_mix_url_shows_warning_and_up_to_n_items_from_snapshot(monkeypatch):
+    snapshot_calls, count_calls = _patch_mix_engine(monkeypatch, count=20)
+    url = _mix_url("mixwarn0001")
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(url).run()
+
+    assert not at.exception
+    assert at.radio(key="playlist_scope_radio").options == [
+        "Tylko to wideo",
+        "Cała playlista (do 20 pozycji)",
+        "Wybrane numery wideo z playlisty",
+    ]
+    warnings = [w.value for w in at.warning]
+    assert any("generowany dynamicznie" in w and "20 pozycji" in w and "migawki" in w for w in warnings)
+    # licznik z migawki — zwykła sonda (15-19 s, losowa liczba) nie jest wołana
+    assert snapshot_calls == [url]
+    assert count_calls == []
+    assert at.session_state["playlist_snapshot"].url == url
+
+
+def test_mix_snapshot_is_created_once_and_survives_reruns(monkeypatch):
+    snapshot_calls, _ = _patch_mix_engine(monkeypatch, count=5)
+    url = _mix_url("mixonce0001")
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(url).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (do 5 pozycji)").run()
+    at.run()
+    at.run()
+
+    assert not at.exception
+    assert snapshot_calls == [url]
+
+
+def test_mix_snapshot_is_reused_for_continuation_turn(monkeypatch, tmp_path):
+    """Tura 1 i tura 2 dostają TĘ SAMĄ migawkę; snapshot_playlist wołany raz
+    (kolejne tury nie odczytują listy od nowa), nazwa ZIP-a z zakresem
+    względem migawki i rozszerzeniem formatu."""
+    snapshot_calls, _ = _patch_mix_engine(monkeypatch, count=5)
+    received: list[tuple[PlaylistSnapshot | None, int]] = []
+
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1, selected_indices=None):
+        received.append((job.playlist_snapshot, start_index))
+        # osobny katalog na turę — app.py po publikacji woła storage.cleanup(zip.parent)
+        turn_dir = tmp_path / f"turn{len(received)}"
+        turn_dir.mkdir()
+        zip_file = turn_dir / "playlist.zip"
+        zip_file.write_bytes(b"fake zip bytes")
+        first_turn = len(received) == 1
+        indices = [1, 2] if first_turn else [3, 4, 5]
+        return PlaylistDownloadResult(
+            zip_path=zip_file,
+            items=[PlaylistItemResult(index=i, title=f"Wideo {i}", status="done") for i in indices],
+            playlist_title=job.playlist_snapshot.title,
+            next_start_index=3 if first_turn else None,
+        )
+
+    monkeypatch.setattr(engine_module.DownloadEngine, "submit_playlist", _fake_submit_playlist)
+
+    url = _mix_url("mixturns001")
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(url).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (do 5 pozycji)").run()
+    at.button(key="download_button").click().run()
+    for _ in range(30):
+        if at.session_state["status"] == "done" and len(received) == 1:
+            break
+        at.run()
+    assert at.session_state["playlist_next_start_index"] == 3
+
+    at.button(key="continue_playlist_button").click().run()
+    for _ in range(30):
+        if len(received) == 2 and at.session_state["status"] == "done":
+            break
+        at.run()
+
+    assert not at.exception
+    assert [start for _, start in received] == [1, 3]
+    assert received[0][0] is received[1][0]
+    assert received[0][0].url == url
+    assert snapshot_calls == [url]
+    assert at.session_state["result_file_name"] == "Playlista-Mix - Test-pozycje-03-05.mp4.zip"
+    assert at.session_state["playlist_next_start_index"] is None
+
+
+def test_new_url_button_invalidates_mix_snapshot(monkeypatch):
+    snapshot_calls, _ = _patch_mix_engine(monkeypatch, count=5)
+    url_a, url_b = _mix_url("mixnewurlA1"), _mix_url("mixnewurlB1")
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(url_a).run()
+    assert at.session_state["playlist_snapshot"].url == url_a
+
+    at.button(key="new_url_button").click().run()
+    assert at.session_state["playlist_snapshot"] is None
+
+    at.text_input(key="url_input").input(url_b).run()
+
+    assert not at.exception
+    assert snapshot_calls == [url_a, url_b]
+    assert at.session_state["playlist_snapshot"].url == url_b
+
+
+def test_snapshot_bound_to_a_different_url_is_not_reused(monkeypatch):
+    snapshot_calls, _ = _patch_mix_engine(monkeypatch, count=5)
+    old_url, new_url = _mix_url("mixstale0001"), _mix_url("mixstale0002")
+
+    at = _run_app(monkeypatch)
+    at.session_state["playlist_snapshot"] = _mix_snapshot(old_url, count=5)
+    at.text_input(key="url_input").input(new_url).run()
+
+    assert not at.exception
+    assert snapshot_calls == [new_url]
+    assert at.session_state["playlist_snapshot"].url == new_url
+
+
+def test_mix_playlist_only_url_without_v_shows_error_and_blocks_download(monkeypatch):
+    snapshot_calls, count_calls = _patch_mix_engine(monkeypatch)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input("https://www.youtube.com/playlist?list=RDmixnov00001").run()
+
+    assert not at.exception
+    assert any("v=" in e.value for e in at.error)
+    assert at.button(key="download_button").proto.disabled is True
+    assert len(at.radio) == 0
+    assert snapshot_calls == [] and count_calls == []
+
+
+def test_mix_snapshot_failure_shows_error_and_offers_only_single_video(monkeypatch):
+    _patch_mix_engine(monkeypatch, exc=EmptyPlaylistSnapshotError("pusta"))
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(_mix_url("mixfail00001")).run()
+
+    assert not at.exception
+    assert any("Nie udało się odczytać żadnych pozycji" in e.value for e in at.error)
+    assert at.radio(key="playlist_scope_radio").options == ["Tylko to wideo"]
+    assert at.session_state["playlist_snapshot"] is None
+
+
+def test_mix_limit_is_rd_limit_not_max_playlist_items(monkeypatch):
+    """20 pozycji migawki w Video przy MAX_PLAYLIST_ITEMS=10 nie blokuje
+    pobierania (limit dla mixa = MAX_PLAYLIST_RD_ITEMS, wbudowany w migawkę);
+    dotyczy też trybu wybranych numerów."""
+    monkeypatch.setattr(
+        config_module,
+        "settings",
+        Settings.from_env({"MAX_PLAYLIST_ITEMS": "10", "MAX_PLAYLIST_RD_ITEMS": "20"}),
+    )
+    _patch_mix_engine(monkeypatch, count=20)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(_mix_url("mixlimit0001")).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (do 20 pozycji)").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+    assert not any("limit" in w.value for w in at.warning)
+
+    at.radio(key="playlist_scope_radio").set_value("Wybrane numery wideo z playlisty").run()
+    at.text_input(key="selected_indices_input").input("1,2,3,4,5,6,7,8,9,10,11,12").run()
+
+    assert not at.exception
+    assert at.button(key="download_button").proto.disabled is False
+
+
+def test_mix_subtitle_probe_uses_first_snapshot_item_without_rereading_the_mix(monkeypatch):
+    _patch_mix_engine(monkeypatch, count=5)
+    probed: list[str] = []
+
+    def _fail_resolve(url, cookie_data=None):
+        raise AssertionError("resolve_representative_video_url nie może czytać mixa od nowa")
+
+    monkeypatch.setattr(engine_module, "resolve_representative_video_url", _fail_resolve)
+    monkeypatch.setattr(
+        engine_module,
+        "list_available_subtitles",
+        lambda url, cookie_data=None: probed.append(url) or {"manual": ["en"], "automatic": []},
+    )
+    url = _mix_url("mixsubs00001")
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(url).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (do 5 pozycji)").run()
+    at.selectbox(key="mode_select").set_value("Napisy (SRT / VTT)").run()
+
+    assert not at.exception
+    assert probed == ["https://www.youtube.com/watch?v=mixsubs00001-1"]
+
+
+def test_regular_playlist_url_does_not_use_snapshot(monkeypatch):
+    """Regresja: URL zwykłej playlisty (PL…) nadal idzie przez count_playlist_items."""
+    snapshot_calls, count_calls = _patch_mix_engine(monkeypatch)
+    url = "https://www.youtube.com/watch?v=regplaylist1&list=PLregplaylist1"
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(url).run()
+
+    assert not at.exception
+    assert snapshot_calls == []
+    assert count_calls == [url]
+    assert at.radio(key="playlist_scope_radio").options[1] == "Cała playlista (99 pozycji)"
+    assert at.session_state["playlist_snapshot"] is None

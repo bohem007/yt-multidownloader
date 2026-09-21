@@ -4,6 +4,8 @@ Settings.from_env przyjmuje dowolną mapę, więc testy nie muszą
 monkeypatchować os.environ ani przeładowywać modułu.
 """
 
+import pytest
+
 from src.config import Settings
 
 
@@ -15,6 +17,7 @@ def test_defaults_match_claude_md():
     assert s.db_schema == "dev"
     assert s.max_file_size_mb == 500
     assert s.max_playlist_items == 10
+    assert s.max_playlist_rd_items == 20
     assert s.max_zip_size_mb == 500
     assert s.max_concurrent_jobs == 2
     assert s.item_download_timeout_seconds == 180
@@ -31,6 +34,7 @@ def test_env_vars_override_defaults():
         "DB_SCHEMA": "public",
         "MAX_FILE_SIZE_MB": "250",
         "MAX_PLAYLIST_ITEMS": "5",
+        "MAX_PLAYLIST_RD_ITEMS": "7",
         "MAX_ZIP_SIZE_MB": "300",
         "MAX_CONCURRENT_JOBS": "4",
         "ITEM_DOWNLOAD_TIMEOUT_SECONDS": "60",
@@ -46,6 +50,7 @@ def test_env_vars_override_defaults():
     assert s.db_schema == "public"
     assert s.max_file_size_mb == 250
     assert s.max_playlist_items == 5
+    assert s.max_playlist_rd_items == 7
     assert s.max_zip_size_mb == 300
     assert s.max_concurrent_jobs == 4
     assert s.item_download_timeout_seconds == 60
@@ -53,6 +58,18 @@ def test_env_vars_override_defaults():
     assert s.rate_limit_per_ip == 20
     assert s.rate_limiting_enabled is False
     assert s.ip_hash_secret == "super-secret"
+
+
+def test_max_playlist_rd_items_is_independent_of_max_playlist_items():
+    s = Settings.from_env({"MAX_PLAYLIST_ITEMS": "3"})
+
+    assert s.max_playlist_items == 3
+    assert s.max_playlist_rd_items == 20
+
+
+def test_max_playlist_rd_items_rejects_non_numeric_value():
+    with pytest.raises(ValueError):
+        Settings.from_env({"MAX_PLAYLIST_RD_ITEMS": "dwadziescia"})
 
 
 def test_rate_limiting_enabled_accepts_common_truthy_and_falsy_strings():
