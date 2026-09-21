@@ -27,6 +27,8 @@ obowiązują lokalnie (`.env`) i w produkcji (HF Secrets/Variables) — patrz `.
 Ustalone wartości domyślne:
 - `MAX_FILE_SIZE_MB=500`
 - `MAX_PLAYLIST_ITEMS=10`
+- `MAX_PLAYLIST_RD_ITEMS=20` (limit migawki listy Mix/Radio `list=RD…`;
+  dla tych URL-i zastępuje `MAX_PLAYLIST_ITEMS`, we wszystkich trybach)
 - `MAX_ZIP_SIZE_MB=500` (twardy stop pętli pobierania playlisty po przekroczeniu
   rozmiaru ZIP-a tury — patrz „Kontrakty playlisty i pobierania")
 - `MAX_CONCURRENT_JOBS=2`
@@ -217,6 +219,12 @@ uv run pytest
   dla `selected` — lista numerów (`-pozycje-15,21`, ≤5 pozycji) albo fallback
   `-pozycje-wybrane` dla dłuższych; na końcu rozszerzenie formatu joba tuż
   przed `.zip` (`...-pozycje-01-07.mp4.zip`, z `ProgressEvent.output_format`).
+- **Mix/Radio (`list=RD…`):** lista dynamiczna (dwa odczyty = inne pozycje), więc
+  JEDEN odczyt → `PlaylistSnapshot` (`engine.snapshot_playlist`, limit
+  `MAX_PLAYLIST_RD_ITEMS`) w `st.session_state`, związany z URL-em, unieważniany
+  przez „Nowy URL". Tury, `selected_indices` i „do N" liczone względem migawki;
+  `submit_playlist` z `job.playlist_snapshot` NIGDY nie czyta listy ponownie.
+  Bez `v=` (`playlist?list=RD…`) YouTube zwraca „unviewable" — link odrzucany w UI.
 - **Stopka źródłowa w TXT:** `_finalize_transcript` dopisuje po
   `format_paragraphs` linię `Źródło: {Autor}-{Tytuł} {webpage_url} {data}` —
   dla pojedynczego wideo i każdej pozycji playlisty.
