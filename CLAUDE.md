@@ -98,6 +98,11 @@ uv run pytest -q -m "not slow"
 uv run pytest
 ```
 
+Testy (poza `@pytest.mark.db_integration`) nie dotykają bazy ani lokalnego `.env`:
+izolacja w `tests/conftest.py` (autouse `database_calls` podmienia `Database` i blokuje
+`psycopg.connect`; limity pinowane w `os.environ` przed importem `config`). Jedyne testy
+łączące się z Neon to `tests/test_db.py` — `slow` + `db_integration`, poza szybkim zestawem.
+
 ## Oszczędność kontekstu
 
 - Przed odczytem dużego pliku (zwłaszcza `src/engine.py`, `app.py`,

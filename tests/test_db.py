@@ -4,6 +4,9 @@ Pomijane automatycznie, gdy DATABASE_URL nie jest ustawiony (np. na CI
 bez dostępu do bazy). Zapisują i czyszczą własne wiersze w tabeli
 {DB_SCHEMA}.jobs, więc lokalnie warto trzymać DB_SCHEMA=dev (patrz
 CLAUDE.md — izolacja danych testowych od produkcyjnych).
+
+Oznaczone `slow` + `db_integration`: poza szybkim zestawem i poza izolacją
+bazy z tests/conftest.py — jedyne testy, które wolno łączyć z Neon.
 """
 
 import uuid
@@ -12,10 +15,14 @@ import pytest
 
 from src.config import settings
 
-pytestmark = pytest.mark.skipif(
-    not settings.database_url,
-    reason="Wymaga DATABASE_URL wskazującego na rzeczywistą bazę Neon (patrz .env)",
-)
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.db_integration,
+    pytest.mark.skipif(
+        not settings.database_url,
+        reason="Wymaga DATABASE_URL wskazującego na rzeczywistą bazę Neon (patrz .env)",
+    ),
+]
 
 
 @pytest.fixture

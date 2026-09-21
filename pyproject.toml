@@ -20,4 +20,5 @@ dev = [
 [tool.pytest.ini_options]
 markers = [
     "slow: testy integracyjne z realnym pobraniem/siecią — pomijane przez `-m \"not slow\"`",
+    "db_integration: test łączy się z realną bazą — wyłącza izolację `database_calls` z tests/conftest.py (zawsze razem z `slow`)",
 ]

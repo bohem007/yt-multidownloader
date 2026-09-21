@@ -1,10 +1,9 @@
 """Smoke testy app.py przez streamlit.testing.v1.AppTest.
 
-Bez realnego pobierania i bez realnych zapytań do Neon —
-Database.get_recent_history jest podstawiony atrapą (zakładka "Historia"
-wykonuje zapytanie na KAŻDYM rerunie skryptu, niezależnie od aktywnej
-zakładki — Streamlit renderuje treść wszystkich st.tabs() w każdym
-przebiegu), żeby testy były szybkie, deterministyczne i offline.
+Bez realnego pobierania i bez realnych zapytań do Neon — warstwę bazy
+(m.in. get_recent_history, którego zakładka "Historia" woła na KAŻDYM
+rerunie skryptu) podstawia autouse `database_calls` z tests/conftest.py,
+żeby testy były szybkie, deterministyczne i offline.
 """
 
 from __future__ import annotations
@@ -1806,3 +1805,41 @@ def test_e2e_selected_scope_downloads_first_n_of_sorted_selection(monkeypatch, t
     assert downloaded == ["e2e1", "e2e2", "e2e5"]
     assert [item.index for item in at.session_state["playlist_report"]] == [1, 2, 5]
     assert at.session_state["result_file_name"] == "Playlista-Playlista testowa-pozycje-1,2,5.mp4.zip"
+
+
+def test_clicking_download_writes_job_history_to_fake_not_real_database(
+    monkeypatch, tmp_path, database_calls
+):
+    """Strażnik izolacji bazy (tests/conftest.py::database_calls): kliknięcie
+    "Pobierz" woła Database.log_job_start (start joba) i log_job_finish
+    (koniec) — oba muszą trafić do atrapy, nie do Neon. Realne
+    psycopg.connect jest w testach zablokowane, więc ominięcie atrapy
+    kończyłoby się cichym db_job_id=None (app.py połyka wyjątek) — dlatego
+    asercje idą po rejestrze atrapy, nie po braku błędu."""
+    url = "https://www.youtube.com/watch?v=dbguard1&list=PLdbguard1"
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 3)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1, selected_indices=None):
+        # Niepusta lista: playlista z samymi błędami logowana jest jako "error".
+        items = [PlaylistItemResult(index=1, title="Wideo 1", status="done")]
+        return PlaylistDownloadResult(zip_path=zip_file, items=items, playlist_title="Fake")
+
+    monkeypatch.setattr(engine_module.DownloadEngine, "submit_playlist", _fake_submit_playlist)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(url).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (3 pozycji)").run()
+    assert database_calls.starts == []
+
+    at.button(key="download_button").click().run()
+    if at.session_state["status"] != "done":
+        at.run()
+
+    assert not at.exception
+    assert [call["url"] for call in database_calls.starts] == [url]
+    assert database_calls.starts[0]["client_ip_hash"] == "local-dev"
+    assert [call["job_id"] for call in database_calls.finishes] == [1]
+    assert database_calls.finishes[0]["status"] == "done"
