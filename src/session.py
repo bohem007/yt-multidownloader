@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     # Tylko do podpowiedzi typów (patrz analogiczny import w progress.py) —
     # engine.py nie importuje session.py, więc cyklu tu nie ma, ale bez
     # potrzeby resolwowania w runtime i tak importujemy leniwie/warunkowo.
-    from src.engine import PlaylistItemResult
+    from src.engine import PlaylistItemResult, PlaylistSnapshot
 
 Status = Literal["idle", "running", "done", "error"]
 
@@ -47,6 +47,7 @@ _PLAYLIST_SCOPE = "playlist_scope"
 _PLAYLIST_REPORT = "playlist_report"
 _PLAYLIST_TITLE = "playlist_title"
 _PLAYLIST_NEXT_START_INDEX = "playlist_next_start_index"
+_PLAYLIST_SNAPSHOT = "playlist_snapshot"
 
 # Pola "wyniku" zadania — czyszczone razem przy starcie nowego zadania
 # (set_running) i przy zmianie trybu/formatu z URL wciąż wypełnionym
@@ -77,6 +78,10 @@ _DEFAULTS: dict = {
     _LAST_MODE_FORMAT: None,
     _SUBTITLE_LANG: None,
     _PLAYLIST_SCOPE: "single",
+    # Celowo POZA _RESULT_FIELDS: migawka Mix/Radio musi przeżyć kolejne
+    # tury/wznowienia (set_running/clear_result jej nie ruszają), a znika
+    # dopiero przy reset() ("Nowy URL") albo zmianie URL-a (app.py).
+    _PLAYLIST_SNAPSHOT: None,
     **_RESULT_FIELDS,
 }
 
@@ -204,6 +209,13 @@ class SessionState:
         nie tylko przy starcie joba."""
         return self._store[_PLAYLIST_SCOPE]
 
+    @property
+    def playlist_snapshot(self) -> "PlaylistSnapshot | None":
+        """Migawka listy Mix/Radio (engine.snapshot_playlist) dla bieżącego
+        URL-a — jedyne źródło pozycji dla wszystkich tur/wybranych numerów
+        (bez ponownego odczytu playlisty). None = brak/unieważniona."""
+        return self._store[_PLAYLIST_SNAPSHOT]
+
     def reset(self) -> None:
         self._store.update(_DEFAULTS)
 
@@ -279,6 +291,9 @@ class SessionState:
 
     def set_playlist_scope(self, scope: str) -> None:
         self._store[_PLAYLIST_SCOPE] = scope
+
+    def set_playlist_snapshot(self, snapshot: "PlaylistSnapshot | None") -> None:
+        self._store[_PLAYLIST_SNAPSHOT] = snapshot
 
     def set_progress(self, percent: float, message: str) -> None:
         self._store[_STATUS] = "running"
