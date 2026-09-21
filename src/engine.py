@@ -23,6 +23,7 @@ from yt_dlp import YoutubeDL
 from src import storage
 from src.config import settings
 from src.errors import (
+    EmptyPlaylistSnapshotError,
     InvalidPlaylistSelectionError,
     InvalidUrlError,
     ItemDownloadTimeoutError,
@@ -34,6 +35,21 @@ from src.profiles import DownloadProfile, get_profile
 from src.progress import ProgressEvent
 from src.transcript_cleaner import clean_vtt_to_text, format_paragraphs
 from src.validators import validate_url
+
+
+@dataclass(frozen=True)
+class PlaylistSnapshot:
+    """Migawka listy Mix/Radio (list=RD…) zrobiona JEDEN raz (patrz
+    snapshot_playlist) — YouTube generuje takie listy dynamicznie, więc dwa
+    odczyty tego samego URL-a dają inne pozycje/kolejność. Wszystkie tury,
+    tryb "wybrane numery" i licznik pozycji pracują na tej migawce, nigdy na
+    ponownym odczycie. `entries` to dicty {"id", "url", "title"} — ten sam
+    kształt, który submit_playlist() czyta z sondy zwykłych playlist. `url`
+    to URL, dla którego zrobiono migawkę (UI unieważnia ją przy zmianie)."""
+
+    url: str
+    title: str | None
+    entries: tuple[dict, ...]
 
 
 @dataclass
@@ -76,6 +92,12 @@ class DownloadJob:
     # pozostałe WYBRANE pozycje trafiają do raportu jako "skipped" bez
     # przycisku kontynuacji (znane, udokumentowane ograniczenie).
     selected_indices: list[int] | None = None
+    # Mix/Radio (list=RD…): migawka listy zrobiona wcześniej przez UI
+    # (snapshot_playlist). Gdy ustawiona, submit_playlist() NIE odpytuje
+    # playlisty ponownie — numery pozycji (start_index/selected_indices)
+    # odnoszą się do tej migawki, a limit to MAX_PLAYLIST_RD_ITEMS (wbudowany
+    # w rozmiar migawki), nie MAX_PLAYLIST_ITEMS. None = zwykła playlista.
+    playlist_snapshot: PlaylistSnapshot | None = None
 
 
 @dataclass
@@ -250,7 +272,7 @@ def list_available_subtitles(url: str, cookie_data: bytes | None = None) -> dict
 
 
 def _probe_playlist_entries(
-    url: str, cookiefile: str | None = None
+    url: str, cookiefile: str | None = None, limit: int | None = None
 ) -> tuple[list[dict] | None, str | None]:
     """Sonda extract_flat=_PLAYLIST_FLAT_MODE współdzielona przez
     count_playlist_items, _check_playlist_limit i submit_playlist — JEDNA
@@ -264,6 +286,11 @@ def _probe_playlist_entries(
     probe_opts = _base_ydl_opts(cookiefile)
     probe_opts["skip_download"] = True
     probe_opts["extract_flat"] = _PLAYLIST_FLAT_MODE
+    if limit:
+        # Bez tego odczyt mixa trwa 13-27 s i zwraca setki/tysiące pozycji
+        # (Faza 0: 345-2589 wpisów, liczba niepowtarzalna między odczytami);
+        # z limitem ~1 s.
+        probe_opts["playlistend"] = limit
 
     with YoutubeDL(probe_opts) as probe:
         info = probe.extract_info(url, download=False)
@@ -312,6 +339,37 @@ def count_playlist_items(url: str, cookie_data: bytes | None = None) -> int | No
         entries, _ = _probe_playlist_entries(url, cookiefile_path)
 
     return len(entries) if entries is not None else None
+
+
+def snapshot_playlist(url: str, cookie_data: bytes | None = None) -> PlaylistSnapshot:
+    """Jednorazowy odczyt listy Mix/Radio (flat, bez pobierania) przycięty do
+    MAX_PLAYLIST_RD_ITEMS — patrz PlaylistSnapshot. Ta sama sonda co
+    count_playlist_items/submit_playlist (_probe_playlist_entries), tylko z
+    limitem odczytu. Pusta migawka rzuca EmptyPlaylistSnapshotError zamiast
+    zwracać pustą listę (inaczej job skończyłby się cichym, pustym ZIP-em);
+    krótsza niż limit jest zwracana taka, jaka jest."""
+    if not validate_url(url):
+        raise InvalidUrlError(url)
+
+    limit = settings.max_playlist_rd_items
+    with _temp_cookiefile(cookie_data) as cookiefile_path:
+        entries, title = _probe_playlist_entries(url, cookiefile_path, limit=limit)
+
+    trimmed: list[dict] = []
+    for entry in entries or []:
+        video_id = entry.get("id")
+        video_url = entry.get("url") or (
+            f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+        )
+        if not video_url:
+            continue
+        trimmed.append({"id": video_id, "url": video_url, "title": entry.get("title")})
+        if len(trimmed) >= limit:
+            break
+
+    if not trimmed:
+        raise EmptyPlaylistSnapshotError(url)
+    return PlaylistSnapshot(url=url, title=title, entries=tuple(trimmed))
 
 
 class DownloadEngine:
@@ -493,8 +551,17 @@ class DownloadEngine:
             job_dir = storage.create(job.session_id, job.job_id)
             cookiefile_path = self._write_cookiefile(job.cookie_data, job_dir)
 
-            entries, playlist_title = _probe_playlist_entries(job.url, cookiefile_path)
-            entries = entries or []
+            if job.playlist_snapshot is not None:
+                # Mix/Radio: pozycje i tytuł z migawki zrobionej wcześniej —
+                # NIGDY ponowny odczyt (lista mixa zmienia się między
+                # odczytami, tury dawałyby duplikaty i pominięcia).
+                entries = list(job.playlist_snapshot.entries)
+                playlist_title = job.playlist_snapshot.title
+                if not entries:
+                    raise EmptyPlaylistSnapshotError(job.url)
+            else:
+                entries, playlist_title = _probe_playlist_entries(job.url, cookiefile_path)
+                entries = entries or []
             total = len(entries)
 
             if selected_indices is not None:
@@ -517,7 +584,13 @@ class DownloadEngine:
             # pozycji (patrz docstring) — total playlisty jest tu celowo
             # nieistotny.
             limited_count = len(remaining_entries) if selected_indices is not None else total
-            if job.mode in ("video", "audio") and limited_count > settings.max_playlist_items:
+            # Migawka Mix/Radio jest z konstrukcji ≤ MAX_PLAYLIST_RD_ITEMS
+            # (snapshot_playlist), a ten limit ZASTĘPUJE tu MAX_PLAYLIST_ITEMS.
+            if (
+                job.playlist_snapshot is None
+                and job.mode in ("video", "audio")
+                and limited_count > settings.max_playlist_items
+            ):
                 raise PlaylistTooLargeError(
                     f"{limited_count} pozycji do pobrania, limit to {settings.max_playlist_items}"
                 )
@@ -777,7 +850,7 @@ class DownloadEngine:
                 # (requested_downloads[0]), więc przy wielu ściągniętych
                 # plikach cicho zwracał None → "Nie udało się ustalić
                 # ścieżki..." (dokładnie ten bug).
-                "noplaylist": job.playlist_scope == "single",
+                "noplaylist": job.playlist_scope == "single" or job.playlist_snapshot is not None,
             }
         )
 
