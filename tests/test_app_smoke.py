@@ -2064,6 +2064,55 @@ def test_history_is_shown_for_known_client_in_production(monkeypatch):
     assert len(at.dataframe) == 1
 
 
+def test_history_is_not_requeried_on_reruns_unrelated_to_history(monkeypatch):
+    """Cache w SessionState (Sesja B, Część C): ciało OBU zakładek wykonuje
+    się w KAŻDYM rerunie (st.tabs to tylko layout) — bez cache'a każda
+    interakcja z UI (np. przełączenie trybu) odpytywałaby bazę o historię,
+    mimo że nic w niej się nie zmieniło."""
+    at, queries = _open_history_app(monkeypatch, "hash-mine", {"hash-mine": []})
+    assert queries == [("hash-mine", 5)]
+
+    # Reruny niezwiązane z historią (np. inne widżety) — zero nowych zapytań.
+    at.selectbox(key="mode_select").select("Audio (MP3 / FLAC)").run()
+    at.selectbox(key="mode_select").select("Video (MP4)").run()
+    at.run()
+
+    assert not at.exception
+    assert queries == [("hash-mine", 5)]
+
+
+def test_history_is_requeried_after_job_finishes(monkeypatch, tmp_path):
+    """Koniec joba (_log_job_finish) jest jedynym zdarzeniem, które invaliduje
+    cache — dokładnie tam, gdzie wiersz w bazie faktycznie mógł przybyć."""
+    at, queries = _open_history_app(monkeypatch, "hash-mine", {"hash-mine": []})
+    assert queries == [("hash-mine", 5)]
+
+    result_file = tmp_path / "Uploader-Title.mp3"
+    result_file.write_bytes(b"fake mp3 bytes")
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=result_file,
+            result_uploader="Test Uploader",
+            result_title="Test Title",
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+    at.session_state["db_job_id"] = 42
+
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    # _log_job_finish wywołał invalidate_history_cache(); st.rerun() w
+    # _render_progress (scope="app" domyślnie) doprowadza w TYM SAMYM
+    # at.run() do ponownego renderu zakładki "Historia" → drugie zapytanie.
+    assert queries == [("hash-mine", 5), ("hash-mine", 5)]
+
+
 def test_client_hash_is_resolved_once_per_session_across_reruns(monkeypatch):
     resolved: list[int] = []
 

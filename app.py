@@ -295,6 +295,11 @@ def _log_job_finish(
 ) -> None:
     if state.db_job_id is None:
         return
+    # Koniec joba to jedyne zdarzenie, po którym wiersze historii w bazie
+    # realnie mogły się zmienić — invaliduje cache z zakładki "Historia"
+    # (patrz SessionState.invalidate_history_cache), niezależnie od tego,
+    # czy sam zapis niżej się powiedzie.
+    state.invalidate_history_cache()
     try:
         get_database().log_job_finish(
             state.db_job_id,
@@ -965,12 +970,22 @@ with tab_history:
         # "unknown", więc nie pokazujemy (ani nie pytamy o) żadnej historii.
         st.caption("Historia niedostępna dla tej sesji.")
     else:
-        try:
-            history = get_database().get_recent_history(client_ip_hash, history_days)
-        except Exception:
-            st.warning("Historia zadań jest tymczasowo niedostępna (baza może się właśnie wybudzać z uśpienia).")
-        else:
-            if not history:
-                st.caption(_history_empty_text(history_days))
+        # Ciało OBU zakładek wykonuje się w KAŻDYM rerunie (st.tabs to tylko
+        # layout, nie warunkowe wykonanie) — bez cache'a to odpytywałoby bazę
+        # przy każdej interakcji z UI, nie tylko gdy historia faktycznie mogła
+        # się zmienić. state.history_loaded=False tylko na starcie sesji i po
+        # invalidate_history_cache() (koniec joba, patrz _log_job_finish).
+        if not state.history_loaded:
+            try:
+                rows = get_database().get_recent_history(client_ip_hash, history_days)
+            except Exception:
+                state.set_history_cache(None, error=True)
             else:
-                st.dataframe(history)
+                state.set_history_cache(rows)
+
+        if state.history_error:
+            st.warning("Historia zadań jest tymczasowo niedostępna (baza może się właśnie wybudzać z uśpienia).")
+        elif not state.history_rows:
+            st.caption(_history_empty_text(history_days))
+        else:
+            st.dataframe(state.history_rows)

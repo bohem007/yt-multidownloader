@@ -49,6 +49,9 @@ _PLAYLIST_REPORT = "playlist_report"
 _PLAYLIST_TITLE = "playlist_title"
 _PLAYLIST_NEXT_START_INDEX = "playlist_next_start_index"
 _PLAYLIST_SNAPSHOT = "playlist_snapshot"
+_HISTORY_LOADED = "history_loaded"
+_HISTORY_ROWS = "history_rows"
+_HISTORY_ERROR = "history_error"
 
 # Pola "wyniku" zadania — czyszczone razem przy starcie nowego zadania
 # (set_running) i przy zmianie trybu/formatu z URL wciąż wypełnionym
@@ -217,6 +220,30 @@ class SessionState:
         (bez ponownego odczytu playlisty). None = brak/unieważniona."""
         return self._store[_PLAYLIST_SNAPSHOT]
 
+    @property
+    def history_loaded(self) -> bool:
+        """Czy historia była już wczytana od ostatniej invalidacji (koniec
+        joba, patrz invalidate_history_cache) — cache PRZETRWA reset()/"Nowy
+        URL" (jak client_ip_hash/session_id, celowo POZA _DEFAULTS), bo
+        historia nie zależy od aktualnego URL-a. Bez tego cache'a zakładka
+        "Historia" (app.py) odpytywałaby bazę przy KAŻDYM rerunie skryptu
+        (Streamlit wykonuje ciało OBU zakładek co rerun, nie tylko aktywnej),
+        nie tylko wtedy, gdy coś w historii faktycznie mogło się zmienić."""
+        return self._store.get(_HISTORY_LOADED, False)
+
+    @property
+    def history_rows(self) -> list[dict] | None:
+        """Wiersze z ostatniego udanego odczytu historii — None, dopóki nic
+        nie wczytano albo ostatnia próba się nie powiodła (history_error)."""
+        return self._store.get(_HISTORY_ROWS)
+
+    @property
+    def history_error(self) -> bool:
+        """True, gdy OSTATNIA próba wczytania historii rzuciła wyjątek —
+        app.py pokazuje wtedy neutralny komunikat zamiast tabeli/pustego
+        stanu, bez ponawiania próby przy każdym kolejnym rerunie."""
+        return self._store.get(_HISTORY_ERROR, False)
+
     def reset(self) -> None:
         self._store.update(_DEFAULTS)
 
@@ -302,6 +329,20 @@ class SessionState:
 
     def set_playlist_snapshot(self, snapshot: "PlaylistSnapshot | None") -> None:
         self._store[_PLAYLIST_SNAPSHOT] = snapshot
+
+    def set_history_cache(self, rows: list[dict] | None, *, error: bool = False) -> None:
+        """Zapisuje wynik odczytu historii (albo błąd) — patrz history_loaded."""
+        self._store[_HISTORY_LOADED] = True
+        self._store[_HISTORY_ROWS] = rows
+        self._store[_HISTORY_ERROR] = error
+
+    def invalidate_history_cache(self) -> None:
+        """Wymusza ponowny odczyt historii przy najbliższym renderze zakładki
+        "Historia" — wołane po zakończeniu joba (app.py::_log_job_finish),
+        jedynym zdarzeniu, które realnie mogło zmienić wiersze w bazie."""
+        self._store[_HISTORY_LOADED] = False
+        self._store[_HISTORY_ROWS] = None
+        self._store[_HISTORY_ERROR] = False
 
     def set_progress(self, percent: float, message: str) -> None:
         self._store[_STATUS] = "running"

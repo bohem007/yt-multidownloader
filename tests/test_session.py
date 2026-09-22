@@ -308,3 +308,56 @@ def test_client_ip_hash_is_resolved_once_and_survives_reset():
     state.reset()
     assert state.client_ip_hash(resolve) == "hash-a"
     assert len(calls) == 1
+
+
+def test_history_cache_defaults_to_not_loaded():
+    state = SessionState({})
+
+    assert state.history_loaded is False
+    assert state.history_rows is None
+    assert state.history_error is False
+
+
+def test_set_history_cache_stores_rows_and_marks_loaded():
+    state = SessionState({})
+    rows = [{"id": 1, "source_url": "https://youtu.be/x"}]
+
+    state.set_history_cache(rows)
+
+    assert state.history_loaded is True
+    assert state.history_rows == rows
+    assert state.history_error is False
+
+
+def test_set_history_cache_with_error_marks_loaded_without_rows():
+    state = SessionState({})
+
+    state.set_history_cache(None, error=True)
+
+    assert state.history_loaded is True
+    assert state.history_rows is None
+    assert state.history_error is True
+
+
+def test_invalidate_history_cache_resets_to_not_loaded():
+    state = SessionState({})
+    state.set_history_cache([{"id": 1}])
+
+    state.invalidate_history_cache()
+
+    assert state.history_loaded is False
+    assert state.history_rows is None
+    assert state.history_error is False
+
+
+def test_history_cache_survives_reset():
+    """Jak client_ip_hash/session_id — historia nie zależy od URL-a, więc
+    "Nowy URL" (reset()) nie powinien wymuszać ponownego odczytu z bazy."""
+    state = SessionState({})
+    rows = [{"id": 1, "source_url": "https://youtu.be/x"}]
+    state.set_history_cache(rows)
+
+    state.reset()
+
+    assert state.history_loaded is True
+    assert state.history_rows == rows
