@@ -77,7 +77,11 @@ class Database:
             conn: psycopg.Connection | None = None
             for attempt in range(_COLD_START_ATTEMPTS):
                 try:
-                    conn = psycopg.connect(settings.database_url, row_factory=dict_row)
+                    conn = psycopg.connect(
+                        settings.database_url,
+                        row_factory=dict_row,
+                        connect_timeout=settings.db_connect_timeout_seconds,
+                    )
                     break
                 except psycopg.OperationalError as exc:
                     last_error = exc

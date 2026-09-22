@@ -32,6 +32,7 @@ _PINNED_ENV = {
     "RATE_LIMIT_PER_IP": "10",
     "RATE_LIMITING_ENABLED": "false",
     "HISTORY_RETENTION_DAYS": "5",
+    "DB_CONNECT_TIMEOUT_SECONDS": "5",
     "IP_HASH_SECRET": "test-secret",
 }
 os.environ.update(_PINNED_ENV)

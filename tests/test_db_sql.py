@@ -5,12 +5,15 @@ psycopg.connect jest nadal zablokowane — połączenie wstrzykujemy do
 `Database._connect`. Zero sieci, zero sleep (zegar i "wątek" są wstrzykiwane).
 """
 
+import dataclasses
 import logging
 import threading
 from contextlib import contextmanager
 
+import psycopg
 import pytest
 
+import src.db as db_module
 from src.config import settings
 from src.db import _PURGE_INTERVAL_SECONDS, Database, _spawn_daemon
 
@@ -167,6 +170,55 @@ def test_failing_scheduler_never_breaks_job_start(conn, caplog):
         assert db.log_job_start("https://youtu.be/x", "video", "mp4") == 42
 
     assert "scheduling purge_old_jobs failed: RuntimeError" in caplog.text
+
+
+class _FakeRawConnection:
+    """Podstawka pod zwrot psycopg.connect() (niżej niż Database._connect —
+    ten test celowo NIE podmienia _connect, żeby faktycznie wywołać
+    psycopg.connect z kwargs, które go interesują)."""
+
+    def commit(self) -> None:
+        pass
+
+    def rollback(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_connect_passes_configured_connect_timeout_to_psycopg(monkeypatch):
+    captured: dict = {}
+
+    def _fake_psycopg_connect(conninfo, **kwargs):
+        captured["conninfo"] = conninfo
+        captured.update(kwargs)
+        return _FakeRawConnection()
+
+    monkeypatch.setattr(psycopg, "connect", _fake_psycopg_connect)
+
+    with _make_db()._connect():
+        pass
+
+    assert captured["connect_timeout"] == settings.db_connect_timeout_seconds
+
+
+def test_connect_uses_custom_connect_timeout_from_settings(monkeypatch):
+    captured: dict = {}
+
+    def _fake_psycopg_connect(conninfo, **kwargs):
+        captured.update(kwargs)
+        return _FakeRawConnection()
+
+    monkeypatch.setattr(psycopg, "connect", _fake_psycopg_connect)
+    monkeypatch.setattr(
+        db_module, "settings", dataclasses.replace(settings, db_connect_timeout_seconds=42)
+    )
+
+    with _make_db()._connect():
+        pass
+
+    assert captured["connect_timeout"] == 42
 
 
 def test_spawn_daemon_runs_function_on_a_daemon_thread():
