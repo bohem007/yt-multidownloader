@@ -110,10 +110,11 @@ def map_download_error(exc: Exception) -> str:
         if any(marker in message for marker in _AGE_RESTRICTED_MARKERS):
             return (
                 "YouTube blokuje pobranie tego materiału pomimo prawidłowych "
-                "cookies — to znane, aktualne ograniczenie techniczne yt-dlp "
-                "dla części treści z ograniczeniem wiekowym, niezwiązane "
-                "z ustawieniami Twojego konta Google. Aplikacja obecnie nie "
-                "obsługuje obejścia tego ograniczenia."
+                "cookies — to znane ograniczenie techniczne yt-dlp dla części "
+                "treści z ograniczeniem wiekowym, niezwiązane z ustawieniami "
+                "Twojego konta Google. Materiał w standardowej jakości może "
+                "zadziałać po skonfigurowaniu lokalnego silnika JavaScript "
+                "(Deno) — wysoka jakość pozostaje nieobsługiwana."
             )
 
         if any(marker in message for marker in _SUBTITLE_MARKERS):
