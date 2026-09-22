@@ -79,6 +79,11 @@ class Settings:
     ip_hash_secret: str = ""
     # Retencja historii zadań (widok "Historia" + kasowanie starych wierszy).
     history_retention_days: int = 5
+    # Twardy limit czasu (sekundy) na SAM psycopg.connect() — bez tego
+    # niedostępna/wolna baza blokuje wątek Streamlita bezterminowo (obserwowane:
+    # >6 minut lokalnie bez .env). Niezależny od retry/backoff w db.py::_connect
+    # (_COLD_START_ATTEMPTS) — ten limit dotyczy KAŻDEJ pojedynczej próby.
+    db_connect_timeout_seconds: int = 5
     # True tylko gdy ENVIRONMENT był jawnie ustawiony (nie wzięty z domyślnej
     # wartości "local") — fail-closed dla historii sesji o nieznanym adresie.
     environment_explicit: bool = False
@@ -108,15 +113,33 @@ class Settings:
             raise ValueError(
                 f"HISTORY_RETENTION_DAYS musi być >= 1 (jest: {history_retention_days})"
             )
+        db_connect_timeout_seconds = int(
+            env.get("DB_CONNECT_TIMEOUT_SECONDS", defaults.db_connect_timeout_seconds)
+        )
+        if db_connect_timeout_seconds < 1:
+            raise ValueError(
+                f"DB_CONNECT_TIMEOUT_SECONDS musi być >= 1 (jest: {db_connect_timeout_seconds})"
+            )
+        max_playlist_items = int(env.get("MAX_PLAYLIST_ITEMS", defaults.max_playlist_items))
+        if max_playlist_items < 1:
+            raise ValueError(
+                f"MAX_PLAYLIST_ITEMS musi być >= 1 (jest: {max_playlist_items}) — "
+                "0 przycina playlisty do pustego wyniku bez błędu, patrz engine.py::submit_playlist"
+            )
+        max_playlist_rd_items = int(
+            env.get("MAX_PLAYLIST_RD_ITEMS", defaults.max_playlist_rd_items)
+        )
+        if max_playlist_rd_items < 1:
+            raise ValueError(
+                f"MAX_PLAYLIST_RD_ITEMS musi być >= 1 (jest: {max_playlist_rd_items})"
+            )
         return cls(
             environment=environment,
             database_url=database_url,
             db_schema=env.get("DB_SCHEMA", defaults.db_schema),
             max_file_size_mb=int(env.get("MAX_FILE_SIZE_MB", defaults.max_file_size_mb)),
-            max_playlist_items=int(env.get("MAX_PLAYLIST_ITEMS", defaults.max_playlist_items)),
-            max_playlist_rd_items=int(
-                env.get("MAX_PLAYLIST_RD_ITEMS", defaults.max_playlist_rd_items)
-            ),
+            max_playlist_items=max_playlist_items,
+            max_playlist_rd_items=max_playlist_rd_items,
             max_zip_size_mb=int(env.get("MAX_ZIP_SIZE_MB", defaults.max_zip_size_mb)),
             max_concurrent_jobs=int(env.get("MAX_CONCURRENT_JOBS", defaults.max_concurrent_jobs)),
             item_download_timeout_seconds=int(
@@ -131,6 +154,7 @@ class Settings:
             ),
             ip_hash_secret=env.get("IP_HASH_SECRET", defaults.ip_hash_secret),
             history_retention_days=history_retention_days,
+            db_connect_timeout_seconds=db_connect_timeout_seconds,
             environment_explicit=bool(env.get("ENVIRONMENT")),
             storage_base_dir=storage_base_dir,
         )

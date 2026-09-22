@@ -28,6 +28,7 @@ def test_defaults_match_claude_md():
     assert s.rate_limiting_enabled is True
     assert s.ip_hash_secret == ""
     assert s.history_retention_days == 5
+    assert s.db_connect_timeout_seconds == 5
     assert s.environment_explicit is False
 
 
@@ -47,6 +48,7 @@ def test_env_vars_override_defaults():
         "RATE_LIMITING_ENABLED": "false",
         "IP_HASH_SECRET": "super-secret",
         "HISTORY_RETENTION_DAYS": "14",
+        "DB_CONNECT_TIMEOUT_SECONDS": "8",
     }
     s = Settings.from_env(env)
 
@@ -64,6 +66,7 @@ def test_env_vars_override_defaults():
     assert s.rate_limiting_enabled is False
     assert s.ip_hash_secret == "super-secret"
     assert s.history_retention_days == 14
+    assert s.db_connect_timeout_seconds == 8
     assert s.environment_explicit is True
 
 
@@ -144,6 +147,34 @@ def test_history_retention_days_rejects_values_below_one(value):
 def test_history_retention_days_rejects_non_numeric_value():
     with pytest.raises(ValueError):
         Settings.from_env({"HISTORY_RETENTION_DAYS": "kilka"})
+
+
+@pytest.mark.parametrize("value", ["0", "-3"])
+def test_db_connect_timeout_seconds_rejects_values_below_one(value):
+    with pytest.raises(ValueError, match="DB_CONNECT_TIMEOUT_SECONDS"):
+        Settings.from_env({"DB_CONNECT_TIMEOUT_SECONDS": value})
+
+
+def test_db_connect_timeout_seconds_rejects_non_numeric_value():
+    with pytest.raises(ValueError):
+        Settings.from_env({"DB_CONNECT_TIMEOUT_SECONDS": "kilka"})
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_max_playlist_items_rejects_values_below_one(value):
+    with pytest.raises(ValueError, match="MAX_PLAYLIST_ITEMS"):
+        Settings.from_env({"MAX_PLAYLIST_ITEMS": value})
+
+
+def test_max_playlist_items_rejects_non_numeric_value():
+    with pytest.raises(ValueError):
+        Settings.from_env({"MAX_PLAYLIST_ITEMS": "kilka"})
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_max_playlist_rd_items_rejects_values_below_one(value):
+    with pytest.raises(ValueError, match="MAX_PLAYLIST_RD_ITEMS"):
+        Settings.from_env({"MAX_PLAYLIST_RD_ITEMS": value})
 
 
 def test_environment_is_not_explicit_when_missing_or_empty():
