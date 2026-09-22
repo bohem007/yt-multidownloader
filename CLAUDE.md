@@ -26,9 +26,10 @@ obowiązują lokalnie (`.env`) i w produkcji (HF Secrets/Variables) — patrz `.
 
 Ustalone wartości domyślne:
 - `MAX_FILE_SIZE_MB=500`
-- `MAX_PLAYLIST_ITEMS=10`
+- `MAX_PLAYLIST_ITEMS=10` (walidacja `>= 1` przy imporcie configu — `0` przycinałoby
+  playlisty do cichego pustego wyniku, bez błędu)
 - `MAX_PLAYLIST_RD_ITEMS=20` (limit migawki listy Mix/Radio `list=RD…`;
-  dla tych URL-i zastępuje `MAX_PLAYLIST_ITEMS`, we wszystkich trybach)
+  dla tych URL-i zastępuje `MAX_PLAYLIST_ITEMS`, we wszystkich trybach; też `>= 1`)
 - `MAX_ZIP_SIZE_MB=500` (twardy stop pętli pobierania playlisty po przekroczeniu
   rozmiaru ZIP-a tury — patrz „Kontrakty playlisty i pobierania")
 - `MAX_CONCURRENT_JOBS=2`
@@ -37,6 +38,8 @@ Ustalone wartości domyślne:
 - `DOWNLOAD_LINK_TTL_MINUTES=30` (jak długo ZIP playlisty czeka na dysku pod linkiem)
 - `RATE_LIMIT_PER_IP=10` (żądań/godzinę)
 - `RATE_LIMITING_ENABLED` — domyślnie włączone w `production`, opcjonalne lokalnie
+- `DB_CONNECT_TIMEOUT_SECONDS=5` (walidacja `>= 1`; twardy limit czasu na SAM
+  `psycopg.connect()` w `db.py::_connect` — patrz „Odporność warstwy bazy")
 - `ENVIRONMENT=local|production`
 
 (pełna lista zmiennych, włącznie z tymi niebędącymi limitami — `DB_SCHEMA`,
@@ -181,6 +184,17 @@ jako sekrety) trafiają do HF Secrets/Variables, nigdy do obrazu.
   (`src/client_identity.py`); `st.context.ip_address` NIE służy do tego (za proxy HF wspólny dla
   wszystkich). Brak adresu → `"unknown"`: historia takiej sesji tylko przy JAWNYM `ENVIRONMENT=local`.
   Wiersze starsze niż retencja kasuje `Database.purge_old_jobs` (best effort, raz/h na proces).
+- **Odporność warstwy bazy.** `db.py::_connect` przekazuje `connect_timeout=
+  DB_CONNECT_TIMEOUT_SECONDS` (domyślnie 5s) do `psycopg.connect` — bez tego
+  pojedyncza próba połączenia nie miała żadnego limitu czasu. Zapis historii
+  (`log_job_start`/`log_job_finish`, wołane z `app.py`) NIGDY nie blokuje ani
+  nie przerywa pobierania: wyjątek jest tam cicho połykany (`try/except:
+  pass`/`db_job_id=None`, bez logowania) — świadomy kompromis, priorytet to
+  nieprzerwanie ścieżki pobierania, nie diagnostyka awarii zapisu. Historia w
+  `app.py` (zakładka „Historia") jest czytana z cache w `SessionState`
+  (`history_loaded`/`set_history_cache`/`invalidate_history_cache`), NIE przy
+  każdym rerunie — `st.tabs()` to tylko layout, ciało obu zakładek wykonuje
+  się w każdym rerunie skryptu; cache invaliduje wyłącznie koniec joba.
 - **Współbieżność:** `threading.Semaphore(MAX_CONCURRENT_JOBS)`, domyślnie 2.
 - **Rate limiting per IP jest obowiązkowy** (Space jest Public) — Warstwa 11a,
   włącz/wyłącz przez `RATE_LIMITING_ENABLED`.
