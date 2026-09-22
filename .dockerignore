@@ -1,0 +1,31 @@
+# Sekrety i env lokalny — nigdy w obrazie.
+.env
+.env.*
+!.env.example
+
+# Środowisko i narzędzia deweloperskie.
+.venv
+.git
+.gitignore
+.python-version
+.vscode
+.claude
+.agents
+
+# Cache/artefakty Pythona.
+__pycache__/
+**/__pycache__/
+*.py[oc]
+.pytest_cache
+
+# Testy i dokumentacja robocza — niepotrzebne w obrazie produkcyjnym.
+tests/
+docs/
+CLAUDE.md
+
+# Cookies i pliki tymczasowe pobierania — nigdy w repo ani w obrazie.
+cookies*
+*.zip
+
+# Storage efemeryczny z lokalnych uruchomień, gdyby kiedyś powstał pod repo.
+storage/
