@@ -1846,6 +1846,81 @@ def test_clicking_download_writes_job_history_to_fake_not_real_database(
     assert database_calls.finishes[0]["status"] == "done"
 
 
+def _playlist_job_url_and_submit_mock(monkeypatch, tmp_path, url):
+    """Wspólny setup dla testów regresyjnych nieblokującego zapisu do bazy —
+    identyczny mechanizm co test_clicking_download_writes_job_history_..., bez
+    asercji po rejestrze atrapy (tu podmieniamy metody Database na wyjątki)."""
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 3)
+
+    zip_file = tmp_path / "playlist.zip"
+    zip_file.write_bytes(b"fake zip bytes")
+
+    def _fake_submit_playlist(self, job, on_event=None, start_index=1, selected_indices=None):
+        items = [PlaylistItemResult(index=1, title="Wideo 1", status="done")]
+        return PlaylistDownloadResult(zip_path=zip_file, items=items, playlist_title="Fake")
+
+    monkeypatch.setattr(engine_module.DownloadEngine, "submit_playlist", _fake_submit_playlist)
+
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input(url).run()
+    at.radio(key="playlist_scope_radio").set_value("Cała playlista (3 pozycji)").run()
+    return at
+
+
+def test_log_job_start_failure_does_not_block_download(monkeypatch, tmp_path, database_calls):
+    """Regresja (Sesja B, Część B): wyjątek z Database.log_job_start (baza
+    nieosiągalna/zawieszona) NIE blokuje kliknięcia "Pobierz" — app.py już
+    łapie to w try/except (db_job_id zostaje None), pobieranie idzie dalej
+    normalnie do statusu "done". Ten mechanizm istniał już PRZED Sesją B —
+    ten test go tylko pilnuje (guard przed regresją), Faza 0 potwierdziła,
+    że realny problem był w braku connect_timeout, nie w braku try/except."""
+
+    def _boom_log_job_start(self, url, mode, output_format, client_ip_hash=None):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(Database, "log_job_start", _boom_log_job_start)
+
+    url = "https://www.youtube.com/watch?v=dbguard2&list=PLdbguard2"
+    at = _playlist_job_url_and_submit_mock(monkeypatch, tmp_path, url)
+
+    at.button(key="download_button").click().run()
+    if at.session_state["status"] != "done":
+        at.run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    assert at.session_state["db_job_id"] is None
+    # _log_job_finish (app.py) wraca wcześnie, gdy db_job_id is None — atrapa
+    # log_job_finish (z database_calls) nigdy nie powinna zostać wywołana.
+    assert database_calls.finishes == []
+
+
+def test_log_job_finish_failure_does_not_break_ui(monkeypatch, tmp_path, database_calls):
+    """Regresja (Sesja B, Część B): wyjątek z Database.log_job_finish (baza
+    padła W TRAKCIE pobierania, po udanym log_job_start) NIE psuje UI po
+    zakończeniu joba — _log_job_finish (app.py) łapie to w try/except: pass."""
+
+    def _boom_log_job_finish(self, job_id, status, duration_ms=None, file_size_bytes=None, error_message=None):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(Database, "log_job_finish", _boom_log_job_finish)
+
+    url = "https://www.youtube.com/watch?v=dbguard3&list=PLdbguard3"
+    at = _playlist_job_url_and_submit_mock(monkeypatch, tmp_path, url)
+    assert database_calls.starts == []
+
+    at.button(key="download_button").click().run()
+    if at.session_state["status"] != "done":
+        at.run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    # log_job_start poszedł normalną (atrapą) ścieżką — db_job_id ustawiony,
+    # tylko finish wybuchł i został połknięty.
+    assert [call["url"] for call in database_calls.starts] == [url]
+    assert at.session_state["db_job_id"] is not None
+
+
 # --- Historia pobrań: tylko własne pobrania, ostatnie N dni ------------------
 
 HISTORY_CAPTION_TITLE = "Historia pobrań (ostatnie 5 dni)"
