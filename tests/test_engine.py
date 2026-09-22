@@ -6,6 +6,7 @@ Wymaga dostępu do internetu i ffmpeg na PATH.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 import zipfile
@@ -422,6 +423,60 @@ def test_engine_submit_passes_cookiefile_to_every_ydl_instance(monkeypatch, tmp_
         assert cookiefile_path.read_bytes() == cookie_bytes
         # Plik cookie żyje w job_dir (tmp_path), nie w systemowym katalogu temp.
         assert cookiefile_path.parent == tmp_path
+
+
+def test_base_ydl_opts_omits_remote_components_when_unset(monkeypatch):
+    """Domyślny YTDLP_REMOTE_COMPONENTS jest pusty — brak klucza w opcjach,
+    yt-dlp nie próbuje pobierać niczego zdalnie (zero zmiany zachowania dla
+    materiałów, którym solver EJS nie jest potrzebny)."""
+    monkeypatch.setattr(engine_module, "settings", Settings.from_env({}))
+
+    opts = engine_module._base_ydl_opts()
+
+    assert "remote_components" not in opts
+
+
+def test_base_ydl_opts_passes_remote_components_when_configured(monkeypatch):
+    """YTDLP_REMOTE_COMPONENTS trafia do KAŻDEJ instancji YoutubeDL (patrz
+    _base_ydl_opts) jako zbiór komponentów, tym samym mechanizmem co
+    cookiefile — solver wyzwań podpisu/"n" bywa potrzebny już na sondach."""
+    monkeypatch.setattr(
+        engine_module, "settings", Settings.from_env({"YTDLP_REMOTE_COMPONENTS": "ejs:github"})
+    )
+
+    opts = engine_module._base_ydl_opts()
+
+    assert opts["remote_components"] == {"ejs:github"}
+
+
+def test_base_ydl_opts_parses_comma_separated_remote_components(monkeypatch):
+    monkeypatch.setattr(
+        engine_module,
+        "settings",
+        Settings.from_env({"YTDLP_REMOTE_COMPONENTS": "ejs:github, ejs:npm"}),
+    )
+
+    opts = engine_module._base_ydl_opts()
+
+    assert opts["remote_components"] == {"ejs:github", "ejs:npm"}
+
+
+def test_warn_if_deno_missing_logs_warning_when_deno_not_on_path(monkeypatch, caplog):
+    monkeypatch.setattr(engine_module.shutil, "which", lambda name: None)
+
+    with caplog.at_level(logging.WARNING):
+        engine_module.warn_if_deno_missing()
+
+    assert any("Deno" in record.message for record in caplog.records)
+
+
+def test_warn_if_deno_missing_silent_when_deno_present(monkeypatch, caplog):
+    monkeypatch.setattr(engine_module.shutil, "which", lambda name: "C:/deno/deno.exe")
+
+    with caplog.at_level(logging.WARNING):
+        engine_module.warn_if_deno_missing()
+
+    assert caplog.records == []
 
 
 def test_engine_submit_sets_noplaylist_true_for_single_scope(monkeypatch, tmp_path):

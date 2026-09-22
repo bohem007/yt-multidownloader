@@ -23,10 +23,12 @@ from starlette.routing import Route
 
 from src import downloads, storage
 from src.download_routes import DOWNLOAD_ROUTE, download_endpoint
+from src.engine import warn_if_deno_missing
 
 
 @asynccontextmanager
 async def lifespan(_app):
+    warn_if_deno_missing()
     downloads.purge_all()
     # Katalogi pojedynczych jobów (storage.py) nie mają swojego TTL-sprzątania
     # w tle jak linki ZIP powyżej — po awarii procesu w trakcie pobierania

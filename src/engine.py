@@ -10,6 +10,8 @@ widocznej dla użytkownika — patrz _resolve_result.
 from __future__ import annotations
 
 import concurrent.futures
+import logging
+import shutil
 import tempfile
 import zipfile
 from contextlib import contextmanager
@@ -187,12 +189,42 @@ def _base_ydl_opts(cookiefile: str | None = None) -> dict:
     extractor_args player_client=["mweb"] tutaj została WYCOFANA — łamała
     ekstrakcję formatów dla zwykłych żądań bez ograniczenia wiekowego
     (potwierdzone: "No video formats found!" na standardowym wideo
-    testowym). Dla treści z ograniczeniem wiekowym, którego cookies nie
-    ominą, patrz komunikat _AGE_RESTRICTED_MARKERS w errors.py."""
+    testowym).
+
+    remote_components (patrz CLAUDE.md, "Solver wyzwań JS dla treści z
+    ograniczeniem wiekowym") trafia do KAŻDEJ instancji z tego samego
+    powodu co cookiefile — solver podpisu/"n" jest potrzebny już na
+    sondach, nie tylko przy właściwym pobraniu. Pusty
+    YTDLP_REMOTE_COMPONENTS (domyślnie) = brak zmiany zachowania, yt-dlp
+    nic nie pobiera zdalnie. Wymaga lokalnie zainstalowanego Deno — patrz
+    warn_if_deno_missing()."""
     opts: dict = {"quiet": True, "no_warnings": True}
     if cookiefile:
         opts["cookiefile"] = cookiefile
+    if settings.ytdlp_remote_components:
+        opts["remote_components"] = {
+            component.strip()
+            for component in settings.ytdlp_remote_components.split(",")
+            if component.strip()
+        }
     return opts
+
+
+def warn_if_deno_missing() -> None:
+    """Ostrzega (log, nie wyjątek) o braku Deno w PATH przy starcie aplikacji.
+
+    Deno to wymóg środowiska (jak ffmpeg), NIE zależność pip/uv — bez niego
+    solver wyzwań podpisu/"n" nie działa i treści z ograniczeniem wiekowym
+    kończą się błędem (patrz _base_ydl_opts, YTDLP_REMOTE_COMPONENTS), ale
+    reszta aplikacji (materiały bez ograniczeń) działa identycznie — stąd
+    ostrzeżenie, nie twardy błąd startu."""
+    if shutil.which("deno") is None:
+        logging.getLogger(__name__).warning(
+            "Deno nie jest dostępne w PATH — pobieranie treści z ograniczeniem "
+            "wiekowym może kończyć się błędem 'age-restricted' nawet z "
+            "prawidłowymi cookies. Zainstaluj Deno (patrz README.md), jeśli "
+            "chcesz obsługiwać takie materiały."
+        )
 
 
 @contextmanager
