@@ -123,8 +123,9 @@ testuje prawdziwy SQL na fałszywym połączeniu (w szybkim zestawie, `psycopg.c
 
 ```
 /
-├── Dockerfile              # tylko do wdrożenia HF, nie lokalnie (jeszcze nie istnieje)
-├── docker-compose.yml      # (jeszcze nie istnieje)
+├── Dockerfile              # tylko do wdrożenia HF, nie lokalnie
+├── .dockerignore
+├── README.md               # nagłówek YAML HF (sdk: docker, app_port: 7860) + opis
 ├── pyproject.toml / uv.lock
 ├── schema.sql
 ├── .env.example
@@ -149,6 +150,13 @@ testuje prawdziwy SQL na fałszywym połączeniu (w szybkim zestawie, `psycopg.c
 ├── tests/
 └── .vscode/
 ```
+
+Produkcja (HF Spaces): `Dockerfile` uruchamia `uv run streamlit run asgi_app.py
+--server.port=7860 --server.address=0.0.0.0 --server.headless=true` jako
+uid 1000, nasłuch na porcie 7860 (`app_port` w README.md). Wymaga `ffmpeg`
+w `PATH` (instalowany w obrazie z apt, nie jest opcją konfigurowalną w
+kodzie). Zmienne środowiskowe (limity + `DATABASE_URL`/`IP_HASH_SECRET`
+jako sekrety) trafiają do HF Secrets/Variables, nigdy do obrazu.
 
 ## Zasady architektoniczne (nienaruszalne)
 
