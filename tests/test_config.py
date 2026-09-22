@@ -29,6 +29,7 @@ def test_defaults_match_claude_md():
     assert s.ip_hash_secret == ""
     assert s.history_retention_days == 5
     assert s.db_connect_timeout_seconds == 5
+    assert s.ytdlp_remote_components == ""
     assert s.environment_explicit is False
 
 
@@ -49,6 +50,7 @@ def test_env_vars_override_defaults():
         "IP_HASH_SECRET": "super-secret",
         "HISTORY_RETENTION_DAYS": "14",
         "DB_CONNECT_TIMEOUT_SECONDS": "8",
+        "YTDLP_REMOTE_COMPONENTS": "ejs:github",
     }
     s = Settings.from_env(env)
 
@@ -67,6 +69,7 @@ def test_env_vars_override_defaults():
     assert s.ip_hash_secret == "super-secret"
     assert s.history_retention_days == 14
     assert s.db_connect_timeout_seconds == 8
+    assert s.ytdlp_remote_components == "ejs:github"
     assert s.environment_explicit is True
 
 

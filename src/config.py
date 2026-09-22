@@ -84,6 +84,12 @@ class Settings:
     # >6 minut lokalnie bez .env). Niezależny od retry/backoff w db.py::_connect
     # (_COLD_START_ATTEMPTS) — ten limit dotyczy KAŻDEJ pojedynczej próby.
     db_connect_timeout_seconds: int = 5
+    # Komponenty, które yt-dlp wolno pobrać zdalnie do rozwiązywania wyzwań
+    # podpisu/"n" YouTube (solver EJS) — pusty string = wyłączone (yt-dlp nie
+    # pobiera nic). Wartość jak w CLI --remote-components, np. "ejs:github".
+    # Bez tego treści z ograniczeniem wiekowym kończą się błędem mimo
+    # obecności Deno — patrz CLAUDE.md, "Solver wyzwań JS...".
+    ytdlp_remote_components: str = ""
     # True tylko gdy ENVIRONMENT był jawnie ustawiony (nie wzięty z domyślnej
     # wartości "local") — fail-closed dla historii sesji o nieznanym adresie.
     environment_explicit: bool = False
@@ -155,6 +161,9 @@ class Settings:
             ip_hash_secret=env.get("IP_HASH_SECRET", defaults.ip_hash_secret),
             history_retention_days=history_retention_days,
             db_connect_timeout_seconds=db_connect_timeout_seconds,
+            ytdlp_remote_components=env.get(
+                "YTDLP_REMOTE_COMPONENTS", defaults.ytdlp_remote_components
+            ),
             environment_explicit=bool(env.get("ENVIRONMENT")),
             storage_base_dir=storage_base_dir,
         )
