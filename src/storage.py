@@ -13,10 +13,17 @@ from pathlib import Path
 from src.config import settings
 from src.errors import FileTooLargeError
 
+# Własny podkatalog zadań w STORAGE_BASE_DIR (analogicznie do
+# downloads._LINKS_DIRNAME) — dzięki temu purge_all() poniżej może sprzątać
+# WYŁĄCZNIE swoje dane, nigdy całego STORAGE_BASE_DIR (który w produkcji to
+# domyślnie /tmp — dzielony z systemem/innymi procesami, nie nasz do kasowania).
+_JOBS_DIRNAME = "yt-multidownloader-jobs"
+
 
 def create(session_id: str, job_id: str) -> Path:
-    """Tworzy izolowany katalog tymczasowy: {STORAGE_BASE_DIR}/{session_id}/{job_id}/."""
-    path = Path(settings.storage_base_dir) / session_id / job_id
+    """Tworzy izolowany katalog tymczasowy:
+    {STORAGE_BASE_DIR}/yt-multidownloader-jobs/{session_id}/{job_id}/."""
+    path = Path(settings.storage_base_dir) / _JOBS_DIRNAME / session_id / job_id
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -24,6 +31,18 @@ def create(session_id: str, job_id: str) -> Path:
 def cleanup(path: str | Path) -> None:
     """Usuwa katalog zadania — brak katalogu (już usunięty) nie jest błędem."""
     shutil.rmtree(path, ignore_errors=True)
+
+
+def purge_all() -> None:
+    """Usuwa WSZYSTKIE katalogi zadań — wyłącznie przy starcie procesu.
+
+    cleanup() pojedynczego joba jest wołany dopiero po jego zakończeniu, więc
+    awaria procesu w trakcie pobierania (crash, restart kontenera) zostawia
+    katalog joba osieroconym na dysku — nic go wtedy nie usuwa. Bezpieczne
+    tylko na starcie serwera (patrz asgi_app.py::lifespan): żaden job nie
+    jest jeszcze w toku, więc nie ma czego przerwać. Sprząta wyłącznie
+    własny podkatalog `_JOBS_DIRNAME`, nigdy całego STORAGE_BASE_DIR."""
+    shutil.rmtree(Path(settings.storage_base_dir) / _JOBS_DIRNAME, ignore_errors=True)
 
 
 def directory_size_bytes(path: str | Path) -> int:

@@ -10,7 +10,7 @@ def test_create_makes_isolated_job_directory(tmp_path, monkeypatch):
 
     job_dir = storage.create("session-1", "job-1")
 
-    assert job_dir == tmp_path / "session-1" / "job-1"
+    assert job_dir == tmp_path / storage._JOBS_DIRNAME / "session-1" / "job-1"
     assert job_dir.is_dir()
 
 
@@ -76,3 +76,33 @@ def test_directory_size_bytes_of_single_file(tmp_path):
     file_path.write_bytes(b"0" * 500)
 
     assert storage.directory_size_bytes(file_path) == 500
+
+
+def test_purge_all_removes_orphaned_job_directories(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "settings", Settings.from_env({"STORAGE_BASE_DIR": str(tmp_path)}))
+    job_dir = storage.create("session-1", "job-1")
+    (job_dir / "video.mp4").write_bytes(b"x")
+
+    storage.purge_all()
+
+    assert not job_dir.exists()
+    assert not (tmp_path / storage._JOBS_DIRNAME).exists()
+
+
+def test_purge_all_does_not_touch_unrelated_siblings_in_storage_base_dir(tmp_path, monkeypatch):
+    """STORAGE_BASE_DIR bywa dzielonym /tmp — purge_all() sprząta wyłącznie
+    własny podkatalog, nigdy zawartości poza nim."""
+    monkeypatch.setattr(storage, "settings", Settings.from_env({"STORAGE_BASE_DIR": str(tmp_path)}))
+    storage.create("session-1", "job-1")
+    unrelated = tmp_path / "some-other-process.tmp"
+    unrelated.write_bytes(b"not ours")
+
+    storage.purge_all()
+
+    assert unrelated.exists()
+
+
+def test_purge_all_missing_directory_does_not_raise(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "settings", Settings.from_env({"STORAGE_BASE_DIR": str(tmp_path)}))
+
+    storage.purge_all()  # brak wyjątku, mimo że _JOBS_DIRNAME nigdy nie istniał

@@ -21,13 +21,18 @@ from contextlib import asynccontextmanager
 import streamlit as st
 from starlette.routing import Route
 
-from src import downloads
+from src import downloads, storage
 from src.download_routes import DOWNLOAD_ROUTE, download_endpoint
 
 
 @asynccontextmanager
 async def lifespan(_app):
     downloads.purge_all()
+    # Katalogi pojedynczych jobów (storage.py) nie mają swojego TTL-sprzątania
+    # w tle jak linki ZIP powyżej — po awarii procesu w trakcie pobierania
+    # (crash, restart kontenera na HF) zostają osierocone na dysku. Bezpieczne
+    # tylko tu, na starcie: żaden job nie jest jeszcze w toku.
+    storage.purge_all()
     downloads.set_route_enabled(True)
     yield
     downloads.set_route_enabled(False)
