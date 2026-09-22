@@ -208,6 +208,20 @@ jako sekrety) trafiają do HF Secrets/Variables, nigdy do obrazu.
   pobranie zapisuje `cookies.txt` w `job_dir` przez `_write_cookiefile`, na
   czas życia joba. `_zip_job_dir` wyklucza `cookies.txt` z ZIP-a playlisty —
   sprzątanie idzie przez `storage.cleanup(job_dir)` jak dla innych plików.
+- **Solver wyzwań JS dla treści z ograniczeniem wiekowym.** `yt-dlp` wymaga
+  lokalnie zainstalowanego Deno (wymóg środowiska, NIE zależność pip/uv —
+  jak `ffmpeg`) do rozwiązania wyzwań podpisu/„n" YouTube; Deno jest
+  wykrywane automatycznie, ale sam solver EJS pobiera się i aktywuje
+  dopiero z jawnie ustawionym `YTDLP_REMOTE_COMPONENTS` (np. `ejs:github`,
+  domyślnie puste = wyłączone). `engine.py::_base_ydl_opts` przekazuje
+  `remote_components` do KAŻDEJ instancji `YoutubeDL`, tym samym
+  mechanizmem co `cookiefile` — tylko gdy zmienna jest ustawiona, bez
+  twardej zależności funkcjonalnej dla materiałów, którym solver nie jest
+  potrzebny. `engine.py::warn_if_deno_missing()` (wołane z `asgi_app.py`
+  przy starcie serwera) loguje ostrzeżenie, gdy `deno` nie ma w PATH — nie
+  blokuje startu. Patrz „Znane ograniczenie: filmy z ograniczeniem
+  wiekowym" niżej po pełny kontekst i zakres (standardowa jakość vs
+  wysoka jakość/PO token).
 - **Timeout na pojedynczą pozycję pobierania.** `engine.py::DownloadEngine._download_one`
   to wrapper (`ThreadPoolExecutor(max_workers=1)` + `future.result(timeout=
   ITEM_DOWNLOAD_TIMEOUT_SECONDS)`) wokół właściwej logiki w `_download_one_impl`.
@@ -303,6 +317,18 @@ test(rate-limit)
 - Izolacja danych testowych od produkcyjnych w Neon (wspólna tabela `jobs` vs
   osobny schemat/`DB_SCHEMA`)
 - Formalny checklist testów jakościowych przed przejściem local → HF
+- Treść komunikatu `errors.py::_AGE_RESTRICTED_MARKERS` — nieaktualna od
+  2026-09-22 dla standardowej jakości ze skonfigurowanym Deno/
+  `YTDLP_REMOTE_COMPONENTS` (patrz „Znane ograniczenie: filmy z
+  ograniczeniem wiekowym"), czeka na nowe sformułowanie
+- Czy i jak odróżnić w UI wygasłe/rotowane cookies od ogólnej blokady 18+ —
+  wymaga customowego `logger` w opcjach `YoutubeDL` (yt-dlp zgłasza to jako
+  `report_warning`, nie wyjątek), nie samego markera tekstowego w
+  `map_download_error`
+- Czy w przyszłości dodać PO token provider (`bgutil-ytdlp-pot-provider` lub
+  odpowiednik) dla wysokiej jakości materiałów 18+ — obecnie świadomie
+  pominięte, standardowa jakość (Deno + `YTDLP_REMOTE_COMPONENTS`) uznana za
+  wystarczającą
 
 ## Czego NIE robić
 
@@ -340,28 +366,53 @@ wymusza `subtitlesformat="vtt"` niezależnie od formatu joba. Znane edge case'y
 zachowanie); skrót przed wielką literą bywa mylnie rozdzielany jako koniec
 zdania. Pełny opis: `docs/HISTORIA.md`.
 
-## Znane ograniczenie: filmy z ograniczeniem wiekowym dla zalogowanych sesji (2026-09-16)
+## Znane ograniczenie: filmy z ograniczeniem wiekowym dla zalogowanych sesji (2026-09-16, zrewidowane 2026-09-22)
 
-Pobieranie filmów z ograniczeniem wiekowym z prawidłowymi, świeżymi cookies
-kończy się błędem yt-dlp "Sorry, this content is age-restricted" — NIE jest
-to problem z weryfikacją wieku konta Google (potwierdzone: konto użytkownika
-jest w pełni zweryfikowane i może oglądać tę treść normalnie w przeglądarce).
+Historia: pobieranie filmów z ograniczeniem wiekowym z prawidłowymi, świeżymi
+cookies kończyło się błędem yt-dlp "Sorry, this content is age-restricted" —
+potwierdzone, że NIE jest to problem weryfikacji wieku konta Google (konto
+użytkownika w pełni zweryfikowane, ogląda tę treść normalnie w przeglądarce).
+Pierwotna decyzja (2026-09-16) była świadomym pominięciem: yt-dlp wymaga
+środowiska JavaScript (Deno/Node) do rozwiązania wyzwań szyfrujących YouTube,
+uznanym wtedy za zbyt duży wzrost zakresu. **Ta decyzja została odwrócona
+2026-09-22** — patrz „Solver wyzwań JS..." w „Zasadach architektonicznych".
 
-To udokumentowane, aktualne ograniczenie yt-dlp dla zalogowanych sesji
-(https://github.com/yt-dlp/yt-dlp/issues/17619) — wymaga środowiska
-JavaScript (Deno/Node) do rozwiązania wyzwań szyfrujących YouTube, którego
-świadomie nie dodajemy jako zależności projektu (zbyt duży wzrost zakresu:
-nowa zależność binarna + PO tokens wymagające odnawiania).
+**Zweryfikowane manualnie (CLI, poza aplikacją, 3 materiały 18+, `yt-dlp`
+2026.08.19):** Deno + `YTDLP_REMOTE_COMPONENTS=ejs:github` + prawidłowe,
+świeże cookies → pobranie w **standardowej jakości** (itag 18, klient
+`web_creator`) kończy się sukcesem, 3/3. Zwykłe materiały (wideo, audio, mała
+playlista) z tą samą konfiguracją → bez regresji. Przyczyna pierwotnego
+błędu okazała się węższa niż zakładano: nie brak PO tokenu, tylko brak
+lokalnie pobranego/aktywnego solvera podpisu/„n" (mechanizm „remote
+components"/EJS, nowszy niż opisane wyżej issue #17619) — sam Deno bez
+`YTDLP_REMOTE_COMPONENTS` nie wystarczał.
 
-Wypróbowane i ODRZUCONE obejście: wymuszenie extractor_args
-player_client=["mweb"] we wszystkich opcjach yt_dlp — powoduje regresję
-("No video formats found!") dla zwykłych, nieograniczonych wideo. Nie
-próbować ponownie bez realnych, zalogowanych cookies do weryfikacji korzyści
-przeciw temu kosztowi.
+**Nadal NIEOBSŁUGIWANE — świadome ograniczenie, nie błąd do naprawienia:**
+wyższa jakość tego samego materiału 18+ (`bestvideo*+bestaudio`) — klient
+`web_creator` wymaga GVS PO Token, którego to rozwiązanie nie dostarcza
+(brak `bgutil-ytdlp-pot-provider` czy innego PO token providera — świadomie
+NIE dodany, patrz „Otwarte decyzje"/dług do rozważenia w przyszłości, jeśli
+standardowa jakość okaże się niewystarczająca).
 
-Komunikat błędu w UI (errors.py) uczciwie informuje użytkownika, że to znane
-ograniczenie narzędzia, z linkiem do zgłoszenia — nie sugeruje problemu
-po stronie konta użytkownika.
+Obserwacja uboczna z testów: wygasłe/rotowane cookies dają ODRĘBNY,
+jednoznaczny komunikat yt-dlp ("account cookies are no longer valid...
+rotated as a security measure") — ale to `report_warning`, nie wyjątek, i
+`_base_ydl_opts` ma `no_warnings: True`, więc obecnie NIE dociera do
+`errors.py::map_download_error` żadną istniejącą ścieżką. Odróżnienie tego
+przypadku w UI (osobny komunikat od ogólnej blokady 18+) wymagałoby
+przechwycenia warningów yt-dlp przez customowy `logger` w opcjach
+`YoutubeDL`, nie samego dopisania markera tekstowego — nie zaimplementowane,
+czeka na decyzję zakresu.
+
+Komunikat błędu w `errors.py` (`_AGE_RESTRICTED_MARKERS`) wciąż zawiera
+zdanie "Aplikacja obecnie nie obsługuje obejścia tego ograniczenia" — to
+**nieaktualne** dla standardowej jakości przy skonfigurowanym Deno/
+`YTDLP_REMOTE_COMPONENTS`, czeka na aktualizację treści (decyzja UX, nie
+zamykać samodzielnie bez potwierdzenia, patrz „Otwarte decyzje").
+
+Wypróbowane i ODRZUCONE (nadal aktualne, niezależne od powyższego): wymuszenie
+extractor_args player_client=["mweb"] we wszystkich opcjach yt_dlp — powoduje
+regresję ("No video formats found!") dla zwykłych, nieograniczonych wideo.
 
 ## Dług techniczny: timeout pojedynczej pozycji jest best-effort (2026-09-20)
 

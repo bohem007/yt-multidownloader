@@ -20,4 +20,6 @@ Aplikacja webowa (Streamlit) do pobierania z YouTube przez `yt-dlp`: wideo (MP4)
 
 **cookies.txt:** opcjonalny upload w UI (filmy z ograniczeniem wiekowym / bot-check YouTube) — plik żyje tylko w pamięci sesji i katalogu roboczym zadania, nigdy nie jest zapisywany trwale ani commitowany do repozytorium.
 
+**Deno (opcjonalnie, dla treści z ograniczeniem wiekowym):** `yt-dlp` potrzebuje lokalnego silnika JavaScript do rozwiązania wyzwań podpisu/„n” YouTube — bez niego materiały 18+ kończą się błędem mimo prawidłowych cookies. Zainstaluj [Deno](https://deno.land) (`winget install DenoLand.Deno` na Windows) i ustaw `YTDLP_REMOTE_COMPONENTS=ejs:github` w `.env` (patrz `.env.example`). Bez Deno reszta aplikacji (materiały bez ograniczeń) działa identycznie — start serwera loguje ostrzeżenie, nie blokuje się.
+
 Używaj zgodnie z Regulaminem YouTube i obowiązującym prawem autorskim — pobieraj wyłącznie treści, do których masz prawo.
