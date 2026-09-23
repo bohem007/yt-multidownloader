@@ -94,13 +94,17 @@ def publish(source: Path, file_name: str) -> DownloadLink:
 
 
 def lookup(token: str) -> DownloadLink | None:
-    """Zwraca link, jeśli token istnieje, nie wygasł i plik wciąż jest na dysku."""
+    """Zwraca link, jeśli token istnieje, nie wygasł i plik wciąż jest na dysku.
+
+    Woła ją także trasa async (download_routes.py): wygasły token znika z
+    rejestru od razu, ale plik kasuje wątek w tle — rmtree w pętli zdarzeń
+    wstrzymałby na czas operacji dyskowej wszystkie żądania serwera."""
     with _lock:
         link = _links.get(token)
     if link is None:
         return None
     if time.monotonic() >= link.expires_at:
-        release(token)
+        _expire_in_background(token)
         return None
     if not link.path.exists():
         return None
@@ -112,7 +116,24 @@ def release(token: str) -> None:
     with _lock:
         link = _links.pop(token, None)
     if link is not None:
-        shutil.rmtree(link.path.parent, ignore_errors=True)
+        _delete_link_directory(link.path.parent)
+
+
+def _expire_in_background(token: str) -> None:
+    with _lock:
+        link = _links.pop(token, None)
+    if link is None:
+        return
+    threading.Thread(
+        target=_delete_link_directory,
+        args=(link.path.parent,),
+        name="downloads-expired-cleanup",
+        daemon=True,
+    ).start()
+
+
+def _delete_link_directory(directory: Path) -> None:
+    shutil.rmtree(directory, ignore_errors=True)
 
 
 def sweep_expired() -> None:

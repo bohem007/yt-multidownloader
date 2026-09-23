@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import threading
 import time
 from urllib.parse import unquote
 
@@ -45,6 +46,21 @@ def _source(tmp_path, content: bytes = b"zip-bytes", name: str = "job.zip"):
     return path
 
 
+def _advance_clock_past_ttl(monkeypatch) -> None:
+    # TTL liczony jest od publish(), więc przesuwamy czas do przodu.
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(downloads.time, "monotonic", lambda: real_monotonic() + 31 * 60)
+
+
+def _wait_until(condition, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
+
+
 def test_publish_moves_file_and_registers_unguessable_token(tmp_path):
     source = _source(tmp_path)
 
@@ -73,17 +89,38 @@ def test_lookup_unknown_token_returns_none():
 
 def test_lookup_expired_token_returns_none_and_removes_file(monkeypatch, tmp_path):
     link = downloads.publish(_source(tmp_path), "x.zip")
-    monkeypatch.setattr(
-        downloads,
-        "settings",
-        dataclasses.replace(downloads.settings, download_link_ttl_minutes=0),
-    )
-    # TTL liczony jest od publish(), więc przesuwamy czas do przodu.
-    real_monotonic = time.monotonic
-    monkeypatch.setattr(downloads.time, "monotonic", lambda: real_monotonic() + 31 * 60)
+    _advance_clock_past_ttl(monkeypatch)
 
     assert downloads.lookup(link.token) is None
-    assert not link.path.exists()
+    assert _wait_until(lambda: not link.path.parent.exists())
+
+
+def test_lookup_of_expired_token_deletes_file_in_background_not_inline(monkeypatch, tmp_path):
+    """lookup() woła też trasa async — kasowanie nie może iść w jej wątku
+    (pętli zdarzeń). Wstrzymane kasowanie: lookup() musi wrócić, zanim
+    plik zniknie; gdyby kasował synchronicznie, czekałby na bramkę."""
+    link = downloads.publish(_source(tmp_path), "x.zip")
+    real_delete = downloads._delete_link_directory
+    gate = threading.Event()
+    deleting_threads: list[threading.Thread] = []
+
+    def _gated_delete(directory):
+        gate.wait(timeout=5)
+        deleting_threads.append(threading.current_thread())
+        real_delete(directory)
+
+    monkeypatch.setattr(downloads, "_delete_link_directory", _gated_delete)
+    _advance_clock_past_ttl(monkeypatch)
+
+    assert downloads.lookup(link.token) is None
+    assert deleting_threads == []
+    assert link.path.exists()
+    # Token znika z rejestru od razu, niezależnie od kasowania pliku.
+    assert downloads.lookup(link.token) is None
+
+    gate.set()
+    assert _wait_until(lambda: not link.path.parent.exists())
+    assert deleting_threads[0] is not threading.current_thread()
 
 
 def test_lookup_returns_none_when_file_disappeared(tmp_path):
@@ -122,8 +159,7 @@ def test_sweep_expired_removes_only_old_orphan_directories(_links_dir):
 
 def test_publish_sweeps_expired_links_of_earlier_jobs(monkeypatch, tmp_path):
     old = downloads.publish(_source(tmp_path, b"old", "old.zip"), "old.zip")
-    real_monotonic = time.monotonic
-    monkeypatch.setattr(downloads.time, "monotonic", lambda: real_monotonic() + 31 * 60)
+    _advance_clock_past_ttl(monkeypatch)
 
     downloads.publish(_source(tmp_path, b"new", "new.zip"), "new.zip")
 
