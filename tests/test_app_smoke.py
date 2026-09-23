@@ -22,6 +22,7 @@ import src.config as config_module
 import src.client_identity as client_identity_module
 import src.downloads as downloads
 import src.engine as engine_module
+import src.ui_focus as ui_focus
 from src.config import Settings
 from src.db import Database
 from src.engine import DownloadResult, PlaylistDownloadResult, PlaylistItemResult, PlaylistSnapshot
@@ -975,6 +976,69 @@ def test_new_url_button_clears_and_unlocks_url_input(monkeypatch):
     assert not at.exception
     assert at.text_input(key="url_input").value == ""
     assert at.text_input(key="url_input").proto.disabled is False
+
+
+def _focus_scripts(at: AppTest) -> list[str]:
+    """Skrypty fokusu wysłane w ostatnim przebiegu (src/ui_focus.py) —
+    AppTest nie wykonuje JS, więc sprawdzamy, CO zostało wysłane."""
+    return [
+        element.proto.body
+        for element in at.get("html")
+        if element.proto.unsafe_allow_javascript and "/* focus #" in element.proto.body
+    ]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLfocustest1",
+    ],
+    ids=["single-video", "playlist"],
+)
+def test_submitting_valid_url_moves_focus_to_download_button(monkeypatch, url):
+    monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 3)
+    at = _run_app(monkeypatch)
+
+    at.text_input(key="url_input").input(url).run()
+
+    assert not at.exception
+    scripts = _focus_scripts(at)
+    assert len(scripts) == 1
+    assert ui_focus.FOCUS_SELECTORS["download"] in scripts[0]
+    # Prośba wykonana raz i wyczyszczona — kolejny przebieg już jej nie wysyła.
+    assert at.session_state["focus_target"] is None
+    at.run()
+    assert _focus_scripts(at) == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://vimeo.com/12345", "https://www.youtube.com/playlist?list=RDjNQXAC9IVRw"],
+    ids=["foreign-domain", "mix-without-v"],
+)
+def test_submitting_invalid_url_keeps_focus_in_url_field(monkeypatch, url):
+    at = _run_app(monkeypatch)
+
+    at.text_input(key="url_input").input(url).run()
+
+    assert not at.exception
+    assert _focus_scripts(at) == []
+
+
+def test_new_url_button_moves_focus_to_unlocked_url_field(monkeypatch):
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input("https://www.youtube.com/watch?v=jNQXAC9IVRw").run()
+    at.run()
+    assert at.text_input(key="url_input").proto.disabled is True
+
+    at.button(key="new_url_button").click().run()
+
+    assert not at.exception
+    assert at.text_input(key="url_input").proto.disabled is False
+    scripts = _focus_scripts(at)
+    assert len(scripts) == 1
+    assert ui_focus.FOCUS_SELECTORS["url"] in scripts[0]
 
 
 def _simulate_job_in_flight(at: AppTest, job_queue: "queue_module.Queue") -> None:

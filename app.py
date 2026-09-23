@@ -45,6 +45,7 @@ from src.job_runner import JobRunner
 from src.naming import build_display_filename
 from src.progress import ProgressEvent
 from src.session import SessionState
+from src.ui_focus import render_focus_script, request_focus
 from src.validators import classify_url, is_mix_playlist_url, validate_url
 
 MODE_LABELS = {
@@ -525,6 +526,14 @@ def _render_save_link(state: SessionState, *, replaced_by_next_turn: bool) -> No
         )
 
 
+def _url_ready_for_download(url: str) -> bool:
+    """URL, który przycisk "Pobierz" przyjmie: domena z whitelisty i nie
+    Mix/Radio bez v= (YouTube zwraca "unviewable" — patrz mix_unreadable)."""
+    return validate_url(url) and not (
+        classify_url(url) == "playlist_only" and is_mix_playlist_url(url)
+    )
+
+
 st.set_page_config(page_title="YT MultiDownloader", page_icon="📥")
 
 state = SessionState(st.session_state)
@@ -550,11 +559,18 @@ with tab_download:
     # nigdy nie był przyjmowany). Blokada włącza się więc z jednorenderowym
     # opóźnieniem: widoczna dopiero przy NASTĘPNEJ interakcji po wpisaniu
     # URL — to jest poprawne zachowanie Streamlit, nie błąd.
+    def _on_url_submitted() -> None:
+        # ENTER z poprawnym URL przenosi fokus na "Pobierz" — drugi ENTER
+        # uruchamia pobieranie. Przy błędnym URL fokus zostaje w polu.
+        if _url_ready_for_download(st.session_state["url_input"]):
+            request_focus(state, "download")
+
     url = st.text_input(
         "URL",
         placeholder="https://www.youtube.com/watch?v=...",
         key="url_input",
         disabled=state.url_locked,
+        on_change=_on_url_submitted,
     )
     # Blokada włącza się, gdy URL jest wypełniony — jedyny sposób jego
     # odblokowania to przycisk "Nowy URL" niżej (pełny reset).
@@ -819,6 +835,9 @@ with tab_download:
         # jest kasowany — jego link działa do TTL.
         state.reset()
         st.session_state["url_input"] = ""
+        # Pole jest w tym samym przebiegu odblokowane (reset() zdjął URL-lock),
+        # więc od razu można wkleić nowy adres.
+        request_focus(state, "url")
 
     col_download, col_new_url = st.columns(2)
     with col_download:
@@ -979,3 +998,7 @@ with tab_history:
             st.caption(_history_empty_text(history_days))
         else:
             st.dataframe(state.history_rows)
+
+# Na samym końcu: fokus ustawiony przez callback (request_focus) trafia do
+# przeglądarki dopiero, gdy wszystkie widżety tego przebiegu już istnieją.
+render_focus_script(state)

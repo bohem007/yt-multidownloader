@@ -75,6 +75,20 @@ def test_each_request_produces_a_different_script(emitted):
     assert emitted[0]["body"] != emitted[1]["body"]
 
 
+def test_download_focus_moves_only_from_the_url_field(emitted):
+    """Fokus na "Pobierz" (z on_change pola URL — ENTER albo opuszczenie
+    pola) nie może wyrwać użytkownika z innego widżetu; fokus na pole URL
+    (po "Nowy URL") takiego warunku nie ma."""
+    state = SessionState({})
+    for target in ("download", "url"):
+        ui_focus.request_focus(state, target)
+        ui_focus.render_focus_script(state)
+
+    download_script, url_script = (call["body"] for call in emitted)
+    assert f'const onlyWhenFocusIn = "{ui_focus.FOCUS_SELECTORS["url"]}";' in download_script
+    assert "const onlyWhenFocusIn = null;" in url_script
+
+
 def test_focus_nonce_survives_session_reset():
     state = SessionState({})
     ui_focus.request_focus(state, "url")

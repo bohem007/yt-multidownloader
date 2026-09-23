@@ -28,6 +28,12 @@ FOCUS_SELECTORS: dict[str, str] = {
     "url": ".st-key-url_input input",  # pole URL
 }
 
+# Fokus na "Pobierz" przychodzi z on_change pola URL, a to odpala się też
+# przy opuszczeniu pola (kliknięcie w inny widżet), nie tylko po ENTER.
+# Przenosimy go więc tylko wtedy, gdy fokus wciąż jest w polu URL (albo
+# nigdzie) — nie wyrywamy użytkownika z widżetu, który sam właśnie wybrał.
+_ONLY_WHEN_FOCUS_IN: dict[str, str] = {"download": FOCUS_SELECTORS["url"]}
+
 # Gdy skrypt rusza, widżet bywa jeszcze nienarysowany albo wyłączony —
 # focus() ponawiamy co 50 ms, najwyżej ~1,5 s, potem rezygnujemy po cichu.
 _RETRY_INTERVAL_MS = 50
@@ -45,19 +51,28 @@ def render_focus_script(state: SessionState) -> None:
     if target is None:
         return
     st.html(
-        _focus_script(FOCUS_SELECTORS[target], state.focus_nonce),
+        _focus_script(
+            FOCUS_SELECTORS[target], _ONLY_WHEN_FOCUS_IN.get(target), state.focus_nonce
+        ),
         unsafe_allow_javascript=True,
     )
     state.clear_focus_target()
 
 
-def _focus_script(selector: str, nonce: int) -> str:
+def _focus_script(selector: str, only_when_focus_in: str | None, nonce: int) -> str:
     return (
         f"<script>/* focus #{nonce} */(() => {{\n"
         f"  const selector = {json.dumps(selector)};\n"
+        f"  const onlyWhenFocusIn = {json.dumps(only_when_focus_in)};\n"
         "  let attempts = 0;\n"
         "  const timer = setInterval(() => {\n"
         "    attempts += 1;\n"
+        "    const active = document.activeElement;\n"
+        "    if (onlyWhenFocusIn && active && active !== document.body\n"
+        "        && !active.matches(onlyWhenFocusIn)) {\n"
+        "      clearInterval(timer);\n"
+        "      return;\n"
+        "    }\n"
         "    const el = document.querySelector(selector);\n"
         "    if (el && !el.disabled) {\n"
         "      el.focus({ focusVisible: true });\n"
