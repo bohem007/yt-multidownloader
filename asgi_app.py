@@ -4,7 +4,7 @@
 
 Relacja z app.py (literalnie): `st.App("app.py", ...)` WCZYTUJE app.py jako
 skrypt UI Streamlita i dokłada do tego samego serwera trasę HTTP pobierania
-dużych plików (src/download_routes.py). To nie są dwa równoległe
+plików wynikowych (src/download_routes.py). To nie są dwa równoległe
 punkty wejścia — app.py to wyłącznie UI (i cel testów AppTest), a ten plik
 jest jedynym, który go uruchamia z pełną funkcjonalnością.
 
@@ -31,7 +31,7 @@ async def lifespan(_app):
     warn_if_deno_missing()
     downloads.purge_all()
     # Katalogi pojedynczych jobów (storage.py) nie mają swojego TTL-sprzątania
-    # w tle jak linki ZIP powyżej — po awarii procesu w trakcie pobierania
+    # w tle jak linki do pobrania powyżej — po awarii procesu w trakcie pobierania
     # (crash, restart kontenera na HF) zostają osierocone na dysku. Bezpieczne
     # tylko tu, na starcie: żaden job nie jest jeszcze w toku.
     storage.purge_all()

@@ -2,7 +2,7 @@
 
 SKRYPT UI i cel testów (AppTest). NIE uruchamiaj go wprost — serwer startuje
 przez asgi_app.py (`uv run streamlit run asgi_app.py`), który wczytuje ten
-plik i dokłada trasę HTTP pobierania dużych plików (src/downloads.py).
+plik i dokłada trasę HTTP pobierania plików wynikowych (src/downloads.py).
 
 Nie zawiera logiki yt-dlp — tylko renderuje stan (przez SessionState) i
 woła inne warstwy (job_runner/engine/db/storage). Jedyne miejsce, gdzie
@@ -14,7 +14,6 @@ klasę, zgodnie z CLAUDE.md.
 from __future__ import annotations
 
 import logging
-import mimetypes
 import queue as queue_module
 import re
 import time
@@ -122,13 +121,6 @@ def _get_or_create_mix_snapshot(
         snapshot = snapshot_playlist(url, cookie_data=cookie_data)
     state.set_playlist_snapshot(snapshot)
     return snapshot
-
-
-def _guess_mime(file_name: str | None) -> str:
-    if not file_name:
-        return "application/octet-stream"
-    mime_type, _ = mimetypes.guess_type(file_name)
-    return mime_type or "application/octet-stream"
 
 
 _ILLEGAL_WINDOWS_CHARS = re.compile(r'[:/\\*?"<>|]')
@@ -314,6 +306,85 @@ def _log_job_finish(
         pass
 
 
+def _publish_result(
+    state: SessionState, event: ProgressEvent, result_file: Path, duration_ms: int
+) -> None:
+    """Jedna ścieżka dla KAŻDEGO pliku wynikowego — pojedynczego (wideo,
+    audio, napisy, TXT) i ZIP-a playlisty: plik NIE trafia do RAM, tylko
+    downloads.publish() przenosi go do katalogu linków pod nieodgadywalny
+    token, a UI daje zwykły link HTTP (_render_save_link). Plik żyje do
+    DOWNLOAD_LINK_TTL_MINUTES, niezależnie od dalszych losów sesji."""
+    is_playlist = event.playlist_items is not None
+    if is_playlist:
+        file_name = _build_playlist_zip_filename(
+            event.playlist_title,
+            event.playlist_items,
+            event.playlist_scope or "all",
+            event.output_format,
+        )
+    else:
+        # Nazwa widoczna dla użytkownika ({Uploader}-{Tytuł}[.{jezyk}].{ext})
+        # jest NIEZALEŻNA od wewnętrznej nazwy pliku na dysku serwera (patrz
+        # src/naming.py) — z tej ostatniej bierzemy tylko prawdziwe rozszerzenie.
+        file_name = build_display_filename(
+            event.result_uploader or "",
+            event.result_title or result_file.stem,
+            result_file.suffix.lstrip(".") or "bin",
+            lang=state.subtitle_lang,
+        )
+
+    # Poprzedni token jest tu wciąż w stanie tylko przy kontynuacji playlisty
+    # ("Pobierz kolejne pozycje", begin_job z clear_previous_result=False) —
+    # ten ZIP zastępujemy, co UI zapowiada wprost. Każdy inny poprzedni wynik
+    # zniknął ze stanu już przy begin_job, a jego plik czeka do TTL.
+    previous_token = state.result_download_token
+    try:
+        link = downloads.publish(result_file, file_name)
+        file_size_bytes = link.path.stat().st_size
+    except OSError:
+        logger.exception("publishing result file failed for job_id=%s", state.job_id)
+        storage.cleanup(result_file.parent)
+        state.set_error("Nie udało się przygotować pliku do pobrania.")
+        _log_job_finish(
+            state, status="error", duration_ms=duration_ms, error_message=state.error_message
+        )
+        return
+
+    # Plik wynikowy jest już w katalogu linków — resztę katalogu joba (pliki
+    # pośrednie, cookies.txt) usuwamy od razu, zgodnie z Warstwą 10.
+    storage.cleanup(result_file.parent)
+
+    if not is_playlist:
+        state.set_done(
+            link.path, download_token=link.token, file_name=file_name, file_size=file_size_bytes
+        )
+        _log_job_finish(state, status="done", duration_ms=duration_ms, file_size_bytes=file_size_bytes)
+        return
+
+    items = event.playlist_items
+    done_count, _total_count, summary = _playlist_report_summary(items)
+    state.set_done(
+        link.path,
+        download_token=link.token,
+        file_name=file_name,
+        file_size=file_size_bytes,
+        playlist_report=items,
+        playlist_title=event.playlist_title,
+        playlist_next_start_index=event.next_start_index,
+    )
+    if previous_token is not None:
+        downloads.release(previous_token)
+    # Decyzja produktowa: status="done" gdy CHOĆ JEDNA pozycja się udała
+    # (z podsumowaniem w error_message) — "error" tylko gdy zero pozycji się udało.
+    _log_job_finish(
+        state,
+        status="done" if done_count > 0 else "error",
+        duration_ms=duration_ms,
+        file_size_bytes=file_size_bytes,
+        error_message=summary,
+    )
+
+
 @st.fragment(run_every=0.5)
 def _render_progress(state: SessionState) -> None:
     """Odpytuje kolejkę zdarzeń z wątku w tle i aktualizuje SessionState
@@ -363,69 +434,10 @@ def _render_progress(state: SessionState) -> None:
                 _log_job_finish(
                     state, status="error", duration_ms=duration_ms, error_message=state.error_message
                 )
-            elif terminal_event.playlist_items is not None:
-                # Faza 2b: wynik submit_playlist() — result_path to ZIP,
-                # playlist_items niesie raport per pozycja (done/error/skipped).
-                # ZIP-a NIE wczytujemy do RAM (st.download_button(data=...)
-                # zawieszał się dla ~1 GB) — przenosimy go do src/downloads.py
-                # i serwujemy jako zwykły link HTTP z dysku.
-                items = terminal_event.playlist_items
-                zip_name = _build_playlist_zip_filename(
-                    terminal_event.playlist_title,
-                    items,
-                    terminal_event.playlist_scope or "all",
-                    terminal_event.output_format,
-                )
-                previous_token = state.result_download_token
-                try:
-                    link = downloads.publish(result_file, zip_name)
-                    file_size_bytes = link.path.stat().st_size
-                except OSError:
-                    logger.exception("publishing playlist zip failed for job_id=%s", state.job_id)
-                    storage.cleanup(result_file.parent)
-                    state.set_error("Nie udało się przygotować pliku do pobrania.")
-                    _log_job_finish(
-                        state,
-                        status="error",
-                        duration_ms=duration_ms,
-                        error_message=state.error_message,
-                    )
-                else:
-                    storage.cleanup(result_file.parent)
-                    done_count, _total_count, summary = _playlist_report_summary(items)
-                    state.set_done(
-                        link.path,
-                        download_token=link.token,
-                        file_name=zip_name,
-                        playlist_report=items,
-                        playlist_title=terminal_event.playlist_title,
-                        playlist_next_start_index=terminal_event.next_start_index,
-                    )
-                    if previous_token is not None:
-                        downloads.release(previous_token)
-                    # Decyzja produktowa: status="done" gdy CHOĆ JEDNA pozycja
-                    # się udała (z podsumowaniem w error_message) — "error"
-                    # tylko gdy zero pozycji się udało.
-                    _log_job_finish(
-                        state,
-                        status="done" if done_count > 0 else "error",
-                        duration_ms=duration_ms,
-                        file_size_bytes=file_size_bytes,
-                        error_message=summary,
-                    )
             else:
-                data = result_file.read_bytes()
-                # Wczytane do RAM — katalog tymczasowy natychmiast usuwamy,
-                # zgodnie z Warstwą 10 (brak trwałych plików na serwerze).
-                storage.cleanup(result_file.parent)
-                state.set_done(
-                    result_file,
-                    data=data,
-                    file_name=result_file.name,
-                    uploader=terminal_event.result_uploader,
-                    title=terminal_event.result_title,
-                )
-                _log_job_finish(state, status="done", duration_ms=duration_ms, file_size_bytes=len(data))
+                # Pojedynczy plik albo (Faza 2b) ZIP z submit_playlist(), gdy
+                # playlist_items niesie raport per pozycja (done/error/skipped).
+                _publish_result(state, terminal_event, result_file, duration_ms)
         else:
             state.set_error(terminal_event.message)
             _log_job_finish(
@@ -444,18 +456,14 @@ def _render_result(state: SessionState) -> None:
         st.error(state.error_message or "Wystąpił nieoczekiwany błąd.")
         return
 
-    if state.result_data is None and state.result_download_token is None:
+    if state.result_download_token is None:
         st.error("Brak danych wynikowych.")
         return
 
-    key_suffix = "running" if state.status == "running" else "final"
-
+    replaced_by_next_turn = False
     if state.playlist_report is not None:
-        # ZIP całej playlisty leży na dysku (src/downloads.py) i jest serwowany
-        # zwykłym linkiem HTTP — nie przez st.download_button (dla ~1 GB
-        # zawieszał się bezterminowo, patrz historia buga "Zapisz plik").
-        has_continuation = state.playlist_next_start_index is not None
-        if has_continuation:
+        replaced_by_next_turn = state.playlist_next_start_index is not None
+        if replaced_by_next_turn:
             # "Zakończone" obok przycisku "Pobierz kolejne pozycje" byłoby
             # sprzeczne — playlista jeszcze się nie skończyła.
             processed_range = _playlist_processed_range(state.playlist_report)
@@ -467,71 +475,54 @@ def _render_result(state: SessionState) -> None:
         else:
             st.success("Pobieranie playlisty zakończone.")
         _render_playlist_report(state.playlist_report, state.playlist_next_start_index)
-        token = state.result_download_token
-        if not downloads.is_route_enabled():
-            st.error(
-                "Serwer uruchomiono bez trasy pobierania plików. "
-                "Uruchom aplikację poleceniem: uv run streamlit run asgi_app.py"
-            )
-        elif token is not None and downloads.lookup(token) is not None:
-            st.link_button(
-                "Zapisz plik",
-                downloads.download_url(token),
-                key=f"download_result_link-{state.job_id}-{key_suffix}",
-                icon=":material/download:",
-            )
-            # Dla tury z kontynuacją plik zastąpi następny wynik (akcja
-            # użytkownika), więc stały czas ważności byłby mylący.
-            if has_continuation:
-                st.caption("Ten plik zostanie zastąpiony, gdy pobierzesz kolejne pozycje.")
-            else:
-                st.caption(
-                    f"Link do pobrania jest ważny przez {settings.download_link_ttl_minutes} minut."
-                )
-        else:
-            st.warning(
-                "Link do pobrania wygasł. Uruchom pobieranie ponownie, "
-                "aby wygenerować nowy plik."
-            )
-        return
     else:
-        # Nazwa widoczna dla użytkownika ({Uploader}-{Tytuł}[.{jezyk}].{ext})
-        # jest NIEZALEŻNA od wewnętrznej nazwy pliku na dysku serwera (patrz
-        # src/naming.py) — ta ostatnia i tak już nie istnieje (usunięta zaraz
-        # po wczytaniu do RAM), result_file_name służy tu tylko do ustalenia
-        # prawdziwego rozszerzenia i do zgadywania MIME.
-        ext = Path(state.result_file_name or "").suffix.lstrip(".") or "bin"
-        display_name = build_display_filename(
-            state.result_uploader or "",
-            state.result_title or (state.result_file_name or "download"),
-            ext,
-            lang=state.subtitle_lang,
-        )
         st.success("Pobieranie zakończone.")
 
-    # Klucz unikalny per job_id (Faza 2c) — przy kontynuacjach playlisty
-    # ten sam widget bywał renderowany z różną zawartością; sufiks
-    # running/final rozdziela renderowanie "poprzedni wynik widoczny w
-    # trakcie kolejnego joba" od właściwego wyniku.
-    download_button_key = f"download_result_button-{state.job_id}-{key_suffix}"
-    st.download_button(
-        "Zapisz plik",
-        data=state.result_data,
-        file_name=display_name,
-        mime=_guess_mime(state.result_file_name),
-        key=download_button_key,
-        # Domyślne on_click="rerun" niepotrzebnie reruje skrypt przy każdym
-        # kliknięciu — wynik widgetu nie jest nigdzie odczytywany.
-        on_click="ignore",
-    )
+    _render_save_link(state, replaced_by_next_turn=replaced_by_next_turn)
 
 
-def _release_result_download(state: SessionState) -> None:
-    """Zwalnia plik z dysku (src/downloads.py) przed wyczyszczeniem wyniku
-    w stanie sesji — inaczej ZIP czekałby na sprzątanie po TTL."""
+def _render_save_link(state: SessionState, *, replaced_by_next_turn: bool) -> None:
+    """JEDYNY sposób zapisu pliku wynikowego, pojedynczego i ZIP-a playlisty:
+    zwykły link HTTP do /api/download/<token> (src/download_routes.py),
+    który przeglądarka pobiera strumieniowo z dysku.
+
+    Nigdy st.download_button (pilnuje tego test w tests/test_app_smoke.py):
+    w Streamlit 1.63 przy każdym zamontowaniu wysyła w tle pełny GET pliku
+    (checkSourceUrlResponse), którego odpowiedzi nie czyta ani nie anuluje.
+    Duży plik trzyma wtedy połączenie do zamknięcia karty, a po ~6 takich
+    wynikach pula połączeń przeglądarki do hosta jest pełna: "Zapisz plik"
+    przestaje reagować, F5 zamarza (patrz docs/HISTORIA.md)."""
     token = state.result_download_token
-    if token is not None:
-        downloads.release(token)
+    if not downloads.is_route_enabled():
+        st.error(
+            "Serwer uruchomiono bez trasy pobierania plików. "
+            "Uruchom aplikację poleceniem: uv run streamlit run asgi_app.py"
+        )
+    elif token is not None and downloads.lookup(token) is not None:
+        # Klucz unikalny per job_id (Faza 2c) — przy kontynuacjach playlisty
+        # ten sam widget bywał renderowany z różną zawartością; sufiks
+        # running/final rozdziela renderowanie "poprzedni wynik widoczny w
+        # trakcie kolejnego joba" od właściwego wyniku.
+        key_suffix = "running" if state.status == "running" else "final"
+        st.link_button(
+            "Zapisz plik",
+            downloads.download_url(token),
+            key=f"download_result_link-{state.job_id}-{key_suffix}",
+            icon=":material/download:",
+        )
+        # Dla tury z kontynuacją plik zastąpi następny wynik (akcja
+        # użytkownika), więc stały czas ważności byłby mylący.
+        if replaced_by_next_turn:
+            st.caption("Ten plik zostanie zastąpiony, gdy pobierzesz kolejne pozycje.")
+        else:
+            st.caption(
+                f"Link do pobrania jest ważny przez {settings.download_link_ttl_minutes} minut."
+            )
+    else:
+        st.warning(
+            "Link do pobrania wygasł. Uruchom pobieranie ponownie, "
+            "aby wygenerować nowy plik."
+        )
 
 
 st.set_page_config(page_title="YT MultiDownloader", page_icon="📥")
@@ -793,12 +784,13 @@ with tab_download:
 
     # Zmiana trybu/formatu przy URL wciąż wypełnionym chowa wynik/błąd
     # POPRZEDNIEGO zadania (i "Zapisz plik") — ale nie dotyka pola URL.
+    # Plik tego wyniku zostaje na dysku, jego link działa do TTL (jak po
+    # "Nowy URL" i po starcie kolejnego joba — sprząta wyłącznie downloads.py).
     # Tylko jeśli jest faktycznie coś do wyczyszczenia (is_terminal()) —
     # w trakcie pobierania (status "running") zmiana widgetów nie ma tu
     # znaczenia, bo są zablokowane niżej przez download_disabled/inne joby.
     current_mode_format = (mode, output_format, playlist_scope)
     if state.is_terminal() and state.last_mode_format not in (None, current_mode_format):
-        _release_result_download(state)
         state.clear_result()
     state.set_last_mode_format(current_mode_format)
 
@@ -823,8 +815,8 @@ with tab_download:
         # czyszczenie st.session_state["url_input"] tutaj jest bezpieczne —
         # zrobione PO tym, jak text_input() już narysuje pole w tym
         # przebiegu, Streamlit rzuciłby wyjątkiem ("cannot be modified
-        # after widget ... is instantiated").
-        _release_result_download(state)
+        # after widget ... is instantiated"). Plik poprzedniego wyniku NIE
+        # jest kasowany — jego link działa do TTL.
         state.reset()
         st.session_state["url_input"] = ""
 
@@ -863,8 +855,6 @@ with tab_download:
         except Exception:
             db_job_id = None
 
-        if clear_previous_result:
-            _release_result_download(state)
         job_queue = state.begin_job(
             job_id, subtitle_lang=subtitle_lang, clear_previous_result=clear_previous_result
         )

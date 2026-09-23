@@ -1,14 +1,17 @@
-"""Krótkotrwałe linki do pobrania dużych plików (ZIP playlisty) z dysku.
+"""Krótkotrwałe linki do pobrania KAŻDEGO pliku wynikowego z dysku —
+pojedynczego (wideo, audio, napisy, TXT) i ZIP-a playlisty.
 
-`st.download_button(data=<bajty>)` przepuszcza cały plik przez RAM procesu i
-kanał Streamlita — dla ZIP-ów rzędu 1 GB zawisał bezterminowo (patrz historia
-buga "Zapisz plik"). Zamiast tego plik ląduje w dedykowanym katalogu na dysku,
-a użytkownik dostaje zwykły link HTTP GET (trasa w src/download_routes.py),
-który przeglądarka pobiera strumieniowo, poza kanałem WebSocket.
+Plik ląduje w dedykowanym katalogu na dysku, a użytkownik dostaje zwykły
+link HTTP GET (trasa w src/download_routes.py), który przeglądarka pobiera
+strumieniowo, poza kanałem WebSocket. Nie `st.download_button`: z ZIP-ami
+rzędu 1 GB w `data=` zawisał bezterminowo, a w Streamlit 1.63 przy każdym
+zamontowaniu wysyła w tle pełny GET pliku z nieczytaną odpowiedzią — duże
+wyniki wyczerpywały pulę połączeń przeglądarki (patrz docs/HISTORIA.md).
 
 To świadome odstępstwo od "plik wczytany do RAM i natychmiast usunięty"
 (CLAUDE.md, Warstwa 10): plik żyje na dysku do `DOWNLOAD_LINK_TTL_MINUTES`,
-albo do zastąpienia go nowym wynikiem / resetu sesji (release()).
+niezależnie od sesji ("Nowy URL", zmiana trybu i nowy job go nie kasują).
+Wcześniej znika tylko ZIP tury playlisty, zastąpiony kolejną turą (release()).
 
 Bezpieczeństwo: link to nieodgadywalny token (256 bit) — sam token jest
 jedynym "uwierzytelnieniem", więc nigdy nie używamy tu job_id ani nazw plików.

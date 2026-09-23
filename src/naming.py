@@ -1,9 +1,9 @@
-"""Nazwa pliku widoczna dla użytkownika w st.download_button.
+"""Nazwa, pod którą przeglądarka zapisuje plik wynikowy (Content-Disposition
+trasy /api/download/<token>, patrz src/downloads.py).
 
-Niezależna od wewnętrznej nazwy pliku na dysku serwera (ten i tak jest
-usuwany zaraz po wczytaniu do RAM — patrz storage.py). Konwencja:
-"{Uploader}-{Tytuł}.{ext}", albo "{Uploader}-{Tytuł}.{jezyk}.{ext}" dla
-napisów.
+Niezależna od wewnętrznej nazwy pliku na dysku serwera (tam plik leży jako
+payload.{ext} pod tokenem). Konwencja: "{Uploader}-{Tytuł}.{ext}", albo
+"{Uploader}-{Tytuł}.{jezyk}.{ext}" dla napisów.
 """
 
 from __future__ import annotations

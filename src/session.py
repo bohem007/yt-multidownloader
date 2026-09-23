@@ -29,11 +29,9 @@ _STATUS = "status"
 _PERCENT = "percent"
 _MESSAGE = "message"
 _RESULT_PATH = "result_path"
-_RESULT_DATA = "result_data"
 _RESULT_DOWNLOAD_TOKEN = "result_download_token"
 _RESULT_FILE_NAME = "result_file_name"
-_RESULT_UPLOADER = "result_uploader"
-_RESULT_TITLE = "result_title"
+_RESULT_FILE_SIZE = "result_file_size"
 _ERROR_MESSAGE = "error_message"
 _JOB_ID = "job_id"
 _DB_JOB_ID = "db_job_id"
@@ -59,11 +57,9 @@ _HISTORY_ERROR = "history_error"
 # (Warstwa 2, UX) — te żyją niezależnie od pojedynczego zadania.
 _RESULT_FIELDS: dict = {
     _RESULT_PATH: None,
-    _RESULT_DATA: None,
     _RESULT_DOWNLOAD_TOKEN: None,
     _RESULT_FILE_NAME: None,
-    _RESULT_UPLOADER: None,
-    _RESULT_TITLE: None,
+    _RESULT_FILE_SIZE: None,
     _ERROR_MESSAGE: None,
     _PLAYLIST_REPORT: None,
     _PLAYLIST_TITLE: None,
@@ -113,26 +109,20 @@ class SessionState:
         return self._store[_RESULT_PATH]
 
     @property
-    def result_data(self) -> bytes | None:
-        return self._store[_RESULT_DATA]
-
-    @property
     def result_download_token(self) -> str | None:
-        """Token linku do pobrania z dysku (src/downloads.py) — ustawiany
-        zamiast result_data dla dużych wyników (ZIP playlisty)."""
+        """Token linku do pobrania z dysku (src/downloads.py) — jedyna droga
+        do pliku wynikowego, pojedynczego i ZIP-a. Stan sesji nigdy nie
+        trzyma bajtów pliku."""
         return self._store[_RESULT_DOWNLOAD_TOKEN]
 
     @property
     def result_file_name(self) -> str | None:
+        """Nazwa, pod którą przeglądarka zapisze plik (Content-Disposition)."""
         return self._store[_RESULT_FILE_NAME]
 
     @property
-    def result_uploader(self) -> str | None:
-        return self._store[_RESULT_UPLOADER]
-
-    @property
-    def result_title(self) -> str | None:
-        return self._store[_RESULT_TITLE]
+    def result_file_size(self) -> int | None:
+        return self._store[_RESULT_FILE_SIZE]
 
     @property
     def error_message(self) -> str | None:
@@ -302,10 +292,7 @@ class SessionState:
         self._store[_JOB_ID] = None
         self._store[_QUEUE] = None
         self._store[_STARTED_AT] = None
-        has_result = (
-            self._store[_RESULT_DATA] is not None
-            or self._store[_RESULT_DOWNLOAD_TOKEN] is not None
-        )
+        has_result = self._store[_RESULT_DOWNLOAD_TOKEN] is not None
         self._store[_STATUS] = "done" if has_result else "idle"
 
     def client_ip_hash(self, resolve: Callable[[], str]) -> str:
@@ -353,11 +340,9 @@ class SessionState:
         self,
         result_path: Path | str,
         *,
-        data: bytes | None = None,
         download_token: str | None = None,
         file_name: str | None = None,
-        uploader: str | None = None,
-        title: str | None = None,
+        file_size: int | None = None,
         playlist_report: "list[PlaylistItemResult] | None" = None,
         playlist_title: str | None = None,
         playlist_next_start_index: int | None = None,
@@ -365,11 +350,9 @@ class SessionState:
         self._store[_STATUS] = "done"
         self._store[_PERCENT] = 100.0
         self._store[_RESULT_PATH] = result_path
-        self._store[_RESULT_DATA] = data
         self._store[_RESULT_DOWNLOAD_TOKEN] = download_token
         self._store[_RESULT_FILE_NAME] = file_name
-        self._store[_RESULT_UPLOADER] = uploader
-        self._store[_RESULT_TITLE] = title
+        self._store[_RESULT_FILE_SIZE] = file_size
         self._store[_PLAYLIST_REPORT] = playlist_report
         self._store[_PLAYLIST_TITLE] = playlist_title
         self._store[_PLAYLIST_NEXT_START_INDEX] = playlist_next_start_index

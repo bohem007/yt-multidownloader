@@ -1,8 +1,9 @@
 """Storage efemeryczny per zadanie — patrz Warstwa 10 specyfikacji.
 
-Katalog per zadanie żyje tylko na czas pobierania; wynik jest wczytywany
-do RAM i katalog jest natychmiast usuwany (shutil.rmtree) przez warstwę
-wołającą (docelowo app.py). Baza danych nie przechowuje plików.
+Katalog per zadanie żyje tylko na czas pobierania; plik wynikowy jest
+przenoszony do katalogu linków (src/downloads.py::publish), a reszta
+katalogu joba jest natychmiast usuwana (shutil.rmtree) przez warstwę
+wołającą (app.py). Baza danych nie przechowuje plików.
 """
 
 from __future__ import annotations

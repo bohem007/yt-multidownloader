@@ -8,9 +8,11 @@ rerunie skryptu) podstawia autouse `database_calls` z tests/conftest.py,
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import queue as queue_module
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -22,7 +24,7 @@ import src.downloads as downloads
 import src.engine as engine_module
 from src.config import Settings
 from src.db import Database
-from src.engine import PlaylistDownloadResult, PlaylistItemResult, PlaylistSnapshot
+from src.engine import DownloadResult, PlaylistDownloadResult, PlaylistItemResult, PlaylistSnapshot
 from src.errors import EmptyPlaylistSnapshotError
 from src.progress import ProgressEvent
 
@@ -118,37 +120,6 @@ def test_transcript_mode_shows_language_selector_without_format_choice(monkeypat
     assert at.button(key="download_button").proto.disabled is False
 
 
-def test_completed_transcript_job_shows_txt_download_button(monkeypatch, tmp_path):
-    """Wynik trybu Transkrypt (.txt) przechodzi przez ten sam potok
-    zakończenia joba co Video/Audio/Subtitle — bez żadnych zmian w
-    _render_progress/_render_result specyficznych dla tego trybu."""
-    at = _run_app(monkeypatch)
-
-    result_file = tmp_path / "Uploader-Title.en.txt"
-    result_file.write_bytes("Czysty tekst transkryptu.".encode("utf-8"))
-
-    finished_queue: queue_module.Queue = queue_module.Queue()
-    finished_queue.put(
-        ProgressEvent(
-            event_type="on_finished",
-            percent=100.0,
-            message="Zakończono",
-            result_path=result_file,
-            result_uploader="Test Uploader",
-            result_title="Test Title",
-        )
-    )
-    _simulate_job_in_flight(at, finished_queue)
-
-    at.run()
-
-    assert not at.exception
-    assert at.session_state["status"] == "done"
-    assert at.session_state["result_file_name"] == "Uploader-Title.en.txt"
-    assert at.session_state["result_data"] == "Czysty tekst transkryptu.".encode("utf-8")
-    assert len(at.download_button) >= 1
-
-
 def test_mixed_url_shows_playlist_scope_radio_with_real_item_count(monkeypatch):
     """URL z v= i list= (typowy link "autoplay z listy") musi pokazać radio
     z TRZEMA opcjami (2026-09-20: dodano "Wybrane numery...") i realną
@@ -238,7 +209,7 @@ def test_clicking_download_with_playlist_scope_all_starts_real_job(monkeypatch, 
     nie pokazywać już żadnego placeholdera. Fałszywy silnik jest natychmiastowy
     (bez realnego I/O), więc w tym samym rerunie AppTest zdąży też odebrać
     terminalny event z fragmentu _render_progress — dlatego asercja sprawdza
-    finalny sukces (download_button), nie ulotny stan "running", który jest
+    finalny sukces (link do pobrania), nie ulotny stan "running", który jest
     z natury zależny od wyścigu wątku w tle."""
     monkeypatch.setattr(engine_module, "count_playlist_items", lambda url, cookie_data=None: 3)
 
@@ -416,7 +387,6 @@ def test_completed_playlist_job_shows_zip_download_link_with_report(monkeypatch,
     assert at.session_state["status"] == "done"
     assert at.session_state["result_file_name"] == "Playlista-Moja playlista-pozycje-01-02.mp4.zip"
     # ZIP zostaje na dysku pod nieodgadywalnym tokenem — NIE w RAM/session_state.
-    assert at.session_state["result_data"] is None
     token = at.session_state["result_download_token"]
     link = downloads.lookup(token)
     assert link is not None
@@ -849,18 +819,20 @@ def test_switching_mode_after_playlist_stopped_early_clears_next_start_index_and
     assert at.session_state["playlist_next_start_index"] is None
     assert at.session_state["result_download_token"] is None
     assert "continue_playlist_button" not in [b.key for b in at.button]
-    # Czyszczenie wyniku zwalnia też plik z dysku, nie zostawia go do TTL.
-    assert downloads.lookup(link.token) is None
-    assert not link.path.exists()
+    # Czyszczenie wyniku chowa go tylko w UI — plik zostaje na dysku, a jego
+    # link działa do TTL (decyzja 2026-09-23, od tego zależy ostrzeżenie o
+    # niezapisanym pliku).
+    assert downloads.lookup(link.token) is not None
+    assert link.path.exists()
 
 
-def test_new_url_button_releases_playlist_zip_from_disk(monkeypatch, tmp_path):
+def test_new_url_button_keeps_previous_download_link_valid_until_ttl(monkeypatch, tmp_path):
     at = _run_app(monkeypatch)
     at.text_input(key="url_input").input(
         "https://www.youtube.com/watch?v=mixedtest8&list=PLmixedtest8"
     ).run()
 
-    link = _publish_seed_zip(tmp_path, b"zip to release")
+    link = _publish_seed_zip(tmp_path, b"zip kept until ttl")
     at.session_state["status"] = "done"
     at.session_state["result_download_token"] = link.token
     at.session_state["result_file_name"] = link.file_name
@@ -871,9 +843,10 @@ def test_new_url_button_releases_playlist_zip_from_disk(monkeypatch, tmp_path):
     at.button(key="new_url_button").click().run()
 
     assert not at.exception
-    assert downloads.lookup(link.token) is None
-    assert not link.path.exists()
     assert _link_urls(at) == []
+    # "Nowy URL" chowa wynik, ale nie kasuje pliku — link działa do TTL.
+    assert downloads.lookup(link.token) is not None
+    assert link.path.exists()
 
 
 def test_expired_download_link_shows_warning_instead_of_dead_button(monkeypatch, tmp_path):
@@ -916,24 +889,32 @@ def test_playlist_result_without_download_route_shows_launch_instruction(monkeyp
     assert any("asgi_app.py" in e.value for e in at.error)
 
 
-def test_playlist_publish_failure_reports_error_instead_of_crashing(monkeypatch, tmp_path):
+@pytest.mark.parametrize("result_kind", ["playlist_zip", "single_file"])
+def test_publish_failure_reports_error_instead_of_crashing(monkeypatch, tmp_path, result_kind):
     def _boom(source, file_name):
         raise OSError("disk full")
 
     monkeypatch.setattr(downloads, "publish", _boom)
     at = _run_app(monkeypatch)
 
-    zip_file = tmp_path / "playlist.zip"
-    zip_file.write_bytes(b"fake zip bytes")
+    if result_kind == "playlist_zip":
+        result_file = tmp_path / "playlist.zip"
+        event_fields = {
+            "playlist_items": [PlaylistItemResult(index=1, title="Wideo 1", status="done")],
+            "playlist_title": "Moja playlista",
+        }
+    else:
+        result_file = tmp_path / "Uploader-Title.mp4"
+        event_fields = {"result_uploader": "Test Uploader", "result_title": "Test Title"}
+    result_file.write_bytes(b"fake result bytes")
     finished_queue: queue_module.Queue = queue_module.Queue()
     finished_queue.put(
         ProgressEvent(
             event_type="on_finished",
             percent=100.0,
             message="Zakończono",
-            result_path=zip_file,
-            playlist_items=[PlaylistItemResult(index=1, title="Wideo 1", status="done")],
-            playlist_title="Moja playlista",
+            result_path=result_file,
+            **event_fields,
         )
     )
     _simulate_job_in_flight(at, finished_queue)
@@ -942,6 +923,7 @@ def test_playlist_publish_failure_reports_error_instead_of_crashing(monkeypatch,
     assert not at.exception
     assert at.session_state["status"] == "error"
     assert "przygotować pliku" in at.session_state["error_message"]
+    assert _link_urls(at) == []
 
 
 def test_invalid_url_shows_error_on_download_click(monkeypatch):
@@ -1036,12 +1018,16 @@ def test_premature_on_finished_without_result_path_is_not_treated_as_terminal(mo
     assert at.session_state["error_message"] is None
 
 
-def test_completed_job_with_result_path_shows_download_button(monkeypatch, tmp_path):
-    at = _run_app(monkeypatch)
+def _wait_until(condition, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
 
-    result_file = tmp_path / "Uploader-Title.mp3"
-    result_file.write_bytes(b"fake mp3 bytes")
 
+def _finish_single_file_job(at: AppTest, result_file: Path) -> None:
     finished_queue: queue_module.Queue = queue_module.Queue()
     finished_queue.put(
         ProgressEvent(
@@ -1054,53 +1040,146 @@ def test_completed_job_with_result_path_shows_download_button(monkeypatch, tmp_p
         )
     )
     _simulate_job_in_flight(at, finished_queue)
+
+
+@pytest.mark.parametrize(
+    ("file_name", "content", "subtitle_lang", "expected_name"),
+    [
+        ("abc.mp4", b"fake mp4 bytes", None, "Test Uploader-Test Title.mp4"),
+        ("abc.mp3", b"fake mp3 bytes", None, "Test Uploader-Test Title.mp3"),
+        ("abc.flac", b"fake flac bytes", None, "Test Uploader-Test Title.flac"),
+        ("abc.pl.srt", b"1\n00:00:00,000 --> 00:00:01,000\nNapis\n", "pl", "Test Uploader-Test Title.pl.srt"),
+        ("abc.pl.txt", "Czysty tekst transkryptu.".encode("utf-8"), "pl", "Test Uploader-Test Title.pl.txt"),
+    ],
+    ids=["video", "audio-mp3", "audio-flac", "subtitles", "transcript"],
+)
+def test_completed_single_file_job_is_served_via_download_route_not_download_button(
+    monkeypatch, tmp_path, file_name, content, subtitle_lang, expected_name
+):
+    """Strażnik regresji (2026-09-23): wynik KAŻDEGO trybu idzie tą samą
+    ścieżką co ZIP playlisty — plik na dysku pod tokenem, st.link_button do
+    /api/download/<token>. Nigdy st.download_button: jego sonda w tle (pełny
+    GET z nieczytaną odpowiedzią) przy dużych plikach wyczerpywała pulę
+    połączeń przeglądarki. AppTest samej sondy nie zobaczy — pilnuje, żeby
+    przycisk nie wrócił."""
+    at = _run_app(monkeypatch)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    result_file = job_dir / file_name
+    result_file.write_bytes(content)
+    _finish_single_file_job(at, result_file)
+    at.session_state["subtitle_lang"] = subtitle_lang
 
     at.run()
 
     assert not at.exception
     assert at.session_state["status"] == "done"
-    assert at.session_state["result_data"] == b"fake mp3 bytes"
-    assert len(at.download_button) >= 1
+    assert len(at.download_button) == 0
+    token = at.session_state["result_download_token"]
+    link = downloads.lookup(token)
+    assert link is not None
+    assert _link_urls(at) == [downloads.download_url(token)]
+    assert link.path.read_bytes() == content
+    assert link.file_name == expected_name
+    assert at.session_state["result_file_name"] == expected_name
+    assert at.session_state["result_file_size"] == len(content)
+    # Plik wynikowy przeniesiony do katalogu linków, katalog joba sprzątnięty.
+    assert not job_dir.exists()
+    assert "Link do pobrania jest ważny przez 30 minut." in [c.value for c in at.caption]
 
 
-def test_download_result_button_does_not_trigger_script_rerun_on_click(monkeypatch, tmp_path):
-    """Regresja (trzecia iteracja buga "Zapisz plik nie reaguje"): domyślne
-    on_click="rerun" na st.download_button zmuszałoby KAŻDE kliknięcie do
-    przejścia przez tę samą, jednowątkową kolejkę rerunów skryptu, którą
-    (potwierdzone w źródłach streamlit.runtime.fragment/scriptrunner)
-    mogą zapychać osierocone auto-reruny fragmentu run_every=0.5 z
-    _render_progress — ten fragment nigdy nie dostaje jawnego sygnału
-    zatrzymania (stop_auto_rerun) po tym, jak zwykły pełny rerun przestaje
-    go wywoływać. on_click="ignore" usuwa tę zależność: pobranie ZIP-a/
-    pojedynczego pliku ma być czysto przeglądarkowe, bez rerunu.
+def test_app_source_never_uses_st_download_button():
+    """Strażnik kontraktu z CLAUDE.md: każdy plik wynikowy idzie wyłącznie
+    przez /api/download/<token>. Sprawdza sam kod, więc łapie też ścieżkę,
+    której żaden test AppTest nie przechodzi."""
+    tree = ast.parse(Path(APP_PATH).read_text(encoding="utf-8"))
+    uses = [
+        node.lineno
+        for node in ast.walk(tree)
+        if (isinstance(node, ast.Attribute) and node.attr == "download_button")
+        or (isinstance(node, ast.alias) and node.name == "download_button")
+    ]
+    assert uses == [], f"download_button w app.py (linie {uses}) — użyj _render_save_link"
 
-    AppTest nie odtworzy realnego narastania ruchu WebSocket w tle — ten
-    test weryfikuje TYLKO konfigurację widgetu (proto.ignore_rerun), nie
-    zachowanie sieciowe. Manualna weryfikacja w przeglądarce (DevTools →
-    Network, obserwacja po zakończeniu joba) wciąż jest potrzebna."""
+
+def _install_single_file_engine(monkeypatch, tmp_path) -> None:
+    """Fałszywy DownloadEngine.submit: natychmiastowy, bez sieci — każdy job
+    zapisuje własny plik we własnym katalogu (jak storage.create)."""
+    produced = 0
+
+    def _fake_submit(self, job, on_event=None):
+        nonlocal produced
+        produced += 1
+        job_dir = tmp_path / job.job_id
+        job_dir.mkdir()
+        path = job_dir / "result.mp4"
+        path.write_bytes(f"video {produced}".encode())
+        return DownloadResult(path=path, uploader="Kanał", title=f"Film {produced}")
+
+    monkeypatch.setattr(engine_module.DownloadEngine, "submit", _fake_submit)
+
+
+def test_two_single_file_downloads_in_a_row_keep_both_links_and_no_bytes_in_session(
+    monkeypatch, tmp_path
+):
+    """Scenariusz zgłoszenia z 2026-09-23: wideo A pobrane i niezapisane,
+    "Nowy URL", wideo B. Prawdziwe _launch_job/begin_job i "Nowy URL" niczego
+    nie kasują — oba pliki czekają na dysku do TTL, a stan sesji trzyma tylko
+    metadane (token, nazwa, rozmiar), nigdy bajty pliku."""
+    _install_single_file_engine(monkeypatch, tmp_path)
     at = _run_app(monkeypatch)
 
-    result_file = tmp_path / "Uploader-Title.mp3"
-    result_file.write_bytes(b"fake mp3 bytes")
+    at.text_input(key="url_input").input("https://www.youtube.com/watch?v=firstvid001").run()
+    _click_download_and_wait(at)
+    assert at.session_state["status"] == "done"
+    first_token = at.session_state["result_download_token"]
 
-    finished_queue: queue_module.Queue = queue_module.Queue()
-    finished_queue.put(
-        ProgressEvent(
-            event_type="on_finished",
-            percent=100.0,
-            message="Zakończono",
-            result_path=result_file,
-            result_uploader="Test Uploader",
-            result_title="Test Title",
-        )
+    at.button(key="new_url_button").click().run()
+    at.text_input(key="url_input").input("https://www.youtube.com/watch?v=secondvid02").run()
+    _click_download_and_wait(at)
+
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    second_token = at.session_state["result_download_token"]
+    assert second_token != first_token
+    first, second = downloads.lookup(first_token), downloads.lookup(second_token)
+    assert first is not None and second is not None
+    assert first.path.read_bytes() == b"video 1"
+    assert second.path.read_bytes() == b"video 2"
+    assert (first.file_name, second.file_name) == ("Kanał-Film 1.mp4", "Kanał-Film 2.mp4")
+    assert _link_urls(at) == [downloads.download_url(second_token)]
+    assert len(at.download_button) == 0
+    held_bytes = [
+        key
+        for key, value in at.session_state.filtered_state.items()
+        if isinstance(value, (bytes, bytearray))
+    ]
+    assert held_bytes == []
+
+
+def test_expired_single_file_link_shows_warning_and_file_is_removed(monkeypatch, tmp_path):
+    """TTL 0: link wygasa od razu. UI pokazuje ten sam komunikat co dla ZIP-a
+    zamiast martwego przycisku, a plik znika z dysku (w tle, patrz
+    downloads.lookup)."""
+    monkeypatch.setattr(
+        downloads, "settings", dataclasses.replace(downloads.settings, download_link_ttl_minutes=0)
     )
-    _simulate_job_in_flight(at, finished_queue)
+    at = _run_app(monkeypatch)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    result_file = job_dir / "abc.mp4"
+    result_file.write_bytes(b"fake mp4 bytes")
+    _finish_single_file_job(at, result_file)
 
     at.run()
 
     assert not at.exception
-    assert len(at.download_button) >= 1
-    assert at.download_button[0].proto.ignore_rerun is True
+    assert at.session_state["status"] == "done"
+    assert _link_urls(at) == []
+    assert len(at.download_button) == 0
+    assert any("wygasł" in w.value for w in at.warning)
+    links_root = Path(downloads.settings.storage_base_dir) / downloads._LINKS_DIRNAME
+    assert _wait_until(lambda: not any(links_root.glob("*/payload.mp4")))
 
 
 def test_both_finished_events_in_same_queue_batch_resolve_to_done(monkeypatch, tmp_path):
@@ -1144,8 +1223,9 @@ def test_both_finished_events_in_same_queue_batch_resolve_to_done(monkeypatch, t
     assert not at.exception
     assert at.session_state["status"] == "done"
     assert at.session_state["error_message"] is None
-    assert at.session_state["result_data"] is not None
-    assert len(at.download_button) >= 1
+    token = at.session_state["result_download_token"]
+    assert token is not None and downloads.lookup(token) is not None
+    assert _link_urls(at) == [downloads.download_url(token)]
 
 
 def _playlist_items(indices: list[int], status: str = "done") -> list[PlaylistItemResult]:
