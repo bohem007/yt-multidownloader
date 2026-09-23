@@ -50,6 +50,8 @@ _PLAYLIST_SNAPSHOT = "playlist_snapshot"
 _HISTORY_LOADED = "history_loaded"
 _HISTORY_ROWS = "history_rows"
 _HISTORY_ERROR = "history_error"
+_FOCUS_TARGET = "focus_target"
+_FOCUS_NONCE = "focus_nonce"
 
 # Pola "wyniku" zadania — czyszczone razem przy starcie nowego zadania
 # (set_running) i przy zmianie trybu/formatu z URL wciąż wypełnionym
@@ -234,6 +236,19 @@ class SessionState:
         stanu, bez ponawiania próby przy każdym kolejnym rerunie."""
         return self._store.get(_HISTORY_ERROR, False)
 
+    @property
+    def focus_target(self) -> str | None:
+        """Widżet, który ma dostać fokus klawiatury przy najbliższym dojściu
+        skryptu do końca (src/ui_focus.py). Celowo POZA _DEFAULTS, jak
+        focus_nonce — "Nowy URL" woła reset() i zaraz potem prosi o fokus."""
+        return self._store.get(_FOCUS_TARGET)
+
+    @property
+    def focus_nonce(self) -> int:
+        """Rośnie z każdą prośbą o fokus: nowa treść skryptu, więc przeglądarka
+        wykonuje go ponownie. Nigdy nie wraca do zera (poza _DEFAULTS)."""
+        return self._store.get(_FOCUS_NONCE, 0)
+
     def reset(self) -> None:
         self._store.update(_DEFAULTS)
 
@@ -330,6 +345,13 @@ class SessionState:
         self._store[_HISTORY_LOADED] = False
         self._store[_HISTORY_ROWS] = None
         self._store[_HISTORY_ERROR] = False
+
+    def request_focus(self, target: str) -> None:
+        self._store[_FOCUS_TARGET] = target
+        self._store[_FOCUS_NONCE] = self.focus_nonce + 1
+
+    def clear_focus_target(self) -> None:
+        self._store[_FOCUS_TARGET] = None
 
     def set_progress(self, percent: float, message: str) -> None:
         self._store[_STATUS] = "running"
