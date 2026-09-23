@@ -147,6 +147,7 @@ testuje prawdziwy SQL na fałszywym połączeniu (w szybkim zestawie, `psycopg.c
 │   ├── storage.py            # katalog tymczasowy per-job; wynik -> downloads.publish, reszta od razu rmtree
 │   ├── downloads.py          # linki do pobrania z dysku (KAŻDY plik wynikowy): token, TTL, sprzątanie
 │   ├── download_routes.py    # trasa HTTP GET /api/download/{token} (FileResponse, streaming, Content-Type z rozszerzenia)
+│   ├── ui_focus.py           # jednorazowy fokus klawiatury (st.html + JS, selektory .st-key-<key>)
 │   ├── transcript_cleaner.py # czyszczenie VTT/SRT -> TXT
 │   ├── db.py                 # psycopg, pooled connection (host -pooler), 1-2 conn
 │   ├── rate_limit.py          # licznik per IP, in-memory (deque + timestamp window)
@@ -190,6 +191,36 @@ jako sekrety) trafiają do HF Secrets/Variables, nigdy do obrazu.
   F5 zamarzał). Tryb „deferred" (`data` jako callable) też sonduje, przy każdym
   kliknięciu. Pilnuje test statyczny `test_app_source_never_uses_st_download_button`;
   pełna diagnoza w `docs/HISTORIA.md`.
+- **Godzina ważności linku.** Pod „Zapisz plik": „Link do pobrania jest ważny do
+  godziny HH:MM." (plik i ZIP; tura z kontynuacją zostaje przy „Ten plik zostanie
+  zastąpiony..."). Godzina to `DownloadLink.expires_at_local` — ta sama chwila co
+  monotoniczny `expires_at` (on decyduje o wygaśnięciu), liczona w `publish()` z
+  tego samego TTL, czas lokalny serwera; UI nie przelicza jej z TTL. Jeśli temat
+  wróci: na HF czas serwera to UTC, więc godzina w UI byłaby w UTC — świadomie
+  nierozwiązane (2026-09-23).
+- **Sygnał „plik niezapisany" na „Nowy URL".** Źródło prawdy: trasa
+  `/api/download/<token>` oznacza token (`downloads.mark_fetched`, tylko GET) w
+  chwili rozpoczęcia odpowiedzi — „zapisano" = „przeglądarka rozpoczęła
+  pobieranie", anulowania okna zapisu nie widać. W stanie „wynik gotowy +
+  niepobrany + link ważny" (`app.py::_has_unsaved_result`) „Nowy URL" ma pastelowe
+  czerwone tło (warunkowy CSS: `st.html` z samym `<style>`, kolory wg
+  `st.context.theme.type`) i natywne `help=`; tylko ostrzega — bez blokady i
+  potwierdzenia. Kliknięcie linku nie robi rerunu, więc przycisk żyje w
+  `st.fragment` z `run_every="1s"` WYŁĄCZNIE w tym stanie (inaczej `None`), a
+  fragment, który wykryje zmianę (pobrano, TTL), robi pełny `st.rerun()` — pełny
+  przebieg kasuje interwały auto-rerunu we frontendzie, więc odpytywanie się
+  kończy. Callback „Nowy URL" kończy się `st.rerun()`: w Streamlit 1.63 to głos
+  za pełnym rerunem także z widżetu we fragmencie.
+- **Fokus klawiatury (`src/ui_focus.py`).** Streamlit nie ma API fokusu:
+  `request_focus(state, cel)` (np. w callbacku) + `render_focus_script(state)`
+  wołane RAZ, na końcu `app.py`. Skrypt przez `st.html(...,
+  unsafe_allow_javascript=True)` (nie przestarzałe `st.components.v1.html`):
+  wykonuje się w głównym dokumencie przy każdej zmianie treści, więc nonce
+  (`focus_nonce`, poza `_DEFAULTS`) = jedno wykonanie na prośbę. Selektory tylko
+  przez `.st-key-<key>` w `FOCUS_SELECTORS` — zmiana `key=` widżetu wymaga zmiany
+  mapy (pilnuje test). ENTER z poprawnym URL → „Pobierz" (tylko gdy fokus wciąż
+  jest w polu URL: `on_change` odpala się też przy opuszczeniu pola); „Nowy URL"
+  → pole URL.
 - **Anonimowość.** Brak tabeli użytkowników/sesji. `client_ip_hash` — hash, nigdy
   surowy IP.
 - **Historia = własne pobrania z `HISTORY_RETENTION_DAYS` dni** (domyślnie 5). `client_ip_hash` =
@@ -351,6 +382,8 @@ test(rate-limit)
 - Nie przechowuj plików multimedialnych w bazie ani trwale na dysku.
 - Nie używaj `st.download_button` — plik wynikowy tylko przez `/api/download/<token>`
   (patrz „Zasady architektoniczne").
+- Nie używaj przestarzałego `st.components.v1` — JS przez
+  `st.html(..., unsafe_allow_javascript=True)`, tylko z treścią generowaną w kodzie.
 - Nie loguj surowego adresu IP — tylko hash.
 
 ## Znane problemy z testów manualnych (2026-09-16)
