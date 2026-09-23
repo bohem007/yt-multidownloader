@@ -198,14 +198,17 @@ jako sekrety) trafiają do HF Secrets/Variables, nigdy do obrazu.
   tego samego TTL, czas lokalny serwera; UI nie przelicza jej z TTL. Jeśli temat
   wróci: na HF czas serwera to UTC, więc godzina w UI byłaby w UTC — świadomie
   nierozwiązane (2026-09-23).
-- **Sygnał „plik niezapisany" na „Nowy URL".** Źródło prawdy: trasa
-  `/api/download/<token>` oznacza token (`downloads.mark_fetched`, tylko GET) w
-  chwili rozpoczęcia odpowiedzi — „zapisano" = „przeglądarka rozpoczęła
+- **Sygnał „plik niezapisany" na przyciskach porzucających wynik.** Źródło prawdy:
+  trasa `/api/download/<token>` oznacza token (`downloads.mark_fetched`, tylko GET)
+  w chwili rozpoczęcia odpowiedzi — „zapisano" = „przeglądarka rozpoczęła
   pobieranie", anulowania okna zapisu nie widać. W stanie „wynik gotowy +
-  niepobrany + link ważny" (`app.py::_has_unsaved_result`) „Nowy URL" ma pastelowe
-  czerwone tło (warunkowy CSS: `st.html` z samym `<style>`, kolory wg
-  `st.context.theme.type`) i natywne `help=`; tylko ostrzega — bez blokady i
-  potwierdzenia. Kliknięcie linku nie robi rerunu, więc przycisk żyje w
+  niepobrany + link ważny" (`app.py::_has_unsaved_result`) „Nowy URL" — a przy
+  turze playlisty z kontynuacją także „Pobierz kolejne pozycje" (kolejna tura po
+  zakończeniu zwalnia ZIP poprzedniej: `_publish_result`) — ma pastelowe czerwone
+  tło (warunkowy CSS: `st.html` z samym `<style>`, kolory wg
+  `st.context.theme.type`) i natywne `help=`; podpowiedzi i przyciski w jednej mapie
+  `_UNSAVED_SIGNAL_HELP`. Sygnał tylko ostrzega — bez blokady i potwierdzenia.
+  Kliknięcie linku nie robi rerunu, więc „Nowy URL" żyje w
   `st.fragment` z `run_every="1s"` WYŁĄCZNIE w tym stanie (inaczej `None`), a
   fragment, który wykryje zmianę (pobrano, TTL), robi pełny `st.rerun()` — pełny
   przebieg kasuje interwały auto-rerunu we frontendzie, więc odpytywanie się

@@ -458,7 +458,7 @@ def test_completed_playlist_job_with_next_start_index_shows_continue_button_and_
     assert [s.value for s in at.success] == ["Tura zakończona: pobrano pozycje 1-2."]
     caption_texts = [c.value for c in at.caption]
     assert "Ten plik zostanie zastąpiony, gdy pobierzesz kolejne pozycje." in caption_texts
-    assert not any("minut" in text for text in caption_texts)
+    assert not any("ważny do godziny" in text for text in caption_texts)
 
 
 def test_clicking_continue_button_starts_continuation_and_replaces_result_on_completion(
@@ -517,6 +517,8 @@ def test_clicking_continue_button_starts_continuation_and_replaces_result_on_com
     first_urls = _link_urls(at)
     assert first_urls == [downloads.download_url(first_link.token)]  # poprzedni ZIP wciąż dostępny
     assert "continue_playlist_button" in [b.key for b in at.button]
+    # ZIP tury jeszcze niepobrany — sygnał tylko ostrzega, kliknięcie działa normalnie.
+    assert at.button(key="continue_playlist_button").proto.help == UNSAVED_TURN_HELP
 
     at.button(key="continue_playlist_button").click().run()
     assert not at.exception
@@ -1154,14 +1156,18 @@ def test_completed_single_file_job_is_served_via_download_route_not_download_but
     assert expected_caption in [c.value for c in at.caption]
 
 
-def _finish_result_job(at: AppTest, job_dir: Path, result_kind: str) -> None:
-    """Wstrzykuje zakończony job: pojedynczy plik albo ZIP tury playlisty."""
+def _finish_result_job(
+    at: AppTest, job_dir: Path, result_kind: str, next_start_index: int | None = None
+) -> None:
+    """Wstrzykuje zakończony job: pojedynczy plik albo ZIP tury playlisty
+    (next_start_index != None: tura z przyciskiem "Pobierz kolejne pozycje")."""
     job_dir.mkdir(exist_ok=True)
     if result_kind == "playlist_zip":
         result_file = job_dir / "playlist.zip"
         event_fields = {
             "playlist_items": [PlaylistItemResult(index=1, title="Wideo 1", status="done")],
             "playlist_title": "Moja playlista",
+            "next_start_index": next_start_index,
         }
     else:
         result_file = job_dir / "abc.mp4"
@@ -1319,11 +1325,13 @@ def _new_url_signal(at: AppTest, fragment_calls) -> dict:
     }
 
 
-def _app_with_finished_job(monkeypatch, tmp_path, result_kind: str = "single_file"):
+def _app_with_finished_job(
+    monkeypatch, tmp_path, result_kind: str = "single_file", next_start_index: int | None = None
+):
     fragment_calls = _record_fragment_run_every(monkeypatch)
     at = _run_app(monkeypatch)
     at.text_input(key="url_input").input("https://www.youtube.com/watch?v=jNQXAC9IVRw").run()
-    _finish_result_job(at, tmp_path / "job", result_kind)
+    _finish_result_job(at, tmp_path / "job", result_kind, next_start_index)
     at.run()
     assert not at.exception
     assert at.session_state["status"] == "done"
@@ -1338,6 +1346,40 @@ def test_unsaved_result_is_signalled_on_new_url_button(monkeypatch, tmp_path, re
     at, fragment_calls = _app_with_finished_job(monkeypatch, tmp_path, result_kind)
 
     assert _new_url_signal(at, fragment_calls) == SIGNAL_ON
+    # Bez kontynuacji nie ma "Pobierz kolejne pozycje" — CSS go nie dotyczy.
+    assert not _continue_signal_css(at)
+
+
+UNSAVED_TURN_HELP = (
+    "ZIP tej tury nie został zapisany. Pobranie kolejnych pozycji zastąpi go i plik przepadnie."
+)
+
+
+def _continue_signal_css(at: AppTest) -> bool:
+    return any(
+        ".st-key-continue_playlist_button" in element.proto.body for element in at.get("html")
+    )
+
+
+def test_unsaved_turn_zip_is_signalled_on_continue_button(monkeypatch, tmp_path):
+    """Tura z kontynuacją: "Pobierz kolejne pozycje" też porzuca niezapisany
+    ZIP (kolejna tura go zastąpi i usunie z dysku), więc ma ten sam sygnał co
+    "Nowy URL" — i traci go razem z nim, gdy pobieranie ZIP-a ruszy."""
+    at, fragment_calls = _app_with_finished_job(
+        monkeypatch, tmp_path, "playlist_zip", next_start_index=2
+    )
+
+    assert at.button(key="continue_playlist_button").proto.help == UNSAVED_TURN_HELP
+    assert _continue_signal_css(at)
+    assert _new_url_signal(at, fragment_calls) == SIGNAL_ON
+
+    downloads.mark_fetched(at.session_state["result_download_token"])
+    at.run()
+
+    assert not at.exception
+    assert at.button(key="continue_playlist_button").proto.help == ""
+    assert not _continue_signal_css(at)
+    assert _new_url_signal(at, fragment_calls) == SIGNAL_OFF
 
 
 def test_signal_clears_once_the_download_starts(monkeypatch, tmp_path):

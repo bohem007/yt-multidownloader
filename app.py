@@ -526,8 +526,18 @@ def _render_save_link(state: SessionState, *, replaced_by_next_turn: bool) -> No
         )
 
 
-UNSAVED_RESULT_HELP = "Plik nie został zapisany. Kliknięcie spowoduje utratę pobranego pliku."
-# Jak szybko "Nowy URL" wraca do zwykłego wyglądu po kliknięciu "Zapisz plik".
+# Przyciski, których kliknięcie porzuca niezapisany wynik, i ich podpowiedzi
+# w stanie "niezapisany" (_has_unsaved_result) — jeden sygnał, jeden wygląd.
+_UNSAVED_SIGNAL_HELP = {
+    "new_url_button": "Plik nie został zapisany. Kliknięcie spowoduje utratę pobranego pliku.",
+    # Kontynuacja zwalnia ZIP poprzedniej tury, gdy nowa tura się zakończy
+    # (_publish_result: downloads.release(previous_token)).
+    "continue_playlist_button": (
+        "ZIP tej tury nie został zapisany. Pobranie kolejnych pozycji zastąpi go "
+        "i plik przepadnie."
+    ),
+}
+# Jak szybko sygnał znika po kliknięciu "Zapisz plik" (odpytuje fragment "Nowy URL").
 UNSAVED_POLL_INTERVAL = "1s"
 # Pastelowa czerwień; tekst/obramowanie z kontrastem >= 4.5:1 do tła (także
 # po najechaniu), osobno dla motywu jasnego i ciemnego.
@@ -549,20 +559,29 @@ def _has_unsaved_result(state: SessionState) -> bool:
     return link is not None and not link.fetched
 
 
-def _inject_unsaved_signal_css() -> None:
-    """Pastelowe tło "Nowy URL" — wstrzykiwane tylko w stanie "niezapisany".
-    Sam <style> trafia do event containera (st.html), więc nie zajmuje
-    miejsca w układzie; selektor przez klasę .st-key-<key> przycisku."""
+def _unsaved_signal_help(button_key: str, signal_unsaved: bool) -> str | None:
+    """Podpowiedź przycisku z _UNSAVED_SIGNAL_HELP — tylko w stanie "niezapisany"."""
+    return _UNSAVED_SIGNAL_HELP[button_key] if signal_unsaved else None
+
+
+def _inject_unsaved_signal_css(button_keys: list[str]) -> None:
+    """Pastelowe tło przycisków porzucających wynik — tylko w stanie
+    "niezapisany". Sam <style> trafia do event containera (st.html), więc nie
+    zajmuje miejsca w układzie; selektory przez klasę .st-key-<key>."""
     colors = _UNSAVED_SIGNAL_COLORS["dark" if st.context.theme.type == "dark" else "light"]
-    button = ".st-key-new_url_button button"
+    buttons = [f".st-key-{key} button" for key in button_keys]
+    any_state = ", ".join(
+        f"{button}, {button}:hover, {button}:active, {button}:focus-visible" for button in buttons
+    )
+    hovered = ", ".join(f"{button}:hover" for button in buttons)
     st.html(
         "<style>"
-        f"{button}, {button}:hover, {button}:active, {button}:focus-visible {{"
+        f"{any_state} {{"
         f"background-color: {colors['background']};"
         f"color: {colors['text']};"
         f"border-color: {colors['text']};"
         "}"
-        f"{button}:hover {{ background-color: {colors['hover_background']}; }}"
+        f"{hovered} {{ background-color: {colors['hover_background']}; }}"
         "</style>"
     )
 
@@ -886,7 +905,11 @@ with tab_download:
 
     unsaved_result = _has_unsaved_result(state)
     if unsaved_result:
-        _inject_unsaved_signal_css()
+        signalled_buttons = ["new_url_button"]
+        if state.playlist_next_start_index is not None:
+            # Tura z kontynuacją: "Pobierz kolejne pozycje" też porzuca ten ZIP.
+            signalled_buttons.append("continue_playlist_button")
+        _inject_unsaved_signal_css(signalled_buttons)
 
     def _render_new_url_button(signal_unsaved: bool) -> None:
         # W stanie "niezapisany" Streamlit wywołuje to co UNSAVED_POLL_INTERVAL
@@ -902,7 +925,7 @@ with tab_download:
             disabled=new_url_disabled,
             on_click=_start_new_url,
             width="stretch",
-            help=UNSAVED_RESULT_HELP if signal_unsaved else None,
+            help=_unsaved_signal_help("new_url_button", signal_unsaved),
         )
 
     col_download, col_new_url = st.columns(2)
@@ -1003,7 +1026,13 @@ with tab_download:
         "dziedziczy" niczego z poprzedniego przebiegu."""
         _render_result(state)
         if state.playlist_next_start_index is not None:
-            if st.button("Pobierz kolejne pozycje", key="continue_playlist_button"):
+            if st.button(
+                "Pobierz kolejne pozycje",
+                key="continue_playlist_button",
+                # Ten sam sygnał co "Nowy URL"; po zapisie znika razem z nim
+                # (pełny rerun z fragmentu "Nowy URL").
+                help=_unsaved_signal_help("continue_playlist_button", unsaved_result),
+            ):
                 if not runner.is_slot_available():
                     st.warning(
                         f"Wszystkie {settings.max_concurrent_jobs} miejsca pobierania są zajęte "
