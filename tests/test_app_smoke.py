@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 import src.config as config_module
@@ -1153,15 +1154,9 @@ def test_completed_single_file_job_is_served_via_download_route_not_download_but
     assert expected_caption in [c.value for c in at.caption]
 
 
-@pytest.mark.parametrize("result_kind", ["single_file", "playlist_zip"])
-def test_link_caption_shows_expiry_clock_time_from_the_token(
-    monkeypatch, tmp_path, frozen_link_clock, result_kind
-):
-    """Godzina ważności pochodzi z rejestru linków (expires_at_local tokenu)
-    i jest taka sama dla pojedynczego pliku i ZIP-a: 12:00 (zamrożone) + TTL."""
-    at = _run_app(monkeypatch)
-    job_dir = tmp_path / "job"
-    job_dir.mkdir()
+def _finish_result_job(at: AppTest, job_dir: Path, result_kind: str) -> None:
+    """Wstrzykuje zakończony job: pojedynczy plik albo ZIP tury playlisty."""
+    job_dir.mkdir(exist_ok=True)
     if result_kind == "playlist_zip":
         result_file = job_dir / "playlist.zip"
         event_fields = {
@@ -1183,6 +1178,16 @@ def test_link_caption_shows_expiry_clock_time_from_the_token(
         )
     )
     _simulate_job_in_flight(at, finished_queue)
+
+
+@pytest.mark.parametrize("result_kind", ["single_file", "playlist_zip"])
+def test_link_caption_shows_expiry_clock_time_from_the_token(
+    monkeypatch, tmp_path, frozen_link_clock, result_kind
+):
+    """Godzina ważności pochodzi z rejestru linków (expires_at_local tokenu)
+    i jest taka sama dla pojedynczego pliku i ZIP-a: 12:00 (zamrożone) + TTL."""
+    at = _run_app(monkeypatch)
+    _finish_result_job(at, tmp_path / "job", result_kind)
 
     at.run()
 
@@ -1282,6 +1287,114 @@ def test_expired_single_file_link_shows_warning_and_file_is_removed(monkeypatch,
     assert any("wygasł" in w.value for w in at.warning)
     links_root = Path(downloads.settings.storage_base_dir) / downloads._LINKS_DIRNAME
     assert _wait_until(lambda: not any(links_root.glob("*/payload.mp4")))
+
+
+UNSAVED_HELP = "Plik nie został zapisany. Kliknięcie spowoduje utratę pobranego pliku."
+SIGNAL_ON = {"help": UNSAVED_HELP, "css": True, "run_every": "1s"}
+SIGNAL_OFF = {"help": "", "css": False, "run_every": None}
+
+
+def _record_fragment_run_every(monkeypatch) -> list[tuple[str | None, object]]:
+    """Rejestruje run_every, z jakim app.py tworzy fragmenty — AppTest nie
+    pokazuje auto-rerunu w drzewie elementów."""
+    calls: list[tuple[str | None, object]] = []
+    real_fragment = st.fragment
+
+    def _recording_fragment(func=None, *, run_every=None, **kwargs):
+        calls.append((getattr(func, "__name__", None), run_every))
+        return real_fragment(func, run_every=run_every, **kwargs)
+
+    monkeypatch.setattr(st, "fragment", _recording_fragment)
+    return calls
+
+
+def _new_url_signal(at: AppTest, fragment_calls) -> dict:
+    """Stan sygnału "plik niezapisany" na "Nowy URL" po OSTATNIM przebiegu:
+    podpowiedź przycisku, wstrzyknięty CSS i run_every jego fragmentu."""
+    run_every = [value for name, value in fragment_calls if name == "_render_new_url_button"]
+    return {
+        "help": at.button(key="new_url_button").proto.help,
+        "css": any(".st-key-new_url_button" in element.proto.body for element in at.get("html")),
+        "run_every": run_every[-1],
+    }
+
+
+def _app_with_finished_job(monkeypatch, tmp_path, result_kind: str = "single_file"):
+    fragment_calls = _record_fragment_run_every(monkeypatch)
+    at = _run_app(monkeypatch)
+    at.text_input(key="url_input").input("https://www.youtube.com/watch?v=jNQXAC9IVRw").run()
+    _finish_result_job(at, tmp_path / "job", result_kind)
+    at.run()
+    assert not at.exception
+    assert at.session_state["status"] == "done"
+    return at, fragment_calls
+
+
+@pytest.mark.parametrize("result_kind", ["single_file", "playlist_zip"])
+def test_unsaved_result_is_signalled_on_new_url_button(monkeypatch, tmp_path, result_kind):
+    """Po zakończeniu joba, dopóki plik nie zaczął się pobierać: pastelowe tło
+    (CSS), podpowiedź i odpytywanie co 1 s (fragment z run_every). Dla
+    playlisty sygnał dotyczy ZIP-a bieżącej tury."""
+    at, fragment_calls = _app_with_finished_job(monkeypatch, tmp_path, result_kind)
+
+    assert _new_url_signal(at, fragment_calls) == SIGNAL_ON
+
+
+def test_signal_clears_once_the_download_starts(monkeypatch, tmp_path):
+    at, fragment_calls = _app_with_finished_job(monkeypatch, tmp_path)
+
+    downloads.mark_fetched(at.session_state["result_download_token"])
+    at.run()
+
+    assert not at.exception
+    # Zwykły wygląd, bez podpowiedzi — i bez stałego odpytywania.
+    assert _new_url_signal(at, fragment_calls) == SIGNAL_OFF
+
+
+def test_no_signal_when_the_link_already_expired(monkeypatch, tmp_path):
+    """Po TTL nic już nie przepada, więc sygnał znika (TTL 0 = od razu)."""
+    monkeypatch.setattr(
+        downloads, "settings", dataclasses.replace(downloads.settings, download_link_ttl_minutes=0)
+    )
+    at, fragment_calls = _app_with_finished_job(monkeypatch, tmp_path)
+
+    assert any("wygasł" in w.value for w in at.warning)
+    assert _new_url_signal(at, fragment_calls) == SIGNAL_OFF
+
+
+def test_no_signal_while_the_next_playlist_turn_is_running(monkeypatch, tmp_path):
+    """W trakcie kolejnej tury poprzedni ZIP wciąż jest widoczny, ale nowy job
+    kończy sygnał — "Nowy URL" i tak jest wtedy zablokowany."""
+    fragment_calls = _record_fragment_run_every(monkeypatch)
+    at = _run_app(monkeypatch)
+    link = _publish_seed_zip(tmp_path, b"previous turn zip")
+    at.session_state["result_download_token"] = link.token
+    at.session_state["result_file_name"] = link.file_name
+    at.session_state["playlist_report"] = [PlaylistItemResult(index=1, title="Wideo 1", status="done")]
+    at.session_state["playlist_next_start_index"] = 2
+    _simulate_job_in_flight(at, queue_module.Queue())
+
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "running"
+    assert _new_url_signal(at, fragment_calls) == SIGNAL_OFF
+
+
+def test_new_url_in_unsaved_state_resets_without_blocking(monkeypatch, tmp_path):
+    """Sygnał tylko ostrzega: bez blokady i bez okna potwierdzenia."""
+    at, fragment_calls = _app_with_finished_job(monkeypatch, tmp_path)
+    token = at.session_state["result_download_token"]
+
+    at.button(key="new_url_button").click().run()
+
+    assert not at.exception
+    assert at.session_state["status"] == "idle"
+    assert at.text_input(key="url_input").value == ""
+    assert _new_url_signal(at, fragment_calls) == SIGNAL_OFF
+    assert ui_focus.FOCUS_SELECTORS["url"] in _focus_scripts(at)[0]
+    # Plik porzucony przez sesję, ale link działa do TTL.
+    assert downloads.lookup(token) is not None
 
 
 def test_both_finished_events_in_same_queue_batch_resolve_to_done(monkeypatch, tmp_path):

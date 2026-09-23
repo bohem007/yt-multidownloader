@@ -526,6 +526,47 @@ def _render_save_link(state: SessionState, *, replaced_by_next_turn: bool) -> No
         )
 
 
+UNSAVED_RESULT_HELP = "Plik nie został zapisany. Kliknięcie spowoduje utratę pobranego pliku."
+# Jak szybko "Nowy URL" wraca do zwykłego wyglądu po kliknięciu "Zapisz plik".
+UNSAVED_POLL_INTERVAL = "1s"
+# Pastelowa czerwień; tekst/obramowanie z kontrastem >= 4.5:1 do tła (także
+# po najechaniu), osobno dla motywu jasnego i ciemnego.
+_UNSAVED_SIGNAL_COLORS = {
+    "light": {"background": "#F8D7DA", "hover_background": "#F1B0B7", "text": "#842029"},
+    "dark": {"background": "#4A1D22", "hover_background": "#5E252B", "text": "#F5C2C7"},
+}
+
+
+def _has_unsaved_result(state: SessionState) -> bool:
+    """Wynik gotowy, link ważny, a przeglądarka jeszcze nie zaczęła go pobierać
+    (downloads.mark_fetched) — "Nowy URL" porzuciłby ten plik. Wygasły link
+    albo nowy job/zmiana trybu (status nie "done") kończą sygnał: nic już
+    nie przepada."""
+    token = state.result_download_token
+    if state.status != "done" or token is None or not downloads.is_route_enabled():
+        return False
+    link = downloads.lookup(token)
+    return link is not None and not link.fetched
+
+
+def _inject_unsaved_signal_css() -> None:
+    """Pastelowe tło "Nowy URL" — wstrzykiwane tylko w stanie "niezapisany".
+    Sam <style> trafia do event containera (st.html), więc nie zajmuje
+    miejsca w układzie; selektor przez klasę .st-key-<key> przycisku."""
+    colors = _UNSAVED_SIGNAL_COLORS["dark" if st.context.theme.type == "dark" else "light"]
+    button = ".st-key-new_url_button button"
+    st.html(
+        "<style>"
+        f"{button}, {button}:hover, {button}:active, {button}:focus-visible {{"
+        f"background-color: {colors['background']};"
+        f"color: {colors['text']};"
+        f"border-color: {colors['text']};"
+        "}"
+        f"{button}:hover {{ background-color: {colors['hover_background']}; }}"
+        "</style>"
+    )
+
+
 def _url_ready_for_download(url: str) -> bool:
     """URL, który przycisk "Pobierz" przyjmie: domena z whitelisty i nie
     Mix/Radio bez v= (YouTube zwraca "unviewable" — patrz mix_unreadable)."""
@@ -838,6 +879,31 @@ with tab_download:
         # Pole jest w tym samym przebiegu odblokowane (reset() zdjął URL-lock),
         # więc od razu można wkleić nowy adres.
         request_focus(state, "url")
+        # Przycisk żyje we fragmencie (niżej), więc bez tego przerysowałby się
+        # tylko fragment. st.rerun() w callbacku to w Streamlit 1.63 głos za
+        # pełnym rerunem aplikacji — musi być ostatnią instrukcją.
+        st.rerun()
+
+    unsaved_result = _has_unsaved_result(state)
+    if unsaved_result:
+        _inject_unsaved_signal_css()
+
+    def _render_new_url_button(signal_unsaved: bool) -> None:
+        # W stanie "niezapisany" Streamlit wywołuje to co UNSAVED_POLL_INTERVAL
+        # (kliknięcie linku "Zapisz plik" nie robi rerunu — o zapisie wie tylko
+        # serwer). Zmiana stanu (plik pobrany, link wygasł) -> pełny rerun:
+        # bez CSS i podpowiedzi, a fragment bez run_every (pełny przebieg kasuje
+        # interwały auto-rerunu we frontendzie) — koniec odpytywania.
+        if _has_unsaved_result(state) != signal_unsaved:
+            st.rerun()
+        st.button(
+            "Nowy URL",
+            key="new_url_button",
+            disabled=new_url_disabled,
+            on_click=_start_new_url,
+            width="stretch",
+            help=UNSAVED_RESULT_HELP if signal_unsaved else None,
+        )
 
     col_download, col_new_url = st.columns(2)
     with col_download:
@@ -845,13 +911,10 @@ with tab_download:
             "Pobierz", key="download_button", disabled=download_disabled, width="stretch"
         )
     with col_new_url:
-        st.button(
-            "Nowy URL",
-            key="new_url_button",
-            disabled=new_url_disabled,
-            on_click=_start_new_url,
-            width="stretch",
-        )
+        st.fragment(
+            _render_new_url_button,
+            run_every=UNSAVED_POLL_INTERVAL if unsaved_result else None,
+        )(unsaved_result)
 
     def _launch_job(start_index: int = 1, *, clear_previous_result: bool = True) -> str:
         """Wspólna ścieżka startu joba dla przycisku "Pobierz" (start_index=1,
