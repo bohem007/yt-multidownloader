@@ -16,6 +16,9 @@ import pytest
 
 import src.downloads as downloads
 from src.download_routes import DOWNLOAD_ROUTE, download_endpoint
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
@@ -147,8 +150,8 @@ def _request_for(token: str) -> Request:
     return Request(scope)
 
 
-def _run_response(response: Response) -> tuple[int, dict[str, str], bytes]:
-    """Wykonuje odpowiedź jako aplikację ASGI i zbiera status/nagłówki/ciało."""
+def _run_asgi(app, scope: dict) -> tuple[int, dict[str, str], bytes]:
+    """Wykonuje aplikację ASGI i zbiera status/nagłówki/ciało."""
     messages: list[dict] = []
 
     async def receive():
@@ -157,13 +160,16 @@ def _run_response(response: Response) -> tuple[int, dict[str, str], bytes]:
     async def send(message):
         messages.append(message)
 
-    scope = {"type": "http", "method": "GET", "headers": [], "path": "/"}
-    asyncio.run(response(scope, receive, send))
+    asyncio.run(app(scope, receive, send))
 
     start = next(m for m in messages if m["type"] == "http.response.start")
     headers = {k.decode().lower(): v.decode() for k, v in start["headers"]}
     body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
     return start["status"], headers, body
+
+
+def _run_response(response: Response) -> tuple[int, dict[str, str], bytes]:
+    return _run_asgi(response, {"type": "http", "method": "GET", "headers": [], "path": "/"})
 
 
 def test_route_pattern_matches_generated_url():
@@ -192,6 +198,58 @@ def test_endpoint_streams_file_as_attachment_with_unicode_filename(tmp_path):
     assert "Playlista-Zażółć gęślą-pozycje-01-07.mp4.zip" in unquote(disposition)
     assert headers["cache-control"] == "no-store"
     assert headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_content_type"),
+    [
+        (".mp4", "video/mp4"),
+        (".mp3", "audio/mpeg"),
+        (".flac", "audio/flac"),
+        (".m4a", "audio/mp4"),
+        (".srt", "text/plain; charset=utf-8"),
+        (".vtt", "text/vtt; charset=utf-8"),
+        (".txt", "text/plain; charset=utf-8"),
+        (".zip", "application/zip"),
+    ],
+)
+def test_endpoint_content_type_follows_file_extension(tmp_path, suffix, expected_content_type):
+    link = downloads.publish(_source(tmp_path, b"payload", f"result{suffix}"), f"Autor-Tytuł{suffix}")
+
+    status, headers, _body = _run_response(asyncio.run(download_endpoint(_request_for(link.token))))
+
+    assert status == 200
+    assert headers["content-type"] == expected_content_type
+
+
+@pytest.mark.parametrize(
+    ("suffix", "compressed"),
+    [(".flac", False), (".m4a", False), (".mp3", False), (".mp4", False), (".zip", False), (".txt", True)],
+)
+def test_server_gzip_does_not_recompress_already_compressed_results(tmp_path, suffix, compressed):
+    """Serwer st.App przepuszcza odpowiedzi przez GZipMiddleware Starlette
+    (minimum_size=500, compresslevel=9) — tu ten sam układ. Audio/wideo/ZIP
+    wychodzą bez ponownej kompresji; tekst jest kontrolą, że gzip działa."""
+    payload = os.urandom(4096)
+    link = downloads.publish(_source(tmp_path, payload, f"result{suffix}"), f"Autor-Tytuł{suffix}")
+    app = Starlette(
+        routes=[Route(DOWNLOAD_ROUTE, download_endpoint)],
+        middleware=[Middleware(GZipMiddleware, minimum_size=500, compresslevel=9)],
+    )
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": downloads.download_url(link.token),
+        "headers": [(b"accept-encoding", b"gzip")],
+        "query_string": b"",
+    }
+
+    status, headers, body = _run_asgi(app, scope)
+
+    assert status == 200
+    assert (headers.get("content-encoding") == "gzip") is compressed
+    if not compressed:
+        assert body == payload
 
 
 def test_endpoint_returns_404_for_unknown_or_expired_token():
