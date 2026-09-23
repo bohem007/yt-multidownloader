@@ -25,7 +25,7 @@ import secrets
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from src.config import settings
@@ -40,6 +40,9 @@ class DownloadLink:
     path: Path
     file_name: str
     expires_at: float
+    # True od chwili, gdy trasa zaczęła wysyłać plik (mark_fetched) —
+    # "przeglądarka rozpoczęła pobieranie"; anulowania okna zapisu nie widać.
+    fetched: bool = False
 
 
 _lock = threading.Lock()
@@ -112,6 +115,15 @@ def lookup(token: str) -> DownloadLink | None:
     if not link.path.exists():
         return None
     return link
+
+
+def mark_fetched(token: str) -> None:
+    """Odnotowuje, że plik tokenu zaczął być pobierany — źródło prawdy dla
+    sygnału "plik niezapisany" w UI. Nieznany token nie jest błędem."""
+    with _lock:
+        link = _links.get(token)
+        if link is not None and not link.fetched:
+            _links[token] = replace(link, fetched=True)
 
 
 def release(token: str) -> None:

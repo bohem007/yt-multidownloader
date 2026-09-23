@@ -45,6 +45,10 @@ async def download_endpoint(request: Request) -> Response:
             status_code=404,
             headers={"Cache-Control": "no-store"},
         )
+    if request.method == "GET":
+        # Odpowiedź z plikiem zaraz rusza — to jest moment "zapisano" dla UI
+        # (HEAD niczego nie pobiera, więc go nie oznacza).
+        downloads.mark_fetched(link.token)
     return FileResponse(
         link.path,
         filename=link.file_name,

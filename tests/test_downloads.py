@@ -175,10 +175,10 @@ def test_purge_all_removes_everything(tmp_path):
     assert downloads.lookup(link.token) is None
 
 
-def _request_for(token: str) -> Request:
+def _request_for(token: str, method: str = "GET") -> Request:
     scope = {
         "type": "http",
-        "method": "GET",
+        "method": method,
         "path": downloads.download_url(token),
         "headers": [],
         "path_params": {"token": token},
@@ -286,6 +286,37 @@ def test_server_gzip_does_not_recompress_already_compressed_results(tmp_path, su
     assert (headers.get("content-encoding") == "gzip") is compressed
     if not compressed:
         assert body == payload
+
+
+def test_new_link_is_not_fetched_until_the_route_serves_it(tmp_path):
+    link = downloads.publish(_source(tmp_path), "x.zip")
+    assert downloads.lookup(link.token).fetched is False
+
+    status, _headers, _body = _run_response(asyncio.run(download_endpoint(_request_for(link.token))))
+
+    assert status == 200
+    assert downloads.lookup(link.token).fetched is True
+
+
+def test_head_request_does_not_mark_link_as_fetched(tmp_path):
+    link = downloads.publish(_source(tmp_path), "x.zip")
+
+    asyncio.run(download_endpoint(_request_for(link.token, method="HEAD")))
+
+    assert downloads.lookup(link.token).fetched is False
+
+
+def test_unknown_or_expired_token_marks_nothing(monkeypatch, tmp_path):
+    downloads.mark_fetched("never-existed")
+    assert downloads.lookup("never-existed") is None
+
+    link = downloads.publish(_source(tmp_path), "x.zip")
+    _advance_clock_past_ttl(monkeypatch)
+    response = asyncio.run(download_endpoint(_request_for(link.token)))
+
+    assert response.status_code == 404
+    downloads.mark_fetched(link.token)
+    assert downloads.lookup(link.token) is None
 
 
 def test_endpoint_returns_404_for_unknown_or_expired_token():
