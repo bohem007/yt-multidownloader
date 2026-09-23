@@ -121,3 +121,60 @@ Drugi udokumentowany edge case (w kodzie transcript_cleaner.py, niekrytyczny):
 skrót przed WIELKĄ literą ("godz. Warszawa nie śpi") wygląda identycznie jak
 koniec zdania i zostanie rozdzielony — rzadkie w praktyce (YouTube
 auto-punktuacja jest uboga), nierozwiązywane bez słownika skrótów.
+
+## „Zapisz plik" nie reaguje, F5 zamarza — sonda st.download_button (2026-09-23)
+
+Zgłoszenie (test manualny): wideo A pobrane bez zapisu, potem wideo B —
+„Zapisz plik" nie reagował (4 kliknięcia), F5 zamarzał; po zamknięciu karty
+wszystkie 4 zapisy ruszyły naraz, bez restartu serwera.
+
+Mechanizm (Faza 0a, odczyt kodu Streamlit 1.63.0 z GitHuba — `.venv` jest
+wyłączony z odczytu w `.claude/settings.json`):
+- `frontend/lib/src/components/widgets/DownloadButton/DownloadButton.tsx:83-90`:
+  przy każdym zamontowaniu przycisku `useEffect` woła
+  `checkSourceUrlResponse(downloadUrl)`.
+- `frontend/connection/src/DefaultStreamlitEndpoints.ts:109-146`: to
+  `await fetch(sourceUrl)` — pełny GET, sprawdza tylko `response.ok`; body nie
+  jest czytane ani anulowane, brak `AbortController`, żądanie przeżywa
+  odmontowanie przycisku.
+- `lib/streamlit/web/server/starlette/starlette_routes.py:678-736`: `/media/`
+  oddaje cały plik jednym `Response(content)`; uvicorn nie ma limitu czasu zapisu.
+- Skutek: przy dużym pliku przeglądarka buforuje kilka MB i przestaje czytać,
+  połączenie HTTP/1.1 jest zajęte do zamknięcia karty. Po ~6 takich wynikach
+  pula Chrome/Edge (6 połączeń na host) jest pełna. WebSocket ma osobny limit,
+  więc UI działa, a stoją tylko żądania HTTP.
+- Tryb „deferred" (`data` jako callable) sonduje przy każdym kliknięciu
+  (`DownloadButton.tsx:107-111`) — nie jest obejściem.
+
+Objawy → wyjaśnienie:
+- „Zapisz plik" bez reakcji: `<a download>` czeka w kolejce na wolne połączenie.
+- F5 zamarza: nawigacja potrzebuje połączenia z tej samej puli, a stara strona
+  (trzymająca sondy) znika dopiero po załadowaniu nowej — zakleszczenie.
+- Zamknięcie karty → zapisy naraz: sondy karty zostają anulowane, a pobrania
+  należą do menedżera pobierania i przeżywają zamknięcie.
+- Narasta tylko w jednej karcie bez F5 (stąd „po dłuższej serii testów").
+  Czynnikiem nie był niezapisany plik — zapis nie zamyka sondy.
+
+Odrzucone na podstawie kodu: zablokowana pętla zdarzeń (gzip dużych odpowiedzi
+idzie w wątku, `video/*` i `audio/*` są wyłączone z kompresji) i kosztowny
+rerun (Streamlit 1.63 haszuje tylko próbki plików >1 MiB). Faza 0b (pomiar)
+pominięta decyzją z 2026-09-23 — diagnozę weryfikuje test manualny po naprawie.
+
+Naprawa (gałąź `fix/single-file-download-route`): każdy plik wynikowy
+(pojedynczy i ZIP) idzie przez `downloads.publish` + `st.link_button` →
+`/api/download/<token>`; `st.download_button` usunięty (strażnik: test
+statyczny + AppTest dla każdego trybu). Pliki żyją do
+`DOWNLOAD_LINK_TTL_MINUTES`, także po „Nowy URL", zmianie trybu i nowym jobie.
+Przy okazji: Content-Type z rozszerzenia pliku (`.flac`/`.m4a` zarejestrowane —
+wcześniej `application/octet-stream` i ponowny gzip skompresowanego audio) oraz
+kasowanie wygasłego tokenu w wątku, poza pętlą zdarzeń.
+
+Jeśli temat wróci:
+- HF Spaces za proxy (prawdopodobnie HTTP/2): limit 6 połączeń nie obowiązuje,
+  ale nieczytane strumienie trzymają okna flow-control — objaw i próg mogą być
+  inne. Niezweryfikowane; wdrożenie na HF wstrzymane.
+- Zgłoszenie upstream (sonda powinna używać `HEAD` albo `response.body?.cancel()`)
+  nie zostało wysłane; sondę najpewniej wprowadził PR streamlit/streamlit#10837.
+- Tani pomiar wiszących połączeń: `(Get-NetTCPConnection -LocalPort 8501 -State
+  Established).Count` po ≥5 s bezczynności (uvicorn zamyka wtedy keep-alive)
+  = 1 (WebSocket karty) + wiszące żądania.

@@ -35,7 +35,8 @@ Ustalone wartości domyślne:
 - `MAX_CONCURRENT_JOBS=2`
 - `ITEM_DOWNLOAD_TIMEOUT_SECONDS=180` (twardy limit ścienny na pobranie JEDNEJ
   pozycji — defense-in-depth, niezależny od retries/fragment_retries yt-dlp)
-- `DOWNLOAD_LINK_TTL_MINUTES=30` (jak długo ZIP playlisty czeka na dysku pod linkiem)
+- `DOWNLOAD_LINK_TTL_MINUTES=30` (jak długo plik wynikowy — pojedynczy lub ZIP
+  playlisty — czeka na dysku pod linkiem)
 - `RATE_LIMIT_PER_IP=10` (żądań/godzinę)
 - `RATE_LIMITING_ENABLED` — domyślnie włączone w `production`, opcjonalne lokalnie
 - `DB_CONNECT_TIMEOUT_SECONDS=5` (walidacja `>= 1`; twardy limit czasu na SAM
@@ -89,8 +90,8 @@ użytkownika o aktualny stan.
 
 ```powershell
 # Uruchomienie — ZAWSZE przez asgi_app.py (nie `streamlit run app.py`:
-# bez owijki st.App nie ma trasy /api/download i link "Zapisz plik" dla
-# playlist byłby martwy). Ta sama komenda w Dockerfile (CMD) dla HF.
+# bez owijki st.App nie ma trasy /api/download i żaden link "Zapisz plik"
+# by nie działał). Ta sama komenda w Dockerfile (CMD) dla HF.
 uv run streamlit run asgi_app.py
 # Uwaga: st.App nie otwiera przeglądarki sam — wejdź na http://localhost:8501
 
@@ -143,9 +144,9 @@ testuje prawdziwy SQL na fałszywym połączeniu (w szybkim zestawie, `psycopg.c
 │   ├── engine.py             # JEDYNY moduł importujący yt_dlp; opcje w _build_ydl_opts, timeout w _download_one
 │   ├── profiles.py           # profile formatów (video/mp3/flac/subtitle/transcript)
 │   ├── naming.py             # build_display_filename — konwencja nazw plików do pobrania
-│   ├── storage.py            # katalog tymczasowy per-job, wczytanie do RAM, natychmiastowy rmtree
-│   ├── downloads.py          # linki do pobrania z dysku (ZIP playlisty): token, TTL, sprzątanie
-│   ├── download_routes.py    # trasa HTTP GET /api/download/{token} (FileResponse, streaming)
+│   ├── storage.py            # katalog tymczasowy per-job; wynik -> downloads.publish, reszta od razu rmtree
+│   ├── downloads.py          # linki do pobrania z dysku (KAŻDY plik wynikowy): token, TTL, sprzątanie
+│   ├── download_routes.py    # trasa HTTP GET /api/download/{token} (FileResponse, streaming, Content-Type z rozszerzenia)
 │   ├── transcript_cleaner.py # czyszczenie VTT/SRT -> TXT
 │   ├── db.py                 # psycopg, pooled connection (host -pooler), 1-2 conn
 │   ├── rate_limit.py          # licznik per IP, in-memory (deque + timestamp window)
@@ -169,14 +170,26 @@ jako sekrety) trafiają do HF Secrets/Variables, nigdy do obrazu.
 - **Brak systemu migracji.** Jeden `schema.sql` z `CREATE TABLE IF NOT EXISTS`;
   zmiany schematu = ręczny `ALTER TABLE IF EXISTS ... ADD COLUMN IF NOT EXISTS`.
 - **Baza nie przechowuje plików.** Tylko metadane zadań (`jobs`). Pliki multimedialne
-  żyją tymczasowo na dysku, są wczytywane do RAM i natychmiast usuwane po wysyłce.
-  **Wyjątek: ZIP playlisty** (tryb "Cała playlista") NIE trafia do RAM —
-  `st.download_button(data=<~1 GB>)` zawieszał się bezterminowo. ZIP zostaje na
-  dysku (`src/downloads.py`) pod nieodgadywalnym tokenem i jest serwowany
-  strumieniowo przez `GET /api/download/{token}` (`asgi_app.py`), do
-  `DOWNLOAD_LINK_TTL_MINUTES`, albo do zastąpienia nowym wynikiem / resetu
-  sesji. `server.enableStaticServing` odpada: Streamlit 1.63 zwraca 404 dla
-  plików >200 MB w `static/`.
+  żyją tymczasowo na dysku: katalog joba (`storage.py`) znika zaraz po zakończeniu,
+  a plik wynikowy — **każdy, pojedynczy i ZIP playlisty** — NIE trafia do RAM:
+  `downloads.publish()` przenosi go pod nieodgadywalny token (`src/downloads.py`),
+  skąd jest serwowany strumieniowo przez `GET /api/download/{token}`
+  (`asgi_app.py`) do `DOWNLOAD_LINK_TTL_MINUTES`. „Nowy URL", zmiana
+  trybu/formatu ani nowy job go nie kasują (świadoma decyzja 2026-09-23 — do TTL
+  plik pobierze każdy, kto zna token); wcześniej znika tylko ZIP tury playlisty
+  zastąpiony kolejną turą. `SessionState` trzyma token/nazwę/rozmiar, nigdy bajty.
+  `server.enableStaticServing` odpada: Streamlit 1.63 zwraca 404 dla plików
+  >200 MB w `static/`.
+- **Zapis pliku wyłącznie przez `/api/download/<token>` — zakaz `st.download_button`.**
+  Każdy plik wynikowy (pojedynczy i ZIP) dostaje `st.link_button` z
+  `app.py::_render_save_link`. Powód: sonda frontendu Streamlit 1.63
+  (`checkSourceUrlResponse` w `DownloadButton.tsx`) przy każdym zamontowaniu
+  przycisku wysyła pełny `GET /media/<id>` i nie czyta ani nie anuluje
+  odpowiedzi — duży plik trzymał połączenie do zamknięcia karty, a po ~6 dużych
+  wynikach pula połączeń przeglądarki była pełna („Zapisz plik" nie reagował,
+  F5 zamarzał). Tryb „deferred" (`data` jako callable) też sonduje, przy każdym
+  kliknięciu. Pilnuje test statyczny `test_app_source_never_uses_st_download_button`;
+  pełna diagnoza w `docs/HISTORIA.md`.
 - **Anonimowość.** Brak tabeli użytkowników/sesji. `client_ip_hash` — hash, nigdy
   surowy IP.
 - **Historia = własne pobrania z `HISTORY_RETENTION_DAYS` dni** (domyślnie 5). `client_ip_hash` =
@@ -336,6 +349,8 @@ test(rate-limit)
 - Nie dodawaj Alembic ani innego systemu migracji.
 - Nie hardkoduj limitów (rozmiaru, playlisty, współbieżności) w kodzie logiki.
 - Nie przechowuj plików multimedialnych w bazie ani trwale na dysku.
+- Nie używaj `st.download_button` — plik wynikowy tylko przez `/api/download/<token>`
+  (patrz „Zasady architektoniczne").
 - Nie loguj surowego adresu IP — tylko hash.
 
 ## Znane problemy z testów manualnych (2026-09-16)
