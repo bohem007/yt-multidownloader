@@ -38,6 +38,7 @@ _PINNED_ENV = {
 os.environ.update(_PINNED_ENV)
 
 from dataclasses import dataclass, field  # noqa: E402
+from datetime import datetime  # noqa: E402
 
 import psycopg  # noqa: E402
 import pytest  # noqa: E402
@@ -108,3 +109,23 @@ def database_calls(request, monkeypatch):
     monkeypatch.setattr(Database, "get_recent_history", _get_recent_history)
     monkeypatch.setattr(Database, "purge_old_jobs", _purge_old_jobs)
     yield calls
+
+
+_FROZEN_LOCAL_NOW = datetime(2026, 9, 23, 12, 0)
+
+
+class _FrozenLinkClock(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return _FROZEN_LOCAL_NOW if tz is None else _FROZEN_LOCAL_NOW.astimezone(tz)
+
+
+@pytest.fixture
+def frozen_link_clock(monkeypatch) -> datetime:
+    """Zamraża zegar ścienny rejestru linków (src/downloads.py) na 12:00
+    czasu lokalnego: link opublikowany w teście wygasa o 12:00 + TTL. Zwraca
+    zamrożoną chwilę jako datetime ze strefą lokalną."""
+    import src.downloads as downloads
+
+    monkeypatch.setattr(downloads, "datetime", _FrozenLinkClock)
+    return _FROZEN_LOCAL_NOW.astimezone()

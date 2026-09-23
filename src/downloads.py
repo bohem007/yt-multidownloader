@@ -26,6 +26,7 @@ import shutil
 import threading
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from src.config import settings
@@ -39,7 +40,12 @@ class DownloadLink:
     token: str
     path: Path
     file_name: str
+    # O wygaśnięciu decyduje zegar monotoniczny (odporny na zmiany zegara
+    # systemowego). expires_at_local to ta sama chwila na zegarze ściennym
+    # serwera (strefa lokalna), liczona w publish() z tego samego TTL —
+    # wyłącznie do pokazania godziny w UI.
     expires_at: float
+    expires_at_local: datetime
     # True od chwili, gdy trasa zaczęła wysyłać plik (mark_fetched) —
     # "przeglądarka rozpoczęła pobieranie"; anulowania okna zapisu nie widać.
     fetched: bool = False
@@ -88,11 +94,13 @@ def publish(source: Path, file_name: str) -> DownloadLink:
     target = directory / f"payload{source.suffix}"
     shutil.move(str(source), target)
 
+    ttl_seconds = _ttl_seconds()
     link = DownloadLink(
         token=token,
         path=target,
         file_name=file_name,
-        expires_at=time.monotonic() + _ttl_seconds(),
+        expires_at=time.monotonic() + ttl_seconds,
+        expires_at_local=datetime.now().astimezone() + timedelta(seconds=ttl_seconds),
     )
     with _lock:
         _links[token] = link

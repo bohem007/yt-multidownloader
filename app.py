@@ -498,7 +498,7 @@ def _render_save_link(state: SessionState, *, replaced_by_next_turn: bool) -> No
             "Serwer uruchomiono bez trasy pobierania plików. "
             "Uruchom aplikację poleceniem: uv run streamlit run asgi_app.py"
         )
-    elif token is not None and downloads.lookup(token) is not None:
+    elif token is not None and (link := downloads.lookup(token)) is not None:
         # Klucz unikalny per job_id (Faza 2c) — przy kontynuacjach playlisty
         # ten sam widget bywał renderowany z różną zawartością; sufiks
         # running/final rozdziela renderowanie "poprzedni wynik widoczny w
@@ -515,9 +515,9 @@ def _render_save_link(state: SessionState, *, replaced_by_next_turn: bool) -> No
         if replaced_by_next_turn:
             st.caption("Ten plik zostanie zastąpiony, gdy pobierzesz kolejne pozycje.")
         else:
-            st.caption(
-                f"Link do pobrania jest ważny przez {settings.download_link_ttl_minutes} minut."
-            )
+            # Godzina z rejestru linków (jedno źródło prawdy), nie liczona tu od
+            # nowa z TTL — czas lokalny serwera (na HF: UTC, patrz CLAUDE.md).
+            st.caption(f"Link do pobrania jest ważny do godziny {link.expires_at_local:%H:%M}.")
     else:
         st.warning(
             "Link do pobrania wygasł. Uruchom pobieranie ponownie, "

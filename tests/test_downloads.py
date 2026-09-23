@@ -11,6 +11,7 @@ import dataclasses
 import os
 import threading
 import time
+from datetime import timedelta
 from urllib.parse import unquote
 
 import pytest
@@ -73,6 +74,14 @@ def test_publish_moves_file_and_registers_unguessable_token(tmp_path):
     assert len(link.token) >= 43
     assert downloads.lookup(link.token) == link
     assert downloads.download_url(link.token) == f"/api/download/{link.token}"
+
+
+def test_publish_records_expiry_on_the_local_wall_clock(tmp_path, frozen_link_clock):
+    link = downloads.publish(_source(tmp_path), "x.zip")
+
+    assert link.expires_at_local == frozen_link_clock + timedelta(minutes=30)
+    assert link.expires_at_local.tzinfo is not None
+    assert f"{link.expires_at_local:%H:%M}" == "12:30"
 
 
 def test_tokens_are_unique(tmp_path):

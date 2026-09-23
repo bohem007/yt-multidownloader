@@ -398,7 +398,7 @@ def test_completed_playlist_job_shows_zip_download_link_with_report(monkeypatch,
     # Ostatnia tura (brak kontynuacji): "zakończone" + uczciwy czas ważności.
     assert [s.value for s in at.success] == ["Pobieranie playlisty zakończone."]
     caption_texts = [c.value for c in at.caption]
-    assert "Link do pobrania jest ważny przez 30 minut." in caption_texts
+    assert f"Link do pobrania jest ważny do godziny {link.expires_at_local:%H:%M}." in caption_texts
     assert not any("zostanie zastąpiony" in text for text in caption_texts)
     assert any("1 z 2 pozycji pobranych" in text for text in caption_texts)
     write_texts = [w.value for w in at.markdown]
@@ -1085,7 +1085,45 @@ def test_completed_single_file_job_is_served_via_download_route_not_download_but
     assert at.session_state["result_file_size"] == len(content)
     # Plik wynikowy przeniesiony do katalogu linków, katalog joba sprzątnięty.
     assert not job_dir.exists()
-    assert "Link do pobrania jest ważny przez 30 minut." in [c.value for c in at.caption]
+    expected_caption = f"Link do pobrania jest ważny do godziny {link.expires_at_local:%H:%M}."
+    assert expected_caption in [c.value for c in at.caption]
+
+
+@pytest.mark.parametrize("result_kind", ["single_file", "playlist_zip"])
+def test_link_caption_shows_expiry_clock_time_from_the_token(
+    monkeypatch, tmp_path, frozen_link_clock, result_kind
+):
+    """Godzina ważności pochodzi z rejestru linków (expires_at_local tokenu)
+    i jest taka sama dla pojedynczego pliku i ZIP-a: 12:00 (zamrożone) + TTL."""
+    at = _run_app(monkeypatch)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    if result_kind == "playlist_zip":
+        result_file = job_dir / "playlist.zip"
+        event_fields = {
+            "playlist_items": [PlaylistItemResult(index=1, title="Wideo 1", status="done")],
+            "playlist_title": "Moja playlista",
+        }
+    else:
+        result_file = job_dir / "abc.mp4"
+        event_fields = {"result_uploader": "Test Uploader", "result_title": "Test Title"}
+    result_file.write_bytes(b"payload")
+    finished_queue: queue_module.Queue = queue_module.Queue()
+    finished_queue.put(
+        ProgressEvent(
+            event_type="on_finished",
+            percent=100.0,
+            message="Zakończono",
+            result_path=result_file,
+            **event_fields,
+        )
+    )
+    _simulate_job_in_flight(at, finished_queue)
+
+    at.run()
+
+    assert not at.exception
+    assert "Link do pobrania jest ważny do godziny 12:30." in [c.value for c in at.caption]
 
 
 def test_app_source_never_uses_st_download_button():
